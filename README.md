@@ -6,7 +6,7 @@ Minimises
 
 $$E(\theta) = \sum_{o,u} \sum_{o' \in V(x_\theta(o,u)),\, o' \neq o} \|I_{o'}(\pi_{o'}(x_\theta)) - I_o(\pi_o(x_\theta))\|_1$$
 
-where $x_\theta = o + t_\theta(o,u)\,u$ is the surface hit found by differentiable sphere tracing through a **1-Lipschitz CPL network** $f_\theta$.
+where $x_\theta = o + t_\theta(o,u)\u$ is the surface hit found by differentiable sphere tracing through a **1-Lipschitz CPL network** $f_\theta$.
 
 ## Structure
 

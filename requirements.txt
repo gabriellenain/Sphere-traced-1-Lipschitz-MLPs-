@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+matplotlib
+scikit-image
+imageio
+Pillow
+# optional: interactive viewer
+viser
+scipy

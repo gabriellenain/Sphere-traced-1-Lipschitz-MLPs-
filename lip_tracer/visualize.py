@@ -31,8 +31,11 @@ def _marching_cubes(f: FTheta, bound: float, res: int, device: str):
     from skimage import measure
     grid_t = torch.linspace(-bound, bound, res, device=device)
     xs, ys, zs = torch.meshgrid(grid_t, grid_t, grid_t, indexing="ij")
-    pts  = torch.stack([xs, ys, zs], dim=-1).reshape(-1, 3)
+    pts   = torch.stack([xs, ys, zs], dim=-1).reshape(-1, 3)
+    total = pts.shape[0]
+    print(f"  marching cubes: evaluating {total:,} points at res={res}…", flush=True)
     vals = torch.cat([f(p) for p in pts.split(65536)]).reshape(res, res, res).detach().cpu().numpy()
+    print(f"  marching cubes: done", flush=True)
     if vals.min() > 0 or vals.max() < 0:
         return None, None, vals
     verts, faces, _, _ = measure.marching_cubes(vals, level=0.0)
@@ -51,7 +54,7 @@ def _trace_view(f: FTheta, c2w: np.ndarray, K: np.ndarray,
                       np.ones_like(xs_f)], axis=-1)
     d = d_cam @ c2w[:3, :3].T
     d = d / np.linalg.norm(d, axis=-1, keepdims=True)
-    o_t = torch.from_numpy(np.broadcast_to(c2w[:3, 3], d.shape).copy()).float().to(device)
+    o_t = torch.from_numpy(np.broadcast_to(c2w[:3, 3], d.shape).copy().reshape(-1, 3)).float().to(device)
     d_t = torch.from_numpy(d.reshape(-1, 3)).float().to(device)
     x_hit, _, hit = trace_nograd(f, o_t, d_t)
     with torch.enable_grad():
@@ -191,7 +194,7 @@ def render_vs_reference(f: FTheta, views_list: tuple[int, ...] = (0, 15, 30, 45)
         xs_f   = (xs + 0.5) * down - 0.5; ys_f = (ys + 0.5) * down - 0.5
         d_cam  = np.stack([(xs_f-K[0,2])/K[0,0], (ys_f-K[1,2])/K[1,1], np.ones_like(xs_f)], -1)
         d      = d_cam @ c2w[:3, :3].T; d /= np.linalg.norm(d, axis=-1, keepdims=True)
-        o_t    = torch.from_numpy(np.broadcast_to(c2w[:3,3], d.shape).copy()).float().to(device)
+        o_t    = torch.from_numpy(np.broadcast_to(c2w[:3,3], d.shape).copy().reshape(-1, 3)).float().to(device)
         d_t    = torch.from_numpy(d.reshape(-1, 3)).float().to(device)
         x_theta, _, hit = trace_nograd(f, o_t, d_t)
         # round-trip reproject into same view
@@ -284,17 +287,119 @@ def chamfer_stats(f: FTheta, eval_cfg: EvalConfig = None,
     stats = {
         "n_recon_verts": int(A.shape[0]), "n_gt_points": int(B.shape[0]),
         "gt_source": pts_file.name,
-        "accuracy_mean": acc,   "accuracy_p50": d_ab.quantile(0.5).item(),
-        "accuracy_p90":  d_ab.quantile(0.9).item(),
+        "precision_mean": acc,   "precision_p50": d_ab.quantile(0.5).item(),
+        "precision_p90":  d_ab.quantile(0.9).item(),
         "completeness_mean": comp, "completeness_p50": d_ba.quantile(0.5).item(),
         "completeness_p90":  d_ba.quantile(0.9).item(),
         "chamfer": 0.5 * (acc + comp),
     }
     print("\n=== chamfer ===")
     print(f"  recon {stats['n_recon_verts']} verts  gt {stats['n_gt_points']} pts  ({pts_file.name})")
-    print(f"  acc   mean={acc:.4f}  p50={stats['accuracy_p50']:.4f}  p90={stats['accuracy_p90']:.4f}")
+    print(f"  prec  mean={acc:.4f}  p50={stats['precision_p50']:.4f}  p90={stats['precision_p90']:.4f}")
     print(f"  comp  mean={comp:.4f}  p50={stats['completeness_p50']:.4f}  p90={stats['completeness_p90']:.4f}")
     print(f"  chamfer (sym): {stats['chamfer']:.4f}")
+    return stats
+
+
+def dtu_official_chamfer(
+    f: FTheta,
+    scan_id: int,
+    dtu_eval_dir: Path,
+    scene: Path = SCENE,
+    eval_cfg: EvalConfig = None,
+) -> dict:
+    """Official DTU surface evaluation (accuracy + completeness + Chamfer).
+
+    Mirrors the evaluation used in NeuS/VolSDF/MonoSDF:
+      - GT point cloud: <dtu_eval_dir>/SampleSet/STL/stl{scan_id:03d}_total.ply
+      - Observation mask: <dtu_eval_dir>/ObsMask/ObsMask{scan_id}_10.mat
+
+    The predicted mesh is extracted in normalised SDF space, then mapped back to
+    DTU world coordinates via scale_mat_0 from the scene's cameras.npz.
+    """
+    import open3d as o3d
+    from scipy.io import loadmat
+
+    eval_cfg = eval_cfg or EvalConfig()
+    device   = next(f.parameters()).device
+
+    # ---- 1. extract mesh in normalised space ----------------------------
+    verts_norm, faces, _ = _marching_cubes(f, eval_cfg.bound_dtu, eval_cfg.mc_res, str(device))
+    if verts_norm is None:
+        print("  dtu_chamfer: no zero crossing"); return {}
+
+    # ---- 2. transform verts to DTU world coords via scale_mat_0 --------
+    cam_dict   = np.load(scene / "cameras.npz")
+    scale_mat  = cam_dict["scale_mat_0"].astype(np.float64)   # (4,4)
+    v_h        = np.concatenate([verts_norm, np.ones((len(verts_norm), 1))], axis=1)  # (N,4)
+    verts_world = (scale_mat @ v_h.T).T[:, :3].astype(np.float32)
+
+    # ---- 3. load GT point cloud + ObsMask -----------------------------
+    # dtu_eval_dir = 'SampleSet/MVS Data' from DTU's SampleSet.zip
+    ply_path = dtu_eval_dir / "Points" / "stl" / "stl006_total.ply"
+    if not ply_path.exists():
+        ply_path = dtu_eval_dir / "Points" / "stl" / "stl001_total.ply"
+    if not ply_path.exists():
+        raise FileNotFoundError(f"GT PLY not found under {dtu_eval_dir}/Points/stl/")
+    mat_path = dtu_eval_dir / "ObsMask" / f"ObsMask{scan_id}_10.mat"
+    if not mat_path.exists():
+        raise FileNotFoundError(f"ObsMask not found: {mat_path}")
+
+    mat     = loadmat(str(mat_path))
+    ObsMask = mat["ObsMask"].astype(bool)
+    BB      = mat["BB"].astype(np.float64)
+    Res     = float(mat["Res"].flat[0])
+
+    def _in_obs(pts: np.ndarray) -> np.ndarray:
+        in_bb  = np.all((pts >= BB[0]) & (pts <= BB[1]), axis=1)
+        idx    = np.clip(np.round((pts - BB[0]) / Res).astype(int), 0, np.array(ObsMask.shape) - 1)
+        return in_bb & ObsMask[idx[:, 0], idx[:, 1], idx[:, 2]]
+
+    all_pts = np.asarray(o3d.io.read_point_cloud(str(ply_path)).points, dtype=np.float32)
+    gt_pts  = all_pts[_in_obs(all_pts)]   # pre-filter to this scene's region
+    print(f"  GT cloud: {len(gt_pts):,} pts after ObsMask filter "
+          f"(from {len(all_pts):,} in {ply_path.name})")
+
+    # ---- 4. chunked nearest-neighbour distances in world coords --------
+    pred_t = torch.from_numpy(verts_world).to(device)
+    gt_t   = torch.from_numpy(gt_pts).to(device)
+
+    chunk = eval_cfg.nn_chunk
+    d_pred_gt = _nn_dist(pred_t, gt_t, chunk).cpu().numpy()   # pred → gt
+    d_gt_pred = _nn_dist(gt_t, pred_t, chunk).cpu().numpy()   # gt   → pred
+
+    # accuracy: pred points inside obs mask
+    obs_pred  = _in_obs(verts_world)
+    acc_dists = d_pred_gt[obs_pred]
+    accuracy  = float(acc_dists.mean()) if len(acc_dists) else 0.0
+
+    # completeness: gt already filtered, so all gt_pts are in obs mask
+    comp_dists   = d_gt_pred
+    completeness = float(comp_dists.mean()) if len(comp_dists) else 0.0
+
+    chamfer = 0.5 * (accuracy + completeness)
+
+    stats = {
+        "scan_id":        scan_id,
+        "n_pred_verts":   int(len(verts_world)),
+        "n_pred_in_obs":  int(obs_pred.sum()),
+        "n_gt_pts":       int(len(gt_pts)),
+        "n_gt_in_obs":    int(obs_gt.sum()),
+        "accuracy":       accuracy,
+        "completeness":   completeness,
+        "chamfer":        chamfer,
+        "acc_p50":   float(np.median(acc_dists))  if len(acc_dists)  else 0.0,
+        "acc_p90":   float(np.percentile(acc_dists,  90)) if len(acc_dists)  else 0.0,
+        "comp_p50":  float(np.median(comp_dists)) if len(comp_dists) else 0.0,
+        "comp_p90":  float(np.percentile(comp_dists, 90)) if len(comp_dists) else 0.0,
+    }
+
+    print(f"\n=== DTU official Chamfer (scan{scan_id}) ===")
+    print(f"  pred: {stats['n_pred_verts']:,} verts  in_obs: {stats['n_pred_in_obs']:,}")
+    print(f"  gt:   {stats['n_gt_pts']:,} pts   in_obs: {stats['n_gt_in_obs']:,}")
+    print(f"  accuracy    (pred→gt):    mean={accuracy:.4f}  p50={stats['acc_p50']:.4f}  p90={stats['acc_p90']:.4f}")
+    print(f"  completeness (gt→pred):  mean={completeness:.4f}  p50={stats['comp_p50']:.4f}  p90={stats['comp_p90']:.4f}")
+    print(f"  Chamfer (sym mean):       {chamfer:.4f}")
     return stats
 
 
@@ -324,7 +429,7 @@ def geom_stats(f: FTheta, down: int = 2, scene: Path = SCENE) -> dict:
 
     x_rand = (2 * torch.rand(8192, 3, device=device) - 1) * 1.5
     x_rand.requires_grad_(True)
-    g = torch.autograd.grad(f(x_rand).sum(), x_rand, create_graph=False)[0]
+    g = torch.autograd.grad(f.sdf(x_rand).sum(), x_rand, create_graph=False)[0]
     grad_norm = g.norm(dim=-1)
 
     views = load_views(scene)
@@ -332,7 +437,7 @@ def geom_stats(f: FTheta, down: int = 2, scene: Path = SCENE) -> dict:
     n_hit_tot = n_tot = 0
     mvs_errs: list[Tensor] = []
     from .geomvs import load_aligned_depths
-    mvs_data  = load_aligned_depths()
+    mvs_data  = load_aligned_depths(scene)
     V, H_v, W_v = views["images"].shape[0], views["H"], views["W"]
     H_d, W_d = H_v // down, W_v // down
     for v in range(V):
@@ -405,7 +510,7 @@ def lego_stats(f: FTheta, down: int = 2, label: str = "lego") -> None:
     pts = (2 * torch.rand(4096, 3, device=device) - 1) * 1.5
     pts.requires_grad_(True)
     with torch.enable_grad():
-        g = torch.autograd.grad(f(pts).sum(), pts)[0]
+        g = torch.autograd.grad(f.sdf(pts).sum(), pts)[0]
     grad_norm = g.norm(dim=-1)
     cams_out  = (f(views["c2w"][:, :3, 3].to(device)) > 0).float().mean().item()
 

@@ -7,3 +7,4 @@ Pillow
 # optional: interactive viewer
 viser
 scipy
+wandb

@@ -39,7 +39,67 @@ def load_sfm_pairs(scene: Path = SCENE) -> tuple[Tensor, Tensor]:
             torch.from_numpy(np.concatenate(points_list)))
 
 
+def _load_dtu_views(scene: Path) -> dict:
+    """Load DTU data from cameras.npz + image/ + mask/ layout."""
+    import imageio.v2 as imageio
+    from scipy.linalg import rq
+
+    cam_dict = np.load(scene / "cameras.npz")
+    img_paths = sorted(p for p in (scene / "image").glob("*.png") if not p.name.startswith("._"))
+    mask_paths = sorted(p for p in (scene / "mask").glob("*.png") if not p.name.startswith("._"))
+    if not img_paths:
+        raise FileNotFoundError(f"no images found under {scene / 'image'}")
+    if len(mask_paths) < len(img_paths):
+        raise FileNotFoundError(f"expected at least {len(img_paths)} masks under {scene / 'mask'}")
+
+    imgs, c2ws, Ks, masks = [], [], [], []
+    for i, img_path in enumerate(img_paths):
+        img = imageio.imread(img_path)[..., :3].astype(np.float32) / 255.0
+        msk = imageio.imread(mask_paths[i])
+        if msk.ndim == 3:
+            msk = msk[..., 0]
+        msk = msk > 127
+        img[~msk] = 0.0
+
+        P = cam_dict[f"world_mat_{i}"][:3, :4].astype(np.float64)
+        M = P[:, :3]
+        K, R = rq(M)
+        sign = np.sign(np.diag(K))
+        sign[sign == 0] = 1.0
+        T = np.diag(sign)
+        K = K @ T
+        R = T @ R
+        if np.linalg.det(R) < 0:
+            K[:, 2] *= -1.0
+            R[2, :] *= -1.0
+        K = (K / K[2, 2]).astype(np.float32)
+        t = np.linalg.solve(K.astype(np.float64), P[:, 3])
+        cam_center = -R.T @ t
+        cam_center_h = np.concatenate([cam_center, [1.0]], axis=0)
+        key_inv = f"scale_mat_inv_{i}"
+        scale_mat_inv = cam_dict[key_inv] if key_inv in cam_dict else np.linalg.inv(cam_dict[f"scale_mat_{i}"])
+        cam_center = (scale_mat_inv @ cam_center_h)[:3].astype(np.float32)
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = R.T.astype(np.float32)
+        c2w[:3, 3] = cam_center
+
+        imgs.append(img)
+        masks.append(msk)
+        c2ws.append(c2w)
+        Ks.append(K)
+
+    return {
+        "images": torch.from_numpy(np.stack(imgs)),
+        "masks":  torch.from_numpy(np.stack(masks)),
+        "c2w":    torch.from_numpy(np.stack(c2ws)),
+        "K":      torch.from_numpy(np.stack(Ks)),
+        "H": imgs[0].shape[0], "W": imgs[0].shape[1],
+    }
+
+
 def load_views(scene: Path = SCENE) -> dict:
+    if not (scene / "meta_data.json").exists():
+        return _load_dtu_views(scene)
     meta = json.loads((scene / "meta_data.json").read_text())
     import imageio.v2 as imageio
     imgs, c2ws, Ks, masks = [], [], [], []
@@ -101,6 +161,82 @@ def load_blender_views(scene: Path = BLENDER_SCENE, split: str = "train",
         "K":      torch.from_numpy(np.stack([K] * len(imgs))),
         "H": H, "W": W,
     }
+
+
+def load_blender_gt_points(scene: Path = BLENDER_SCENE,
+                           n_pts: int = 30000) -> torch.Tensor:
+    """Unproject test-split depth maps to a GT 3D point cloud.
+
+    The depth PNGs are RGBA 8-bit; R channel encodes scene-space depth
+    (Blender Z-pass normalised to the camera's far clip, exported at far=6.0).
+    A channel > 0.5 marks valid (foreground) pixels.
+
+    Returns (N, 3) float32 tensor in the same OpenCV world frame as training.
+    """
+    import imageio.v2 as imageio
+
+    meta  = json.loads((scene / "transforms_test.json").read_text())
+    fov_x = meta["camera_angle_x"]
+    all_pts: list[np.ndarray] = []
+    fx_set = False; fx = 1.0
+    found_depth = 0
+
+    for fr in meta["frames"]:
+        depth_candidates = [
+            scene / (fr["file_path"] + "_depth_0001.png"),
+            scene / (fr["file_path"] + "_depth_0029.png"),
+        ]
+        depth_path = next((p for p in depth_candidates if p.exists()), None)
+        if depth_path is None:
+            continue
+        found_depth += 1
+        rgba = imageio.imread(str(depth_path)).astype(np.float32) / 255.0  # (H,W,4)
+        H, W = rgba.shape[:2]
+        if not fx_set:
+            fx = 0.5 * W / np.tan(0.5 * fov_x)
+            fx_set = True
+        depth = rgba[..., 0]          # R channel: normalised depth in [0,1]
+        valid = rgba[..., 3] > 0.5    # A channel: foreground mask
+        if not valid.any():
+            continue
+
+        # Map [0,1] → scene-space depth; far=6.0 matches typical NeRF-synthetic clip
+        depth_m = depth * 6.0
+
+        ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+        cx, cy = W / 2.0, H / 2.0
+        pts_cam = np.stack([
+            (xs - cx) / fx * depth_m,
+            (ys - cy) / fx * depth_m,
+            depth_m,
+        ], axis=-1)  # (H, W, 3)
+
+        c2w = np.asarray(fr["transform_matrix"], dtype=np.float32)
+        c2w = c2w @ np.diag([1, -1, -1, 1]).astype(np.float32)  # NeRF→OpenCV
+        pts_world = pts_cam[valid] @ c2w[:3, :3].T + c2w[:3, 3]
+        all_pts.append(pts_world)
+
+    if found_depth == 0:
+        raise FileNotFoundError(
+            f"No Blender test depth maps found in {scene}. "
+            "Expected files like '*_depth_0001.png' or '*_depth_0029.png'."
+        )
+    if not all_pts:
+        raise ValueError(
+            f"Found Blender depth maps in {scene}, but none contained valid foreground pixels."
+        )
+    pts = np.concatenate(all_pts, axis=0)
+    if len(pts) > n_pts:
+        idx = np.random.default_rng(0).choice(len(pts), n_pts, replace=False)
+        pts = pts[idx]
+
+    t = torch.from_numpy(pts).float()
+    print(f"  [gt_pts] {len(t)} points  "
+          f"x∈[{t[:,0].min():.2f},{t[:,0].max():.2f}]  "
+          f"y∈[{t[:,1].min():.2f},{t[:,1].max():.2f}]  "
+          f"z∈[{t[:,2].min():.2f},{t[:,2].max():.2f}]  "
+          f"r_mean={t.norm(dim=-1).mean():.3f}")
+    return t
 
 
 # ---------- ray utilities ----------

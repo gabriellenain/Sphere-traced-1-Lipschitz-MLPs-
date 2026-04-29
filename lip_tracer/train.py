@@ -79,19 +79,11 @@ def fit_hull_init(
     bound:     float       = 1.5,
 ) -> FTheta:
     """Warm-start f_θ by fitting to the visual hull SDF."""
-    from .visual_hull import carve, carve_octree, fit_to_hull
+    from .visual_hull import carve, fit_to_hull
     model_cfg = model_cfg or ModelConfig()
     init_cfg  = init_cfg  or InitConfig()
-    print(f"  hull init: carving at res={init_cfg.hull_res} mode={init_cfg.hull_mode} …")
-    if init_cfg.hull_mode == "octree":
-        occ = carve_octree(
-            scene=scene,
-            res=init_cfg.hull_res,
-            bound=bound,
-            min_depth=init_cfg.octree_min_depth,
-        )
-    else:
-        occ = carve(scene=scene, res=init_cfg.hull_res, bound=bound)
+    print(f"  hull init: carving at res={init_cfg.hull_res} …")
+    occ = carve(scene=scene, res=init_cfg.hull_res, bound=bound)
     print(f"  occupied voxels: {occ.sum()} / {occ.size}")
     depth_pts = None
     w_depth_surface = init_cfg.w_depth_surface
@@ -1015,11 +1007,11 @@ if __name__ == "__main__":
     ap.add_argument("--activation", type=str,   default=_mc.activation,
                     choices=["groupsort", "nact"], help="activation: groupsort or nact (N-Activation)")
     ap.add_argument("--input-encoding", type=str, default=_mc.input_encoding,
-                    choices=["identity", "neus"], help="input encoding before the 1-Lipschitz backbone")
+                    choices=["identity", "pe"], help="input encoding before the 1-Lipschitz backbone")
     ap.add_argument("--architecture", type=str, default="cpl", choices=["cpl", "mlp"],
                     help="cpl: 1-Lipschitz CPL network (default); mlp: unconstrained MLP baseline")
     ap.add_argument("--multires", type=int, default=_mc.multires,
-                    help="number of NeuS-style positional encoding frequencies")
+                    help="number of positional encoding frequencies (input_encoding=pe)")
     _trc = TraceConfig()
     ap.add_argument("--trace-iters", type=int, default=_trc.iters,
                     help="max sphere-tracing iterations (increase when using PE)")
@@ -1030,11 +1022,6 @@ if __name__ == "__main__":
                     help="sphere-init radius (None = auto from COLMAP p60)")
     ap.add_argument("--hull-res",   type=int,   default=_ic.hull_res,
                     help="voxel resolution for hull carving")
-    ap.add_argument("--hull-mode",  type=str,   default=_ic.hull_mode,
-                    choices=["grid", "octree"], help="visual-hull carving backend")
-    ap.add_argument("--octree-min-depth", type=int, default=_ic.octree_min_depth,
-                    help="for octree hulls: accept fully-inside cells at/after this depth")
-    ap.add_argument("--w-depth-surface-init", type=float, default=_ic.w_depth_surface,
                     help="blender hull-init only: weight on GT depth surface samples")
     ap.add_argument("--w-photo",    type=float, default=_tc.w_photo)
     ap.add_argument("--w-feature",  type=float, default=_tc.w_feature,
@@ -1122,9 +1109,6 @@ if __name__ == "__main__":
             init=args.init,
             radius=args.radius,
             hull_res=args.hull_res,
-            hull_mode=args.hull_mode,
-            octree_min_depth=args.octree_min_depth,
-            w_depth_surface=args.w_depth_surface_init,
         ),
         train=TrainConfig(
             steps=args.steps, batch=args.batch, lr=args.lr, down=args.down,

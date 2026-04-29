@@ -85,66 +85,6 @@ def carve(scene: Path = BLENDER_SCENE, res: int = 128, bound: float = 1.5) -> np
     return keep_central_component(occ) if is_dtu else occ
 
 
-def carve_octree(
-    scene: Path = BLENDER_SCENE,
-    res: int = 128,
-    bound: float = 1.5,
-    min_depth: int = 5,
-    sample_grid: int = 3,
-) -> np.ndarray:
-    """Adaptive octree-style carving, rasterized back to a dense grid.
-
-    The tree only subdivides ambiguous cells. Fully-inside cells are accepted
-    once `min_depth` is reached, which keeps the carve cheap while preserving
-    more detail near silhouette boundaries than a coarse uniform grid.
-    """
-    if res <= 0 or res & (res - 1):
-        raise ValueError(f"octree carve expects power-of-two res, got {res}")
-    views = _load_masked_views(scene)
-    masks = views["masks"].numpy().astype(np.float32)
-    c2ws  = views["c2w"].numpy()
-    Ks    = views["K"].numpy()
-    H, W  = views["H"], views["W"]
-
-    occ = np.zeros((res, res, res), dtype=bool)
-    cell = 2.0 * bound / res
-    max_depth = int(np.log2(res))
-    min_depth = max(0, min(min_depth, max_depth))
-    sample_axis = np.linspace(0.0, 1.0, sample_grid, dtype=np.float32)
-
-    def classify(z0: int, z1: int, y0: int, y1: int, x0: int, x1: int) -> tuple[bool, bool]:
-        z_lo, z_hi = -bound + z0 * cell, -bound + z1 * cell
-        y_lo, y_hi = -bound + y0 * cell, -bound + y1 * cell
-        x_lo, x_hi = -bound + x0 * cell, -bound + x1 * cell
-        zs = z_lo + (z_hi - z_lo) * sample_axis
-        ys = y_lo + (y_hi - y_lo) * sample_axis
-        xs = x_lo + (x_hi - x_lo) * sample_axis
-        zz, yy, xx = np.meshgrid(zs, ys, xs, indexing="ij")
-        pts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
-        inside = _points_inside_masks(pts, masks, c2ws, Ks, H, W)
-        return bool(inside.any()), bool(inside.all())
-
-    def recurse(z0: int, z1: int, y0: int, y1: int, x0: int, x1: int, depth: int) -> None:
-        any_inside, all_inside = classify(z0, z1, y0, y1, x0, x1)
-        if not any_inside:
-            return
-        if depth == max_depth or (all_inside and depth >= min_depth):
-            occ[z0:z1, y0:y1, x0:x1] = True
-            return
-
-        z_mid = (z0 + z1) // 2
-        y_mid = (y0 + y1) // 2
-        x_mid = (x0 + x1) // 2
-        for za, zb in ((z0, z_mid), (z_mid, z1)):
-            for ya, yb in ((y0, y_mid), (y_mid, y1)):
-                for xa, xb in ((x0, x_mid), (x_mid, x1)):
-                    if za < zb and ya < yb and xa < xb:
-                        recurse(za, zb, ya, yb, xa, xb, depth + 1)
-
-    recurse(0, res, 0, res, 0, res, 0)
-    is_dtu = (scene / "cameras.npz").exists() or (scene / "meta_data.json").exists()
-    return keep_central_component(occ) if is_dtu else occ
-
 
 def save_views(occ: np.ndarray, out: Path) -> None:
     """Save three axis-aligned max-projections as a single PNG strip."""
@@ -228,8 +168,7 @@ def fit_to_hull(
 
     N = len(pts_t)
     narrow_idx = torch.nonzero(sdf_t.abs() <= band_width, as_tuple=False).squeeze(-1)
-    use_neus_init_balance = cfg.input_encoding == "neus"
-    n_narrow = min((3 * batch // 4) if use_neus_init_balance else (batch // 2),
+    n_narrow = min(batch // 2,
                    int(narrow_idx.numel()))
     depth_pts_t: torch.Tensor | None = None
     n_depth = 0
@@ -252,7 +191,7 @@ def fit_to_hull(
         target_full = sdf_t[idx]
         target = target_full
         pred_raw = f(pts_t[idx])
-        pred = pred_raw  # fit f.forward directly; 1-Lip guarantee held by f.sdf = f.forward * lip_scale at trace time
+        pred = pred_raw
         hull_loss = F.mse_loss(pred, target)
         depth_loss = torch.zeros(1, device=device).squeeze()
         if depth_pts_t is not None and n_depth > 0:
@@ -281,8 +220,6 @@ def fit_to_hull(
                 else:
                     narrow_err = err.new_tensor(0.0)
                     narrow_sign = err.new_tensor(0.0)
-                raw_target = target / f.lip_scale
-                raw_err = (pred_raw - raw_target).abs().mean()
 
                 n_uniform = batch - n_narrow
 
@@ -318,9 +255,7 @@ def fit_to_hull(
                 rs = target.max() - target.min()
                 rf = pred.max() - pred.min()
                 rf_raw = pred_raw.max() - pred_raw.min()
-                rf_bound_enc = enc_box_diam * f.lip_scale
-                rf_bound_lip = omega_box_diam
-
+                
             grad_n = None
             if step % 1000 == 0 or step == steps - 1:
                 gidx = idx[:min(256, idx.numel())]
@@ -337,12 +272,12 @@ def fit_to_hull(
                 f"  [{step:4d}/{steps}] loss={loss.item():.5f} "
                 f"(hull={hull_loss.item():.5f} depth={depth_loss.item():.5f} "
                 f"cam={cam_loss.item():.5f}) "
-                f"K={1.0 / f.lip_scale:.2f} band={band_width:.4f} narrow={n_narrow}/{batch} "
+                f"band={band_width:.4f} narrow={n_narrow}/{batch} "
                 f"|sdf-t|={err.mean():.4f}/{err.quantile(.9):.4f} "
                 f"narrow={narrow_err:.4f} sign={sign_acc:.1%}/{narrow_sign:.1%} "
                 f"sdf=[{pred.mean():+.3f},{pred.std():.3f}] "
                 f"t=[{target.mean():+.3f},{target.std():.3f}] "
-                f"raw|f-Kt|={raw_err:.3f}{grad_str}"
+                {grad_str}"
             )
             print(
                 f"      split: uniform err/sign/t/p+={uniform_err:.3f}/{uniform_sign:.1%}/{uniform_t:+.3f}/{uniform_pred_pos:.1%} "
@@ -352,8 +287,6 @@ def fit_to_hull(
             )
             print(
                 f"      range: Rs={rs:.3f} RF_sdf={rf:.3f} RF_raw={rf_raw:.3f} "
-                f"bound_sdf<=diam(gamma(batch))/K={rf_bound_enc:.3f} "
-                f"lip_bound<=diam(omega_batch)={rf_bound_lip:.3f} "
                 f"diam_gamma_box={enc_box_diam:.3f} diam_omega_box={omega_box_diam:.3f}"
             )
 

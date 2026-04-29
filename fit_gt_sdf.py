@@ -230,10 +230,9 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=mc.depth)
     ap.add_argument("--group-size", type=int, default=mc.group_size)
     ap.add_argument("--activation", choices=["groupsort", "nact"], default=mc.activation)
-    ap.add_argument("--input-encoding", choices=["identity", "neus", "lip_pe"], default=mc.input_encoding)
+    ap.add_argument("--input-encoding", choices=["identity", "pe"], default=mc.input_encoding)
     ap.add_argument("--multires", type=int, default=mc.multires)
-    ap.add_argument("--pe-rho", type=float, default=0.5, help="ρ for lip_pe: weight on identity vs PE (0=all PE, 1=all identity)")
-    ap.add_argument("--seed", type=int, default=0)
+        ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -263,7 +262,7 @@ def main() -> None:
                    activation=ckpt_data.get("activation", args.activation),
                    input_encoding=ckpt_data.get("input_encoding", args.input_encoding),
                    multires=ckpt_data.get("multires", args.multires),
-                   pe_rho=ckpt_data.get("pe_rho", args.pe_rho)).to(device)
+                   ).to(device)
         f.load_state_dict(ckpt_data["f"])
         print(f"loaded checkpoint: {args.load_ckpt}")
         pred_mesh_path = args.out_dir / "pred_mesh.ply"
@@ -285,7 +284,7 @@ def main() -> None:
 
     f = FTheta(hidden=args.hidden, depth=args.depth, group_size=args.group_size,
                activation=args.activation, input_encoding=args.input_encoding,
-               multires=args.multires, pe_rho=args.pe_rho).to(device)
+               multires=args.multires).to(device)
 
     if f.encoder is not None:
         with torch.no_grad():
@@ -342,8 +341,7 @@ def main() -> None:
         "activation": f.activation,
         "input_encoding": f.input_encoding,
         "multires": f.multires,
-        "pe_rho": f.pe_rho,
-        "mesh": str(args.mesh),
+                "mesh": str(args.mesh),
         "bound": args.bound,
     }, ckpt)
     print(f"saved checkpoint -> {ckpt}")

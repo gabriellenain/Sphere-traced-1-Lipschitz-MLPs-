@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lip_tracer.n_activation import NActivation
-from lip_tracer.positonal_encoding import LipschitzPositionalEncoding, NormalizedPositionalEncoding
+from lip_tracer.positonal_encoding import PositionalEncoding
 
 
 class ConvexPotentialLayer(nn.Module):
@@ -22,7 +22,7 @@ class ConvexPotentialLayer(nn.Module):
 
     def _sigma_sq(self, update_u: bool = True) -> Tensor:
         if not update_u:
-            return self._sigma_sq_buf  # cached from last training step — free lookup
+            return self._sigma_sq_buf
         w = self.weight
         with torch.no_grad():
             u = self._u
@@ -79,40 +79,28 @@ class FTheta(nn.Module):
         activation: str = "groupsort",
         input_encoding: str = "identity",
         multires: int = 6,
-        pe_rho: float = 0.5,
     ) -> None:
         super().__init__()
         assert activation in ("groupsort", "nact"), f"unknown activation {activation!r}"
-        assert input_encoding in ("identity", "neus", "lip_pe"), \
+        assert input_encoding in ("identity", "pe"), \
             f"unknown input_encoding {input_encoding!r}"
         if activation == "groupsort":
             assert hidden % group_size == 0
-        self.hidden       = hidden
-        self.depth        = depth
-        self.group_size   = group_size
-        self.activation   = activation
-        self.architecture = "cpl"
+        self.hidden         = hidden
+        self.depth          = depth
+        self.group_size     = group_size
+        self.activation     = activation
+        self.architecture   = "cpl"
         self.input_encoding = input_encoding
-        self.multires = multires
-        self.pe_rho   = pe_rho
-        if input_encoding == "neus":
-            self.encoder = NormalizedPositionalEncoding(multires=multires, input_dims=3)
-            from .positonal_encoding import gamma_lipschitz_constant
-            self.lip_scale = 1.0 / gamma_lipschitz_constant(multires)
-            if self.encoder.out_dim > hidden:
-                raise ValueError(
-                    f"encoded dim {self.encoder.out_dim} exceeds hidden dim {hidden}"
-                )
-        elif input_encoding == "lip_pe":
-            self.encoder = LipschitzPositionalEncoding(multires=multires, input_dims=3, rho=pe_rho)
-            self.lip_scale = 1.0  # already 1-Lipschitz by construction
+        self.multires       = multires
+        if input_encoding == "pe":
+            self.encoder = PositionalEncoding(multires=multires, input_dims=3)
             if self.encoder.out_dim > hidden:
                 raise ValueError(
                     f"encoded dim {self.encoder.out_dim} exceeds hidden dim {hidden}"
                 )
         else:
             self.encoder = None
-            self.lip_scale = 1.0
         blocks: list[nn.Module] = []
         for i in range(depth):
             blocks.append(ConvexPotentialLayer(hidden))
@@ -123,7 +111,7 @@ class FTheta(nn.Module):
                     blocks.append(MaxMin())
                 else:
                     blocks.append(GroupSort(group_size))
-        self.net        = nn.Sequential(*blocks)
+        self.net         = nn.Sequential(*blocks)
         self.head_weight = nn.Parameter(torch.empty(hidden))
         self.head_bias   = nn.Parameter(torch.zeros(1))
         nn.init.normal_(self.head_weight, mean=0.0, std=0.02)
@@ -145,32 +133,24 @@ class FTheta(nn.Module):
         return (h * w).sum(-1) + self.head_bias.squeeze(-1)
 
     def sdf(self, x: Tensor) -> Tensor:
-        """Metric SDF value. For NeuS PE this is the raw network output divided by K."""
-        return self.forward(x) * self.lip_scale
+        return self.forward(x)
 
 
 class RegularMLP(nn.Module):
     """Unconstrained MLP baseline: same interface as FTheta, no Lipschitz guarantee."""
 
     def __init__(self, hidden: int = 256, depth: int = 8,
-                 input_encoding: str = "identity", multires: int = 6,
-                 pe_rho: float = 0.5) -> None:
+                 input_encoding: str = "identity", multires: int = 6) -> None:
         super().__init__()
         self.hidden         = hidden
         self.depth          = depth
         self.input_encoding = input_encoding
         self.multires       = multires
-        self.lip_scale      = 1.0
         self.group_size     = 2
         self.activation     = "relu"
         self.architecture   = "mlp"
-        self.pe_rho         = pe_rho
-        if input_encoding == "neus":
-            self.encoder = NormalizedPositionalEncoding(multires=multires, input_dims=3)
-        elif input_encoding == "lip_pe":
-            self.encoder = LipschitzPositionalEncoding(multires=multires, input_dims=3, rho=pe_rho)
-        else:
-            self.encoder = None
+        self.encoder = PositionalEncoding(multires=multires, input_dims=3) \
+                       if input_encoding == "pe" else None
         in_dim = self.encoder.out_dim if self.encoder is not None else 3
         layers: list[nn.Module] = [nn.Linear(in_dim, hidden), nn.ReLU()]
         for _ in range(depth - 1):
@@ -188,11 +168,10 @@ class RegularMLP(nn.Module):
 
 def make_model(hidden: int, depth: int, group_size: int = 2,
                activation: str = "groupsort", input_encoding: str = "identity",
-               multires: int = 6, pe_rho: float = 0.5,
-               architecture: str = "cpl") -> "FTheta | RegularMLP":
+               multires: int = 6, architecture: str = "cpl") -> "FTheta | RegularMLP":
     if architecture == "mlp":
         return RegularMLP(hidden=hidden, depth=depth,
-                          input_encoding=input_encoding, multires=multires, pe_rho=pe_rho)
+                          input_encoding=input_encoding, multires=multires)
     return FTheta(hidden=hidden, depth=depth, group_size=group_size,
                   activation=activation, input_encoding=input_encoding,
-                  multires=multires, pe_rho=pe_rho)
+                  multires=multires)

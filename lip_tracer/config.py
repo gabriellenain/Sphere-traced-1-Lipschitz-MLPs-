@@ -20,8 +20,8 @@ class ModelConfig:
     depth:      int = 8   # number of CPL layers
     group_size: int = 2     # 2 → MaxMin, >2 → GroupSort-N (ignored when activation="nact")
     activation: str = "groupsort"  # "groupsort" | "nact"
-    input_encoding: str = "neus"  # "identity" | "neus"
-    multires: int = 2 # NeuS-style positional encoding frequencies when input_encoding="neus"
+    input_encoding: str = "identity"  # "identity" | "pe"
+    multires: int = 6  # PE frequencies when input_encoding="pe"
     architecture: str = "cpl"  # "cpl" | "mlp"
 
 
@@ -47,8 +47,6 @@ class InitConfig:
     lr:       float        = 1e-1
     radius:   float | None = None      # sphere only: None → auto-detect from COLMAP p80
     hull_res: int          = 256      # hull only: voxel carving resolution
-    hull_mode: str         = "grid"   # "grid" | "octree"
-    octree_min_depth: int  = 5        # octree only: stop early for fully-inside cells at/after this depth
     w_depth_surface: float = 0.0  # blender hull-init only: weight on GT depth surface samples
 
 

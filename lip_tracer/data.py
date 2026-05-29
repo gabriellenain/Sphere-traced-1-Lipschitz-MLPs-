@@ -17,6 +17,28 @@ def load_colmap_points(scene: Path = SCENE) -> Tensor:
     return torch.from_numpy(np.loadtxt(scene / "sparse_sfm_points.txt", dtype=np.float32))
 
 
+def colmap_visibility_counts(pts: Tensor, views: dict, chunk: int = 4096) -> Tensor:
+    """Count how many masked cameras see each COLMAP point."""
+    H, W   = views["H"], views["W"]
+    masks  = views["masks"]
+    w2c    = torch.linalg.inv(views["c2w"])
+    R, t   = w2c[:, :3, :3], w2c[:, :3, 3]
+    K      = views["K"]
+    counts = torch.zeros(len(pts), dtype=torch.long)
+    for i in range(0, len(pts), chunk):
+        p   = pts[i:i + chunk]
+        xc  = torch.einsum("vij,nj->vni", R, p) + t[:, None, :]
+        uvh = torch.einsum("vij,vnj->vni", K, xc)
+        uv  = uvh[..., :2] / uvh[..., 2:3].clamp_min(1e-6)
+        u_, v_ = uv[..., 0], uv[..., 1]
+        in_b = (u_ >= 0) & (u_ < W) & (v_ >= 0) & (v_ < H) & (xc[..., 2] > 1e-4)
+        ui   = u_.round().long().clamp(0, W - 1)
+        vi   = v_.round().long().clamp(0, H - 1)
+        vi_  = torch.arange(masks.shape[0])[:, None].expand_as(ui)
+        counts[i:i + chunk] = (in_b & masks[vi_, vi, ui]).sum(dim=0)
+    return counts
+
+
 def load_camera_centers(scene: Path = SCENE) -> Tensor:
     meta = json.loads((scene / "meta_data.json").read_text())
     c = np.stack([np.asarray(fr["camtoworld"], dtype=np.float32)[:3, 3]
@@ -24,24 +46,62 @@ def load_camera_centers(scene: Path = SCENE) -> Tensor:
     return torch.from_numpy(c)
 
 
-def load_sfm_pairs(scene: Path = SCENE) -> tuple[Tensor, Tensor]:
-    """(origins, points) of shape (P, 3) — one row per (camera, sfm_point) pair."""
-    meta = json.loads((scene / "meta_data.json").read_text())
+def _point_keyset(pts: np.ndarray, atol: float) -> set[tuple[int, int, int]]:
+    quant = np.round(pts / atol).astype(np.int64)
+    return {tuple(row) for row in quant}
+
+
+def _filter_points_by_keyset(pts: np.ndarray, keys: set[tuple[int, int, int]],
+                             atol: float) -> np.ndarray:
+    if not len(pts):
+        return pts
+    quant = np.round(pts / atol).astype(np.int64)
+    keep = np.fromiter((tuple(row) in keys for row in quant),
+                       dtype=bool, count=len(pts))
+    return pts[keep]
+
+
+def load_sfm_pairs(scene: Path = SCENE, allowed_points: Tensor | np.ndarray | None = None,
+                   atol: float = 1e-5) -> tuple[Tensor, Tensor]:
+    """(origins, points) of shape (P, 3) — one row per (camera, sfm_point) pair.
+
+    If allowed_points is provided, keep only pairs whose target belongs to that
+    cleaned COLMAP set. Matching is quantized to tolerate text round-tripping.
+    """
+    # prefer dedicated sfm_pairs.json; fall back to meta_data.json
+    meta_path = scene / "sfm_pairs.json"
+    if not meta_path.exists():
+        meta_path = scene / "meta_data.json"
+    meta = json.loads(meta_path.read_text())
+    allowed_keys = None
+    if allowed_points is not None:
+        allowed_np = (allowed_points.detach().cpu().numpy()
+                      if isinstance(allowed_points, torch.Tensor)
+                      else np.asarray(allowed_points))
+        allowed_keys = _point_keyset(allowed_np.astype(np.float32), atol)
     origins_list, points_list = [], []
     for fr in meta["frames"]:
         pts = np.loadtxt(scene / fr["sfm_sparse_points_view"], dtype=np.float32)
         if pts.ndim == 1:
             pts = pts[None]
+        if allowed_keys is not None:
+            pts = _filter_points_by_keyset(pts, allowed_keys, atol)
+        if len(pts) == 0:
+            continue
         o = np.asarray(fr["camtoworld"], dtype=np.float32)[:3, 3]
         origins_list.append(np.broadcast_to(o, pts.shape).copy())
         points_list.append(pts)
+    if not points_list:
+        z = torch.empty(0, 3, dtype=torch.float32)
+        return z, z.clone()
     return (torch.from_numpy(np.concatenate(origins_list)),
             torch.from_numpy(np.concatenate(points_list)))
 
 
-def _load_dtu_views(scene: Path) -> dict:
+def _load_dtu_views(scene: Path, down: int = 1) -> dict:
     """Load DTU data from cameras.npz + image/ + mask/ layout."""
     import imageio.v2 as imageio
+    from PIL import Image as _PIL
     from scipy.linalg import rq
 
     cam_dict = np.load(scene / "cameras.npz")
@@ -60,6 +120,12 @@ def _load_dtu_views(scene: Path) -> dict:
             msk = msk[..., 0]
         msk = msk > 127
         img[~msk] = 0.0
+        if down > 1:
+            H0, W0 = img.shape[:2]
+            H1, W1 = H0 // down, W0 // down
+            img = np.array(_PIL.fromarray((img * 255).astype(np.uint8)).resize(
+                (W1, H1), _PIL.BILINEAR)).astype(np.float32) / 255.0
+            msk = np.array(_PIL.fromarray(msk).resize((W1, H1), _PIL.NEAREST))
 
         P = cam_dict[f"world_mat_{i}"][:3, :4].astype(np.float64)
         M = P[:, :3]
@@ -73,7 +139,8 @@ def _load_dtu_views(scene: Path) -> dict:
             K[:, 2] *= -1.0
             R[2, :] *= -1.0
         K = (K / K[2, 2]).astype(np.float32)
-        t = np.linalg.solve(K.astype(np.float64), P[:, 3])
+        K_pose = K.astype(np.float64)
+        t = np.linalg.solve(K_pose, P[:, 3])
         cam_center = -R.T @ t
         cam_center_h = np.concatenate([cam_center, [1.0]], axis=0)
         key_inv = f"scale_mat_inv_{i}"
@@ -82,6 +149,10 @@ def _load_dtu_views(scene: Path) -> dict:
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R.T.astype(np.float32)
         c2w[:3, 3] = cam_center
+        if down > 1:
+            K = K.copy()
+            K[0] /= down
+            K[1] /= down
 
         imgs.append(img)
         masks.append(msk)
@@ -97,9 +168,79 @@ def _load_dtu_views(scene: Path) -> dict:
     }
 
 
-def load_views(scene: Path = SCENE) -> dict:
-    if not (scene / "meta_data.json").exists():
-        return _load_dtu_views(scene)
+def _load_tnt_views(scene: Path, down: int = 1) -> dict:
+    """Load NSVF-preprocessed Tanks & Temples scene.
+
+    Layout: intrinsics.txt (4x4), bbox.txt (xmin..zmax voxel_size),
+    rgb/<split>_<frame>.png and pose/<split>_<frame>.txt (split 0 = train).
+    Cameras + bbox are renormalised so the bbox fits the unit cube, so the
+    rest of the DTU-tuned pipeline (bound=1.5, sphere radius~0.5) just works.
+    Returns all-True masks so existing mask-keyed code paths degenerate to
+    no-ops when mask losses are zero-weighted.
+    """
+    import imageio.v2 as imageio
+    from PIL import Image as _PIL
+
+    K_raw = np.loadtxt(scene / "intrinsics.txt", dtype=np.float32)[:3, :3]
+    bbox = np.loadtxt(scene / "bbox.txt", dtype=np.float32)
+    bb_min, bb_max = bbox[:3], bbox[3:6]
+    center = 0.5 * (bb_min + bb_max)
+    scale  = float(np.max(0.5 * (bb_max - bb_min)))  # unit cube fit
+
+    pose_paths = sorted(p for p in (scene / "pose").glob("0_*.txt"))
+    if not pose_paths:
+        raise FileNotFoundError(f"no training poses (0_*.txt) under {scene/'pose'}")
+
+    imgs, c2ws, Ks, masks = [], [], [], []
+    for pp in pose_paths:
+        ip = scene / "rgb" / (pp.stem + ".png")
+        if not ip.exists():
+            continue
+        img = imageio.imread(ip).astype(np.float32) / 255.0
+        if img.ndim == 3 and img.shape[-1] == 4:
+            img = img[..., :3]
+        c2w = np.loadtxt(pp, dtype=np.float32).reshape(4, 4)
+        c2w[:3, 3] = (c2w[:3, 3] - center) / scale
+
+        K = K_raw.copy()
+        if down > 1:
+            H0, W0 = img.shape[:2]
+            H1, W1 = H0 // down, W0 // down
+            img = np.array(_PIL.fromarray((img * 255).astype(np.uint8)).resize(
+                (W1, H1), _PIL.BILINEAR)).astype(np.float32) / 255.0
+            K[0] /= down
+            K[1] /= down
+        H, W = img.shape[:2]
+        imgs.append(img)
+        c2ws.append(c2w)
+        Ks.append(K)
+        mp = scene / "mask" / (pp.stem + ".png")
+        if mp.exists():
+            mraw = imageio.imread(mp)
+            if mraw.ndim == 3:
+                mraw = mraw[..., 0]
+            if down > 1:
+                mraw = np.array(_PIL.fromarray(mraw).resize((W, H), _PIL.NEAREST))
+            masks.append(mraw > 127)
+        else:
+            masks.append(np.ones((H, W), dtype=bool))
+
+    print(f"  tnt[{scene.name}]: {len(imgs)} views {imgs[0].shape[0]}x{imgs[0].shape[1]}  "
+          f"bbox_scale={scale:.3f}  (down={down})")
+    return {
+        "images": torch.from_numpy(np.stack(imgs)),
+        "masks":  torch.from_numpy(np.stack(masks)),
+        "c2w":    torch.from_numpy(np.stack(c2ws)),
+        "K":      torch.from_numpy(np.stack(Ks)),
+        "H": imgs[0].shape[0], "W": imgs[0].shape[1],
+    }
+
+
+def load_views(scene: Path = SCENE, down: int = 1) -> dict:
+    if (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
+        return _load_tnt_views(scene, down=down)
+    if not (scene / "meta_data.json").exists() or (scene / "image").exists():
+        return _load_dtu_views(scene, down=down)
     meta = json.loads((scene / "meta_data.json").read_text())
     import imageio.v2 as imageio
     imgs, c2ws, Ks, masks = [], [], [], []
@@ -249,8 +390,9 @@ def make_deterministic_rays(views: dict, down: int, device: str) -> dict:
     V, H, W = views["c2w"].shape[0], views["H"], views["W"]
     H_d, W_d = H // down, W // down
     all_o, all_d, all_vi, all_gt, all_fg = [], [], [], [], []
-    images  = views["images"].to(device)
-    fg_maps = views["masks"].to(device) if "masks" in views else None
+    all_px, all_py = [], []
+    images  = views["images"]   # keep on CPU — batches moved to device at sample time
+    fg_maps = views["masks"] if "masks" in views else None
     for v in range(V):
         K   = views["K"][v].numpy()
         c2w = views["c2w"][v].numpy()
@@ -264,22 +406,26 @@ def make_deterministic_rays(views: dict, down: int, device: str) -> dict:
         dirs = dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
         o_np = np.broadcast_to(c2w[:3, 3], dirs.shape)
         N    = H_d * W_d
-        all_o.append(torch.from_numpy(o_np.reshape(-1, 3).copy()).float().to(device))
-        all_d.append(torch.from_numpy(dirs.reshape(-1, 3)).float().to(device))
-        all_vi.append(torch.full((N,), v, dtype=torch.long, device=device))
-        yi = torch.from_numpy((ys_f + 0.5).astype(np.int64).ravel()).clamp(0, H - 1).to(device)
-        xi = torch.from_numpy((xs_f + 0.5).astype(np.int64).ravel()).clamp(0, W - 1).to(device)
+        all_o.append(torch.from_numpy(o_np.reshape(-1, 3).copy()).float())
+        all_d.append(torch.from_numpy(dirs.reshape(-1, 3)).float())
+        all_vi.append(torch.full((N,), v, dtype=torch.long))
+        all_px.append(torch.from_numpy(xs_f.ravel().astype(np.float32).copy()))
+        all_py.append(torch.from_numpy(ys_f.ravel().astype(np.float32).copy()))
+        yi = torch.from_numpy((ys_f + 0.5).astype(np.int64).ravel()).clamp(0, H - 1)
+        xi = torch.from_numpy((xs_f + 0.5).astype(np.int64).ravel()).clamp(0, W - 1)
         all_gt.append(images[v, yi, xi])
         if fg_maps is not None:
             all_fg.append(fg_maps[v, yi, xi])
         else:
-            all_fg.append(torch.ones(N, dtype=torch.bool, device=device))
+            all_fg.append(torch.ones(N, dtype=torch.bool))
     return {
         "o":             torch.cat(all_o),
         "d":             torch.cat(all_d),
         "vi":            torch.cat(all_vi),
         "gt":            torch.cat(all_gt),
         "fg":            torch.cat(all_fg),
+        "px":            torch.cat(all_px),
+        "py":            torch.cat(all_py),
         "rays_per_view": H_d * W_d,
     }
 

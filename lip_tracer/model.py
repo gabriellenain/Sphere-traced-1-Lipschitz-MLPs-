@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lip_tracer.n_activation import NActivation
-from lip_tracer.positonal_encoding import PositionalEncoding
+from lip_tracer.positional_encoding import PositionalEncoding
 
 
 class ConvexPotentialLayer(nn.Module):
@@ -136,31 +136,53 @@ class FTheta(nn.Module):
         return self.forward(x)
 
 
-class RegularMLP(nn.Module):
-    """Unconstrained MLP baseline: same interface as FTheta, no Lipschitz guarantee."""
+class NeuSMLP(nn.Module):
+    """NeuS-style MLP: 8-layer Softplus network with skip connection at layer 4.
 
-    def __init__(self, hidden: int = 256, depth: int = 8,
-                 input_encoding: str = "identity", multires: int = 6) -> None:
+    Architecture follows Wang et al. 2021 (NeuS):
+      - PE input encoding
+      - Softplus(β=100) activations
+      - Skip: encoded input concatenated back at layer skip_layer
+      - Single scalar SDF output (no colour head — colour is handled separately)
+    """
+
+    def __init__(self, hidden: int = 256, depth: int = 8, skip_layer: int = 4,
+                 input_encoding: str = "pe", multires: int = 6,
+                 beta: float = 100.0) -> None:
         super().__init__()
         self.hidden         = hidden
         self.depth          = depth
+        self.skip_layer     = skip_layer
         self.input_encoding = input_encoding
         self.multires       = multires
         self.group_size     = 2
-        self.activation     = "relu"
-        self.architecture   = "mlp"
-        self.encoder = PositionalEncoding(multires=multires, input_dims=3) \
-                       if input_encoding == "pe" else None
+        self.activation     = "softplus"
+        self.architecture   = "neus"
+        self.encoder = PositionalEncoding(
+            multires=multires, input_dims=3,
+        ) if input_encoding == "pe" else None
         in_dim = self.encoder.out_dim if self.encoder is not None else 3
-        layers: list[nn.Module] = [nn.Linear(in_dim, hidden), nn.ReLU()]
-        for _ in range(depth - 1):
-            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
-        layers.append(nn.Linear(hidden, 1))
-        self.net = nn.Sequential(*layers)
+        self.in_dim = in_dim
+
+        self.layers = nn.ModuleList()
+        for i in range(depth):
+            if i == 0:
+                self.layers.append(nn.Linear(in_dim, hidden))
+            elif i == skip_layer:
+                self.layers.append(nn.Linear(hidden + in_dim, hidden))
+            else:
+                self.layers.append(nn.Linear(hidden, hidden))
+        self.out = nn.Linear(hidden, 1)
+        self.act = nn.Softplus(beta=beta)
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.encoder(x) if self.encoder is not None else x
-        return self.net(h).squeeze(-1)
+        feat = h
+        for i, layer in enumerate(self.layers):
+            if i == self.skip_layer:
+                feat = torch.cat([feat, h], dim=-1)
+            feat = self.act(layer(feat))
+        return self.out(feat).squeeze(-1)
 
     def sdf(self, x: Tensor) -> Tensor:
         return self.forward(x)
@@ -168,10 +190,10 @@ class RegularMLP(nn.Module):
 
 def make_model(hidden: int, depth: int, group_size: int = 2,
                activation: str = "groupsort", input_encoding: str = "identity",
-               multires: int = 6, architecture: str = "cpl") -> "FTheta | RegularMLP":
-    if architecture == "mlp":
-        return RegularMLP(hidden=hidden, depth=depth,
-                          input_encoding=input_encoding, multires=multires)
+               multires: int = 6, architecture: str = "cpl") -> "FTheta | NeuSMLP":
+    if architecture == "neus":
+        return NeuSMLP(hidden=hidden, depth=depth,
+                       input_encoding=input_encoding, multires=multires)
     return FTheta(hidden=hidden, depth=depth, group_size=group_size,
                   activation=activation, input_encoding=input_encoding,
                   multires=multires)

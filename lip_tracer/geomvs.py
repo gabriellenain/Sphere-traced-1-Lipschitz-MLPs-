@@ -229,6 +229,144 @@ def load_mast3r_depths_idr(scene: Path, depth_dir: Path) -> dict | None:
     }
 
 
+def load_mvsformer_depths_idr(scene: Path, depth_dir: Path,
+                               conf_thresh: float = 0.1,
+                               use_idr_mask: bool = True) -> dict | None:
+    """Load MVSFormer++ depth maps for an IDR-style DTU scan.
+
+    Reads <depth_dir>/<scan>/{depth_est/*.pfm, confidence/*.npy} produced by
+    precompute_mvsformer_depths.py. Cameras are reconstructed from cameras.npz;
+    depths are already in IDR-normalised cam-z (cam.txt was written in that
+    frame), so no SFM scale alignment is needed.
+
+    valid_maps = (conf > conf_thresh) ∩ (IDR object mask, if use_idr_mask).
+    """
+    from scipy.linalg import rq
+    import cv2
+    from PIL import Image
+
+    # depth_dir may be the parent (containing scan/) or the scan dir itself
+    scan_dirs = [d for d in depth_dir.iterdir() if d.is_dir() and (d / "depth_est").exists()]
+    scan_root = scan_dirs[0] if scan_dirs else depth_dir
+    pfm_files = sorted((scan_root / "depth_est").glob("*.pfm"))
+    if not pfm_files:
+        print(f"  [geomvs] no .pfm files under {scan_root}")
+        return None
+
+    cam_dict = np.load(scene / "cameras.npz")
+    img_paths = sorted(p for p in (scene / "image").iterdir()
+                       if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                       and not p.name.startswith("._"))
+    W_orig, H_orig = Image.open(img_paths[0]).size
+    mask_dir = scene / "mask"
+
+    aligned_depths, valid_masks, c2ws, Ks = [], [], [], []
+    for i, pfm in enumerate(pfm_files):
+        depth = np.asarray(_read_pfm(pfm), dtype=np.float32)
+        conf = np.load(scan_root / "confidence" / f"{pfm.stem}.npy")
+        if conf.dtype == np.uint8:
+            conf = conf.astype(np.float32) / 255.0
+        H_d, W_d = depth.shape
+
+        # ---- camera reconstruction (matches load_mast3r_depths_idr) ----
+        P = cam_dict[f"world_mat_{i}"][:3, :4].astype(np.float64)
+        K_cam, R_cam = rq(P[:, :3])
+        s = np.sign(np.diag(K_cam)); s[s == 0] = 1.0
+        K_cam = K_cam @ np.diag(s); R_cam = np.diag(s) @ R_cam
+        if np.linalg.det(R_cam) < 0:
+            K_cam[:, 2] *= -1; R_cam[2, :] *= -1
+        K_cam /= K_cam[2, 2]
+        t_metric = np.linalg.solve(K_cam, P[:, 3])
+        cam_center_metric = -R_cam.T @ t_metric
+        key_inv = f"scale_mat_inv_{i}"
+        scale_mat_inv = (cam_dict[key_inv] if key_inv in cam_dict
+                         else np.linalg.inv(cam_dict[f"scale_mat_{i}"]))
+        cam_center_norm = (scale_mat_inv @ np.append(cam_center_metric, 1.0))[:3]
+
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = R_cam.T.astype(np.float32)
+        c2w[:3, 3] = cam_center_norm.astype(np.float32)
+
+        # K stays at original image resolution (depths are resized to match)
+        Ks.append(K_cam.astype(np.float32))
+        c2ws.append(c2w)
+
+        # ---- valid mask: confidence ∩ IDR object mask ----
+        valid = (conf > conf_thresh) & (depth > 1e-3)
+        if use_idr_mask:
+            mp = mask_dir / f"{i:03d}.png"
+            if not mp.exists():
+                mp = next((mask_dir / f"{i:03d}").parent.glob(f"{i:03d}.*"), None)
+            if mp is not None and mp.exists():
+                m = np.asarray(Image.open(mp).convert("L"))
+                m = cv2.resize((m > 127).astype(np.uint8), (W_d, H_d),
+                               interpolation=cv2.INTER_NEAREST).astype(bool)
+                valid &= m
+            else:
+                print(f"  [geomvs] view {i}: no IDR mask found at {mp}")
+
+        # resize to original image resolution so train.py pixel indexing aligns
+        if (H_d, W_d) != (H_orig, W_orig):
+            depth = cv2.resize(depth, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR)
+            valid = cv2.resize(valid.astype(np.uint8), (W_orig, H_orig),
+                               interpolation=cv2.INTER_NEAREST).astype(bool)
+
+        aligned_depths.append(torch.from_numpy(depth))
+        valid_masks.append(torch.from_numpy(valid))
+        if i % 8 == 0:
+            pct = 100 * valid.mean()
+            zr = depth[valid] if valid.any() else np.array([0.0])
+            print(f"  [geomvs] mvsf view {i}: valid={pct:.1f}%  z=[{zr.min():.3f},{zr.max():.3f}]")
+
+    H_out, W_out = aligned_depths[0].shape
+
+    # Load normals: prefer StableNormal > DSINE > zeros
+    normal_dir = None
+    for candidate in ["normals_stablenormal", "normals_dsine"]:
+        d = scene / candidate
+        if d.exists() and any(f.suffix == ".npy" for f in d.iterdir()):
+            normal_dir = d
+            break
+    normals = []
+    for i in range(len(aligned_depths)):
+        npy = (normal_dir / f"{i:06d}_normal.npy") if normal_dir else None
+        if npy is not None and npy.exists():
+            n = np.load(npy).astype(np.float32)  # (H, W, 3) camera-space [-1,1]
+            if (n.shape[0], n.shape[1]) != (H_out, W_out):
+                n = cv2.resize(n, (W_out, H_out), interpolation=cv2.INTER_LINEAR)
+            normals.append(torch.from_numpy(n))
+        else:
+            normals.append(torch.zeros(H_out, W_out, 3))
+    if normal_dir is not None:
+        print(f"  [geomvs] loaded normals from {normal_dir.name}")
+    else:
+        print(f"  [geomvs] no normals found, using zeros")
+
+    print(f"  [geomvs] loaded {len(aligned_depths)} MVSFormer++ depth maps from {scan_root.name}")
+    return {
+        "depths":  aligned_depths,
+        "valid":   valid_masks,
+        "normals": normals,
+        "c2w": np.stack(c2ws),
+        "K":   np.stack(Ks),
+        "H": H_out, "W": W_out,
+    }
+
+
+def _read_pfm(path: Path):
+    with open(path, "rb") as f:
+        header = f.readline().rstrip()
+        color = header == b"PF"
+        dim = f.readline().decode("ascii").strip()
+        while dim.startswith("#"):
+            dim = f.readline().decode("ascii").strip()
+        W, H = map(int, dim.split())
+        scale = float(f.readline().decode("ascii").strip())
+        data = np.frombuffer(f.read(), dtype="<f" if scale < 0 else ">f")
+    data = data.reshape((H, W, 3) if color else (H, W))
+    return np.flipud(data).copy()
+
+
 def backproject_depth(depth: np.ndarray, K: np.ndarray, c2w: np.ndarray,
                       valid: np.ndarray | None = None) -> np.ndarray:
     """Back-project a z-depth map to world-space 3D points. Returns (N, 3)."""
@@ -246,6 +384,42 @@ def backproject_depth(depth: np.ndarray, K: np.ndarray, c2w: np.ndarray,
     if valid is not None:
         pts_world = pts_world[valid]
     return pts_world.reshape(-1, 3)
+
+
+def load_dtu_gt_points(scene: Path = SCENE, n_pts: int = 100_000) -> torch.Tensor:
+    """Unproject aligned depth maps to a dense GT point cloud for DTU scenes.
+
+    Uses load_aligned_depths (SFM-scale-aligned mono depths) and backproject_depth.
+    Returns (N, 3) float32 in the same normalized world frame as load_views().
+    Falls back to sparse COLMAP points if aligned depths are unavailable.
+    """
+    data = load_aligned_depths(scene)
+    if data is None:
+        import warnings
+        warnings.warn(f"No aligned depths for {scene.name}, falling back to sparse COLMAP pts")
+        pts = np.loadtxt(scene / "sparse_sfm_points.txt", dtype=np.float32)
+        t = torch.from_numpy(pts)
+        print(f"  [dtu_gt_pts] fallback: {len(t)} sparse COLMAP pts")
+        return t
+
+    all_pts: list[np.ndarray] = []
+    for i, (depth, valid) in enumerate(zip(data["depths"], data["valid"])):
+        pts = backproject_depth(
+            depth.numpy(), data["K"][i], data["c2w"][i], valid.numpy()
+        )
+        all_pts.append(pts)
+
+    pts = np.concatenate(all_pts, axis=0)
+    if len(pts) > n_pts:
+        idx = np.random.default_rng(0).choice(len(pts), n_pts, replace=False)
+        pts = pts[idx]
+
+    t = torch.from_numpy(pts).float()
+    print(f"  [dtu_gt_pts] {len(t)} pts  "
+          f"x∈[{t[:,0].min():.2f},{t[:,0].max():.2f}]  "
+          f"y∈[{t[:,1].min():.2f},{t[:,1].max():.2f}]  "
+          f"z∈[{t[:,2].min():.2f},{t[:,2].max():.2f}]")
+    return t
 
 
 def visualize(scene: Path = SCENE) -> None:

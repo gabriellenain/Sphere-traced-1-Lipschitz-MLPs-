@@ -1,6 +1,8 @@
 """Loss functions for 1-Lip sphere-tracing training."""
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -112,7 +114,13 @@ def pmvs_ncc_loss(
     patch: int = 7, half_pix: float = 3.0,
     sample_mode: str = "bilinear",
     gaussian_sigma: float = 0.8, gaussian_radius: int = 2,
-) -> Tensor:
+    ncc_min: float = 0.4,
+    return_full: bool = False,
+    ncc_color: str = "gray",
+    ncc_grad_alpha: float = 0.0,
+    patch_wsigma: float = 0.0,
+    dbg: dict | None = None,
+) -> tuple[Tensor, Tensor, int] | tuple[Tensor, Tensor, int, Tensor]:
     """PMVS-style ZNCC: NCC on a 3D oriented patch projected into two views.
 
     Builds a P×P grid of 3D points on the tangent plane at c(p) with normal n(p),
@@ -126,6 +134,19 @@ def pmvs_ncc_loss(
     Returns (N,) loss ∈ [0, 2], 0 = perfect correlation.
     """
     P = patch
+    B_in = x3d.shape[0]
+
+    def _full(zncc_t: Tensor | None, valid_m: Tensor | None,
+              textured_m: Tensor | None) -> Tensor:
+        """Per-input ZNCC aligned to x3d (B_in,), NaN where unusable.
+        Grad flows into the usable entries (in-place index assign)."""
+        zf = x3d.new_full((B_in,), float("nan"))
+        if zncc_t is not None and zncc_t.numel() > 0:
+            vidx = valid_m.nonzero(as_tuple=True)[0]      # (Bv,)
+            tidx = vidx[textured_m]                        # (Bt,)
+            zf = zf.clone()
+            zf[tidx] = zncc_t
+        return zf
 
     # 1. Orthonormal tangent frame from normals
     n = F.normalize(normals, dim=-1)                         # (B, 3)
@@ -147,6 +168,13 @@ def pmvs_ncc_loss(
     offs = torch.linspace(-(P - 1) / 2, (P - 1) / 2, P, device=x3d.device)
     oi, oj = torch.meshgrid(offs, offs, indexing='ij')       # (P, P)
     oi = oi.reshape(-1);  oj = oj.reshape(-1)                # (P*P,)
+    # Spatial patch weight w = exp(-r/α) over grid points (r = dist to centre).
+    # None → uniform (legacy). Used as weighted ZNCC moments below.
+    if patch_wsigma > 0.0:
+        _r = torch.sqrt(oi * oi + oj * oj)                   # (P*P,)
+        pw = torch.exp(-_r / patch_wsigma).reshape(1, -1, 1)  # (1, P*P, 1)
+    else:
+        pw = None
     pts3d = (x3d.unsqueeze(1)
              + step_3d[:, None, None] * (oi[None, :, None] * t1.unsqueeze(1)
                                         + oj[None, :, None] * t2.unsqueeze(1)))  # (B, P*P, 3)
@@ -172,7 +200,10 @@ def pmvs_ncc_loss(
              & (uv_b[:, :, 1] >= 0).all(1) & (uv_b[:, :, 1] < H).all(1)
     valid = all_in_a & all_in_b
     if not valid.any():
-        return torch.empty(0, device=images.device)
+        empty = torch.empty(0, device=images.device)
+        if return_full:
+            return empty, empty.bool(), 0, _full(None, None, None)
+        return empty, empty.bool(), 0
 
     uv_av = uv_a[valid];  uv_bv = uv_b[valid]    # (B', P*P, 2)
     vi_av = vi_a[valid];  vi_bv = vi_b[valid]     # (B',)
@@ -208,18 +239,67 @@ def pmvs_ncc_loss(
     _sample_grid = _sample_grid_gaussian if sample_mode == "gaussian" else _sample_grid_bilinear
     pa = _sample_grid(uv_av, vi_av)
     pb = _sample_grid(uv_bv, vi_bv)
+    if ncc_color == "gray":
+        # Rec.601 luminance — single channel, robust to per-channel
+        # exposure/white-balance drift between DTU views (3x cheaper too).
+        _lw = pa.new_tensor([0.299, 0.587, 0.114])
+        pa = (pa * _lw).sum(-1, keepdim=True)
+        pb = (pb * _lw).sum(-1, keepdim=True)
 
-    # 7. Per-channel ZNCC averaged over RGB
-    pa = pa - pa.mean(dim=1, keepdim=True)           # (B', P*P, 3)
-    pb = pb - pb.mean(dim=1, keepdim=True)
-    std_a = pa.norm(dim=1)                           # (B', 3)
+    # 7. Per-channel ZNCC averaged over channels
+    raw_a, raw_b = pa, pb                             # keep for gradient term
+
+    if pw is not None:
+        _wsum = pw.sum()
+        _sw = pw.sqrt()
+
+        def _center(p: Tensor) -> Tensor:
+            # weighted zero-mean, then ×√w so the existing norm/dot below
+            # yield weighted std / weighted covariance (proper weighted ZNCC).
+            return (p - (pw * p).sum(dim=1, keepdim=True) / _wsum) * _sw
+    else:
+        def _center(p: Tensor) -> Tensor:
+            return p - p.mean(dim=1, keepdim=True)
+
+    pa = _center(pa)                                 # (B', P*P, C)
+    pb = _center(pb)
+    std_a = pa.norm(dim=1)                           # (B', C)
     std_b = pb.norm(dim=1)
     textured = (std_a > 1e-4).all(1) & (std_b > 1e-4).all(1)
     if not textured.any():
-        return torch.empty(0, device=images.device)
-    pa = pa[textured] / std_a[textured].unsqueeze(1).clamp(min=1e-6)  # (B'', P*P, 3)
+        empty = torch.empty(0, device=images.device)
+        if return_full:
+            return empty, empty.bool(), int(valid.sum()), _full(None, None, None)
+        return empty, empty.bool(), int(valid.sum())
+    pa = pa[textured] / std_a[textured].unsqueeze(1).clamp(min=1e-6)  # (B'', P*P, C)
     pb = pb[textured] / std_b[textured].unsqueeze(1).clamp(min=1e-6)
-    return 1.0 - (pa * pb).sum(dim=1).mean(dim=1).clamp(-1.0, 1.0)   # mean over channels
+    zncc = (pa * pb).sum(dim=1).mean(dim=1).clamp(-1.0, 1.0)         # (B'',) mean over channels
+
+    if ncc_grad_alpha > 0.0:
+        # Gipuma-style edge term, but ZNCC-consistent: a second ZNCC on the
+        # patch gradient magnitude (sharper minimum than intensity NCC).
+        # ρ = (1-α)(1-ZNCC_I) + α(1-ZNCC_∇)  ⇔  zncc ← (1-α)·zncc_I + α·zncc_∇
+        def _grad_mag(p: Tensor) -> Tensor:
+            p2 = p.reshape(p.shape[0], P, P, -1)
+            gx = torch.zeros_like(p2);  gy = torch.zeros_like(p2)
+            gx[:, :, 1:-1, :] = 0.5 * (p2[:, :, 2:, :] - p2[:, :, :-2, :])
+            gy[:, 1:-1, :, :] = 0.5 * (p2[:, 2:, :, :] - p2[:, :-2, :, :])
+            return torch.sqrt(gx * gx + gy * gy + 1e-12).reshape(
+                p.shape[0], P * P, -1)
+        ga = _center(_grad_mag(raw_a)[textured])
+        gb = _center(_grad_mag(raw_b)[textured])
+        ga = ga / ga.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        gb = gb / gb.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        zncc_g = (ga * gb).sum(dim=1).mean(dim=1).clamp(-1.0, 1.0)
+        if dbg is not None and zncc.numel() > 0:
+            dbg["zncc_I"] = float(zncc.detach().mean())
+            dbg["zncc_grad"] = float(zncc_g.detach().mean())
+        zncc = ((1.0 - ncc_grad_alpha) * zncc
+                + ncc_grad_alpha * zncc_g).clamp(-1.0, 1.0)
+    keep = zncc > ncc_min                                             # PMVS photometric gate
+    if return_full:
+        return zncc, keep, int(valid.sum()), _full(zncc, valid, textured)
+    return zncc, keep, int(valid.sum())
 
 
 def photo_loss(
@@ -234,11 +314,26 @@ def photo_loss(
     n_alt: int, cos_thresh: float,
     w_photo: float, w_feature: float, w_ncc: float, ncc_patch: int, ncc_half_pix: float,
     sample_mode: str, gaussian_sigma: float, gaussian_radius: int,
-    step: int,
+    step: int, ncc_min: float = 0.4, occ_mode: str = "pinhole",
+    hit_bg: Tensor | None = None,
+    w_ncc_normal: float = 0.0,
+    ncc_topk: int = 0,
+    ncc_normal_patch: int = -1,
+    ncc_normal_half_pix: float = -1.0,
+    ncc_color: str = "gray",
+    ncc_grad_alpha: float = 0.0,
+    ncc_patch_wsigma: float = 0.0,
+    trace_cfg=None,
+    prof=None,
 ) -> tuple[Tensor, dict]:
     """Multi-view photoconsistency loss with occlusion test.
 
     Returns (loss, debug_stats_dict).
+    hit_bg: optional bool (B,) — bounding-sphere exit rays; tracked separately in stats.
+    trace_cfg: optional TraceConfig passed to the occlusion trace_nograd calls
+        (so the K-budget matches the primary trace). Falls back to the module default.
+    prof: optional StepProfiler — if set, the occlusion trace is recorded under
+        its own "occ_trace" bucket (separate from photo+NCC compute).
     """
     B = vi.shape[0]
     alt = alt_nn[vi]  # (B, n_alt)
@@ -255,22 +350,64 @@ def photo_loss(
         uv_self_f = uv_self * uv_self.new_tensor([Wf / W, Hf / H])
         feat_self = F.normalize(bilinear_sample(feature_maps, vi, uv_self_f, Hf, Wf).float(), dim=-1)
 
+    # Normal-branch patch geometry: sentinel <0 → share the position branch's.
+    n_patch    = ncc_normal_patch    if ncc_normal_patch    > 0 else ncc_patch
+    n_half_pix = ncc_normal_half_pix if ncc_normal_half_pix > 0 else ncc_half_pix
+
     loss_terms: list[Tensor] = []
     l1_vals:   list[Tensor] = []
     feat_vals: list[Tensor] = []
     ncc_vals:  list[Tensor] = []
-    n_total = n_in_frame = n_not_occl = n_cos_ok = n_mask = 0
+    ncc_n_vals: list[Tensor] = []
+    ncc_pos_terms: list[Tensor] = []   # raw (un-weighted) terms kept for per-branch
+    ncc_n_terms:   list[Tensor] = []   # gradient diagnostics (∂NCC/∂x vs ∂NCC/∂n)
+    ncc_zncc_vals: list[Tensor] = []
+    ncc_zncc_I_vals: list[float] = []      # intensity-only ZNCC (grad-blend split)
+    ncc_zncc_g_vals: list[float] = []      # gradient-magnitude ZNCC
+    ncc_kept = ncc_textured = ncc_valid = 0
+    ncc_n_kept = ncc_n_textured = ncc_n_valid = 0
 
-    # Batch all occlusion traces across alt views — (B*n_alt, 3) instead of n_alt serial traces
+    # Top-K robust aggregation: per surface point, keep the K best-correlating
+    # alt views across the n_alt pool (PMVS/COLMAP-style occlusion/grazing
+    # rejection) instead of averaging (1−ZNCC) over all valid views. Collect
+    # per-view full-length ZNCC columns, reduce after the loop.
+    use_topk = ncc_topk > 0
+    zpos_cols: list[Tensor] = []
+    znrm_cols: list[Tensor] = []
+
+    def _scatter_col(zf: Tensor, midx: Tensor) -> Tensor:
+        col = x_theta.new_full((B,), float("nan"))
+        if zf.numel() > 0:
+            col = col.clone()
+            col[midx] = zf
+        return col
+    n_total = n_in_frame = n_not_occl = n_cos_ok = n_mask = n_mask_bg = 0
+
     alt_flat = alt.reshape(-1)                                        # (B*n_alt,)
     op_all   = origins_all[alt_flat]                                  # (B*n_alt, 3)
-    dir_all  = x_theta.unsqueeze(1).expand(B, n_alt, 3).reshape(-1, 3) - op_all
+    x_flat   = x_theta.detach().unsqueeze(1).expand(B, n_alt, 3).reshape(-1, 3)
+    dir_all  = op_all - x_flat                                        # hit-point → alt cam
     dist_all = dir_all.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    dp_all   = dir_all / dist_all
-    with torch.no_grad():
-        _, tp_all, hitp_all = trace_nograd(f, op_all, dp_all)
-    tp_all   = tp_all.reshape(B, n_alt)
-    hitp_all = hitp_all.reshape(B, n_alt)
+    dp_all   = dir_all / dist_all                                     # unit, hit→alt
+
+    _occ_cm = prof.timed("occ_trace") if prof is not None else contextlib.nullcontext()
+    _trace_kw = {"cfg": trace_cfg} if trace_cfg is not None else {}
+    with _occ_cm:
+        if occ_mode == "from_hit":
+            # Trace from hit point toward the alt camera instead of from the pinhole.
+            # Skips the empty space traversal so each trace converges in far fewer steps.
+            # Occlusion check: trace must NOT hit anything before reaching the alt camera.
+            _eps_occ = 1e-2
+            with torch.no_grad():
+                _, tp_all, hitp_all = trace_nograd(f, x_flat + _eps_occ * dp_all, dp_all, **_trace_kw)
+            tp_all   = tp_all.reshape(B, n_alt)
+            hitp_all = hitp_all.reshape(B, n_alt)
+        else:  # "pinhole"
+            with torch.no_grad():
+                _, tp_all, hitp_all = trace_nograd(f, op_all, -dp_all, **_trace_kw)
+            tp_all   = tp_all.reshape(B, n_alt)
+            hitp_all = hitp_all.reshape(B, n_alt)
+
     dist_all = dist_all.squeeze(-1).reshape(B, n_alt)
     dp_all   = dp_all.reshape(B, n_alt, 3)
 
@@ -289,13 +426,16 @@ def photo_loss(
         in_frame = (xc[:, 2] > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < W) \
                    & (uv[:, 1] >= 0) & (uv[:, 1] < H)
 
-        depth_ok = dist <= tp + 1e-1
-        not_occl = hitp & depth_ok
+        if occ_mode == "from_hit":
+            # Trace started at hit-point toward alt cam: occluded iff it hits before reaching cam.
+            not_occl = ~hitp | (tp > dist - 0.1)
+        else:
+            depth_ok = dist <= tp + 1e-1
+            not_occl = hitp & depth_ok
 
         if step % 50 == 0 and k == 0:
             delta = tp - dist
             print(f"  occ alt0: hitp={hitp.float().mean():.2f}  "
-                  f"depth_ok={depth_ok.float().mean():.2f}  "
                   f"not_occl={not_occl.float().mean():.2f}  "
                   f"tp-dist min/mean/max={delta.min():.3f}/{delta.mean():.3f}/{delta.max():.3f}")
 
@@ -313,6 +453,8 @@ def photo_loss(
         n_not_occl += int(not_occl.sum())
         n_cos_ok   += int(cos_ok.sum())
         n_mask     += int(mask.sum())
+        if hit_bg is not None:
+            n_mask_bg += int((mask & hit_bg).sum())
 
         if step % 50 == 0 and k == 0:
             x_norm_str = (f"[{x_theta[hit].detach().norm(dim=-1).min():.3f},"
@@ -337,18 +479,174 @@ def photo_loss(
                 loss_terms.append(w_feature * feat_term)
                 feat_vals.append(feat_term.detach())
             if w_ncc > 0:
-                ncc = pmvs_ncc_loss(
+                _dbg = {} if ncc_grad_alpha > 0.0 else None
+                zncc, keep, n_valid, *zf = pmvs_ncc_loss(
                     images,
                     x_theta[mask], n[mask].detach(),
                     vi[mask], ak[mask],
                     K_all, w2c_all,
                     H, W, ncc_patch, ncc_half_pix,
                     sample_mode, gaussian_sigma, gaussian_radius,
+                    ncc_min,
+                    return_full=use_topk,
+                    ncc_color=ncc_color,
+                    ncc_grad_alpha=ncc_grad_alpha,
+                    patch_wsigma=ncc_patch_wsigma,
+                    dbg=_dbg,
                 )
-                if ncc.numel() > 0:
-                    ncc_term = ncc.mean()
+                if _dbg and "zncc_I" in _dbg:
+                    ncc_zncc_I_vals.append(_dbg["zncc_I"])
+                    ncc_zncc_g_vals.append(_dbg["zncc_grad"])
+                ncc_valid    += n_valid
+                ncc_textured += int(zncc.numel())
+                ncc_kept     += int(keep.sum())
+                if zncc.numel() > 0:
+                    ncc_zncc_vals.append(zncc.detach().mean())
+                if use_topk:
+                    zpos_cols.append(_scatter_col(
+                        zf[0], mask.nonzero(as_tuple=True)[0]))
+                elif keep.any():
+                    ncc_term = (1.0 - zncc[keep]).mean()
                     loss_terms.append(w_ncc * ncc_term)
                     ncc_vals.append(ncc_term.detach())
+                    ncc_pos_terms.append(ncc_term)
+            if w_ncc_normal > 0:
+                # Normal branch: position detached, normal carries gradient.
+                # Gradient flows only through ∂NCC/∂n · ∂n/∂θ (local
+                # orientation/curvature), decoupled from the level-set position.
+                zncc_n, keep_n, n_valid_n, *zf_n = pmvs_ncc_loss(
+                    images,
+                    x_theta[mask].detach(), n[mask],
+                    vi[mask], ak[mask],
+                    K_all, w2c_all,
+                    H, W, n_patch, n_half_pix,
+                    sample_mode, gaussian_sigma, gaussian_radius,
+                    ncc_min,
+                    return_full=use_topk,
+                    ncc_color=ncc_color,
+                    ncc_grad_alpha=ncc_grad_alpha,
+                    patch_wsigma=ncc_patch_wsigma,
+                )
+                ncc_n_valid    += n_valid_n
+                ncc_n_textured += int(zncc_n.numel())
+                ncc_n_kept     += int(keep_n.sum())
+                if use_topk:
+                    znrm_cols.append(_scatter_col(
+                        zf_n[0], mask.nonzero(as_tuple=True)[0]))
+                elif keep_n.any():
+                    ncc_n_term = (1.0 - zncc_n[keep_n]).mean()
+                    loss_terms.append(w_ncc_normal * ncc_n_term)
+                    ncc_n_vals.append(ncc_n_term.detach())
+                    ncc_n_terms.append(ncc_n_term)
+
+    # --- top-K reduction over the alt-view pool ---
+    def _topk_reduce(cols: list[Tensor]) -> Tensor | None:
+        if not cols:
+            return None
+        Z = torch.stack(cols, dim=1)                       # (B, n_cols) w/ grad
+        ok = ~torch.isnan(Z) & (Z > ncc_min)               # usable + gate
+        Zf = Z.masked_fill(~ok, -2.0)                       # sentinel < [-1,1]
+        K = min(ncc_topk, Zf.shape[1])
+        vals, _ = Zf.topk(K, dim=1)                         # (B, K) best views
+        sel = vals > -1.5                                   # real picks only
+        cnt = sel.sum(1)                                    # (B,)
+        rows = cnt > 0
+        if not rows.any():
+            return None
+        per_row = torch.where(sel, 1.0 - vals,
+                              torch.zeros_like(vals)).sum(1) / cnt.clamp(min=1)
+        return per_row[rows].mean()
+
+    # ZNCC diagnostics: mean over the WHOLE valid pool vs mean over the
+    # top-K selected views (per surface point, then averaged). The gap
+    # quantifies how much the robust selection buys over the plain mean.
+    ncc_zncc_mean = ncc_zncc_topk = 0.0
+    if use_topk and zpos_cols:
+        with torch.no_grad():
+            Zd = torch.stack(zpos_cols, dim=1)             # (B, n_cols)
+            okd = ~torch.isnan(Zd) & (Zd > ncc_min)
+            cpx = okd.sum(1)
+            rmean = cpx > 0
+            if rmean.any():
+                zsum = torch.where(okd, Zd, torch.zeros_like(Zd)).sum(1)
+                ncc_zncc_mean = float(
+                    (zsum[rmean] / cpx[rmean].clamp(min=1)).mean())
+                Zfd = Zd.masked_fill(~okd, -2.0)
+                Kd = min(ncc_topk, Zfd.shape[1])
+                vd, _ = Zfd.topk(Kd, dim=1)
+                seld = vd > -1.5
+                cks = seld.sum(1)
+                rk = cks > 0
+                ncc_zncc_topk = float(
+                    (torch.where(seld, vd, torch.zeros_like(vd)).sum(1)[rk]
+                     / cks[rk].clamp(min=1)).mean())
+
+    if use_topk and w_ncc > 0:
+        t = _topk_reduce(zpos_cols)
+        if t is not None:
+            loss_terms.append(w_ncc * t)
+            ncc_vals.append(t.detach())
+            ncc_pos_terms.append(t)
+    if use_topk and w_ncc_normal > 0:
+        tn = _topk_reduce(znrm_cols)
+        if tn is not None:
+            loss_terms.append(w_ncc_normal * tn)
+            ncc_n_vals.append(tn.detach())
+            ncc_n_terms.append(tn)
+
+    # --- per-branch gradient diagnostic (every 50 steps) ---
+    # Isolates the "leverage" ∂NCC/∂x (position branch) vs ∂NCC/∂n (normal
+    # branch), with the network factors ∂x/∂θ, ∂n/∂θ excluded.
+    #
+    # The two raw norms are NOT comparable: ‖∂NCC/∂x‖ is ΔNCC per world-unit of
+    # patch-*center* displacement, while ‖∂NCC/∂n‖ is ΔNCC per *radian* of
+    # normal tilt (n is unit here — normalized in train.py before photo_loss
+    # and again in pmvs_ncc_loss). A unit tilt of the tangent frame moves the
+    # patch *edge* by the patch half-extent r = half_pix·z_ref/f_x — the exact
+    # calibration step_3d uses. Dividing the normal leverage by r expresses it
+    # as ΔNCC per world-unit of edge motion, the same units as the position
+    # leverage, so ncc_grad_n_xeq and ncc_grad_pos can be compared directly
+    # (and their ratio read as "how much orientation buys vs translation").
+    # r is taken as a scalar mean over hit points (it depends only on the
+    # surface point and its own reference view, not on the alt pairing).
+    ncc_grad_pos = ncc_grad_pos_median = ncc_grad_pos_p90 = 0.0
+    ncc_grad_n = ncc_grad_n_median = ncc_grad_n_p90 = 0.0
+    ncc_grad_n_xeq = ncc_grad_n_xeq_median = ncc_grad_n_xeq_p90 = 0.0
+    ncc_grad_ratio = 0.0
+    if step % 50 == 0:
+        if ncc_pos_terms and x_theta.requires_grad:
+            gp = torch.autograd.grad(torch.stack(ncc_pos_terms).mean(), x_theta,
+                                     retain_graph=True, allow_unused=True)[0]
+            if gp is not None:
+                gp_norm = gp.norm(dim=-1)
+                ncc_grad_pos = gp_norm.mean().item()
+                ncc_grad_pos_median = gp_norm.median().item()
+                ncc_grad_pos_p90 = torch.quantile(gp_norm, 0.9).item()
+        if ncc_n_terms and n.requires_grad:
+            gn = torch.autograd.grad(torch.stack(ncc_n_terms).mean(), n,
+                                     retain_graph=True, allow_unused=True)[0]
+            if gn is not None:
+                gn_norm = gn.norm(dim=-1)
+                ncc_grad_n = gn_norm.mean().item()
+                ncc_grad_n_median = gn_norm.median().item()
+                ncc_grad_n_p90 = torch.quantile(gn_norm, 0.9).item()
+                # Patch half-extent r = half_pix·z_ref/f_x in world units.
+                with torch.no_grad():
+                    sel = hit if hit.any() else torch.ones_like(hit)
+                    xs = x_theta[sel].detach()
+                    vs = vi[sel]
+                    R_r = w2c_all[vs, :3, :3]
+                    t_r = w2c_all[vs, :3, 3]
+                    z_ref = (torch.einsum('bij,bj->bi', R_r, xs) + t_r)[:, 2].clamp(min=1e-3)
+                    f_x = K_all[vs, 0, 0]
+                    r_patch = float((n_half_pix * z_ref / f_x).mean())
+                if r_patch > 1e-12:
+                    inv_r = 1.0 / r_patch
+                    ncc_grad_n_xeq = ncc_grad_n * inv_r
+                    ncc_grad_n_xeq_median = ncc_grad_n_median * inv_r
+                    ncc_grad_n_xeq_p90 = ncc_grad_n_p90 * inv_r
+                    if ncc_grad_pos > 1e-12:
+                        ncc_grad_ratio = ncc_grad_n_xeq / ncc_grad_pos
 
     if loss_terms:
         loss = torch.stack(loss_terms).mean()
@@ -356,45 +654,37 @@ def photo_loss(
         loss = f(x_theta.detach()[:1]).sum() * 0.0
     stats = dict(n_mask=n_mask, n_in_frame=n_in_frame,
                  n_not_occl=n_not_occl, n_cos_ok=n_cos_ok, n_total=n_total,
+                 n_mask_bg=n_mask_bg,
                  l1=torch.stack(l1_vals).mean().item() if l1_vals else 0.0,
                  feature=torch.stack(feat_vals).mean().item() if feat_vals else 0.0,
-                 ncc=torch.stack(ncc_vals).mean().item() if ncc_vals else 0.0)
+                 ncc=torch.stack(ncc_vals).mean().item() if ncc_vals else 0.0,
+                 ncc_normal=torch.stack(ncc_n_vals).mean().item() if ncc_n_vals else 0.0,
+                 ncc_weighted=(w_ncc * torch.stack(ncc_vals).mean().item()) if ncc_vals else 0.0,
+                 ncc_normal_weighted=(w_ncc_normal * torch.stack(ncc_n_vals).mean().item()) if ncc_n_vals else 0.0,
+                 ncc_zncc=torch.stack(ncc_zncc_vals).mean().item() if ncc_zncc_vals else 0.0,
+                 ncc_zncc_mean=ncc_zncc_mean,
+                 ncc_zncc_topk=ncc_zncc_topk,
+                 ncc_grad_alpha=ncc_grad_alpha,
+                 ncc_zncc_I=(sum(ncc_zncc_I_vals) / len(ncc_zncc_I_vals)
+                             if ncc_zncc_I_vals else 0.0),
+                 ncc_zncc_grad=(sum(ncc_zncc_g_vals) / len(ncc_zncc_g_vals)
+                                if ncc_zncc_g_vals else 0.0),
+                 ncc_valid=ncc_valid, ncc_textured=ncc_textured, ncc_kept=ncc_kept,
+                 ncc_n_valid=ncc_n_valid, ncc_n_textured=ncc_n_textured, ncc_n_kept=ncc_n_kept,
+                 ncc_grad_pos=ncc_grad_pos,
+                 ncc_grad_pos_median=ncc_grad_pos_median,
+                 ncc_grad_pos_p90=ncc_grad_pos_p90,
+                 ncc_grad_n=ncc_grad_n,
+                 ncc_grad_n_median=ncc_grad_n_median,
+                 ncc_grad_n_p90=ncc_grad_n_p90,
+                 ncc_grad_n_xeq=ncc_grad_n_xeq,
+                 ncc_grad_n_xeq_median=ncc_grad_n_xeq_median,
+                 ncc_grad_n_xeq_p90=ncc_grad_n_xeq_p90,
+                 ncc_grad_ratio=ncc_grad_ratio)
     return loss, stats
 
 
 # ---------- geometry / regularisation ----------
-
-def mask_loss_min_sdf(sdf_min: Tensor, fg: Tensor, alpha: float,
-                      fg_offset: float = 0.1) -> Tensor:
-    """Mask loss via minimum SDF along traced rays (Yariv et al. IDR / NeuS).
-
-    S_{p,α} = σ(−α · (min_t f(o + td) − fg_offset · O_p))
-
-    fg_offset shifts sdf_min for foreground rays so that a hit (sdf_min≈0)
-    maps to σ(α·offset) > 0.5 instead of σ(0)=0.5, giving a stronger
-    gradient toward S=1 without needing the intersection point.
-    Background rays are unaffected (offset=0 for bg).
-
-    Works for all rays. Requires sdf_min from trace_unrolled.
-    """
-    sdf_adj = sdf_min - fg.float() * fg_offset
-    S = torch.sigmoid(-alpha * sdf_adj)
-    return F.binary_cross_entropy(S.clamp(1e-6, 1 - 1e-6), fg.float()) / alpha
-
-
-def silhouette_loss(f: FTheta, o: Tensor, u: Tensor, fg: Tensor,
-                    sil_k: int, sil_t_near: float, sil_t_far: float,
-                    sil_s: float) -> Tensor:
-    """Volumetric silhouette BCE loss (unbiased stratified sampling)."""
-    B = o.shape[0]
-    dt    = (sil_t_far - sil_t_near) / sil_k
-    t_sil = torch.linspace(sil_t_near, sil_t_far, sil_k, device=o.device)
-    t_sil = t_sil.unsqueeze(0) + torch.rand(B, sil_k, device=o.device) * dt
-    pts   = o.unsqueeze(1) + t_sil.unsqueeze(-1) * u.unsqueeze(1)
-    q_k   = torch.sigmoid(-sil_s * f(pts.reshape(-1, 3))).reshape(B, sil_k)
-    p_sil = 1.0 - (1.0 - q_k).prod(dim=1)
-    return F.binary_cross_entropy(p_sil.clamp(1e-4, 1 - 1e-4), fg.float())
-
 
 def eikonal_loss(f: FTheta, eik_pts: Tensor, n_vol: int, device: str) -> Tensor:
     """‖∇sdf‖ = 1 at trace samples + random volume points."""
@@ -410,306 +700,3 @@ def cam_free_loss(f: FTheta, o: Tensor) -> Tensor:
     return F.relu(-f(o)).mean()
 
 
-def sfm_sdf_loss(f: FTheta, sfm_pts: Tensor, batch: int) -> Tensor:
-    """SFM points should be on the surface: f(x_sfm)² ≈ 0."""
-    idx = torch.randint(0, sfm_pts.shape[0], (batch,), device=sfm_pts.device)
-    return f(sfm_pts[idx]).square().mean()
-
-
-def free_space_loss(f: FTheta, sfm_origins: Tensor, sfm_targets: Tensor,
-                    n_sfm_pairs: int, batch: int, n_free: int) -> Tensor:
-    """Points along camera→SFM rays (before the surface) must satisfy f > 0."""
-    idx    = torch.randint(0, n_sfm_pairs, (batch,), device=sfm_origins.device)
-    o_fs   = sfm_origins[idx]
-    x_fs   = sfm_targets[idx]
-    t_fs   = (1.0 - torch.rand(batch, n_free, 1, device=o_fs.device).pow(3.0)).clamp(max=0.98)
-    pts_fs = o_fs.unsqueeze(1) + t_fs * (x_fs - o_fs).unsqueeze(1)
-    return F.relu(-f(pts_fs.reshape(-1, 3))).mean()
-
-
-def surface_loss(
-    f: FTheta, o: Tensor, u: Tensor, vi: Tensor,
-    c2w_all: Tensor, mvs_depth_flat: Tensor, mvs_valid_flat: Tensor,
-    idx: Tensor,
-) -> Tensor:
-    """|f(x*)| = 0 at back-projected depth-prior surface points. No hit required."""
-    mvs_d = mvs_depth_flat[idx]
-    valid = mvs_valid_flat[idx]
-    if not valid.any():
-        return torch.zeros(1, device=o.device).squeeze()
-    z_cams    = c2w_all[vi, :3, 2]
-    cos_theta = (u * z_cams).sum(-1).abs().clamp(min=1e-6)
-    t_target  = mvs_d / cos_theta
-    x_star    = o + t_target.unsqueeze(-1) * u
-    return f(x_star[valid]).abs().mean()
-
-
-def mvs_depth_loss(
-    x_theta: Tensor, o: Tensor, u: Tensor, vi: Tensor, hit: Tensor,
-    c2w_all: Tensor, mvs_depth_flat: Tensor, mvs_valid_flat: Tensor,
-    idx: Tensor, step: int,
-) -> Tensor:
-    """Smooth-L1 alignment between sphere-traced depth and MVS depth prior."""
-    mvs_d = mvs_depth_flat[idx]
-    # Only supervise rays that hit AND have a valid depth prior.
-    # Without the hit gate, x_theta for misses is ~t_far, producing spurious gradients.
-    mvs_v = mvs_valid_flat[idx] & hit
-    if not mvs_v.any():
-        return torch.zeros(1, device=o.device).squeeze()
-    z_cams    = c2w_all[vi, :3, 2]
-    cos_theta = (u * z_cams).sum(-1).abs().clamp(min=1e-6)
-    t_target  = mvs_d / cos_theta
-    t_pred    = ((x_theta - o) * u).sum(-1)
-    loss = F.smooth_l1_loss(t_pred[mvs_v], t_target[mvs_v])
-    if step % 50 == 0:
-        with torch.no_grad():
-            err = (t_pred[mvs_v] - t_target[mvs_v]).abs()
-            print(f"  mvs_depth: valid={mvs_v.sum().item()}/{idx.shape[0]}"
-                  f"  |Δt| mean={err.mean():.3f} p90={err.quantile(.9):.3f}")
-    return loss
-
-
-def mvs_sdf_loss(
-    f: FTheta,
-    x: Tensor,
-    c2w_all: Tensor,
-    w2c_all: Tensor,
-    K_all: Tensor,
-    mvs_depth_maps: Tensor,
-    mvs_valid_maps: Tensor,
-    mvs_normal_maps: Tensor,
-    H: int,
-    W: int,
-    down: int,
-    n_views: int,
-    trunc: float,
-    smooth: float,
-    far_thresh: float,
-    far_att: float,
-    near_thresh: float,
-    near_att: float,
-    step: int,
-) -> Tensor:
-    """Volumetric SDF target from MVS depth, following the depth-carving loss.
-
-    For detached 3D samples x, project into several depth maps, back-project
-    D(p), approximate the signed distance with the depth normal, keep the
-    closest valid MVS surface, and supervise f(x). This mirrors the paper loss
-    structure: eikonal samples -> carving target -> L1/SmoothL1 with in-range
-    masking and near/far attenuation.
-    """
-    V_all, H_d, W_d = mvs_depth_maps.shape
-    if n_views > 0 and n_views < V_all:
-        view_ids = torch.randperm(V_all, device=x.device)[:n_views]
-    else:
-        view_ids = torch.arange(V_all, device=x.device)
-    V = view_ids.shape[0]
-
-    x_det = x.detach()
-    w2c = w2c_all[view_ids]
-    R = w2c[:, :3, :3]
-    t = w2c[:, :3, 3]
-    xc = torch.einsum("vij,nj->nvi", R, x_det) + t.unsqueeze(0)
-    uv_h = torch.einsum("vij,nvj->nvi", K_all[view_ids], xc)
-    uv = uv_h[..., :2] / uv_h[..., 2:3].clamp(min=1e-6)
-
-    in_frame = (xc[..., 2] > 1e-3) & (uv[..., 0] >= 0) & (uv[..., 0] < W) \
-               & (uv[..., 1] >= 0) & (uv[..., 1] < H)
-    px = (uv[..., 0] / down).long().clamp(0, W_d - 1)
-    py = (uv[..., 1] / down).long().clamp(0, H_d - 1)
-    vid = view_ids.view(1, V).expand(x.shape[0], V)
-
-    depth = mvs_depth_maps[vid, py, px]
-    valid = in_frame & mvs_valid_maps[vid, py, px]
-    if not valid.any():
-        return f(x[:1].detach()).sum() * 0.0
-
-    K = K_all[view_ids].unsqueeze(0)
-    xD_cam = torch.stack([
-        (uv[..., 0] - K[..., 0, 2]) / K[..., 0, 0] * depth,
-        (uv[..., 1] - K[..., 1, 2]) / K[..., 1, 1] * depth,
-        depth,
-    ], dim=-1)
-
-    c2w = c2w_all[view_ids]
-    xD = torch.einsum("vij,nvj->nvi", c2w[:, :3, :3], xD_cam) + c2w[:, :3, 3].unsqueeze(0)
-    cam_o = c2w[:, :3, 3].unsqueeze(0)
-    view_dir = F.normalize(xD - cam_o, dim=-1)
-
-    n_cam = mvs_normal_maps[vid, py, px]
-    n_world = F.normalize(torch.einsum("vij,nvj->nvi", c2w[:, :3, :3], n_cam), dim=-1)
-    normal_scale = -(n_world * view_dir).sum(-1)
-    valid = valid & torch.isfinite(normal_scale) & (normal_scale > 1e-3)
-    if not valid.any():
-        return f(x[:1].detach()).sum() * 0.0
-
-    delta = xD - x_det.unsqueeze(1)
-    sign = torch.sign((delta * view_dir).sum(-1)).clamp(min=-1.0, max=1.0)
-    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-    target_all = (sign * normal_scale * delta.norm(dim=-1)).clamp(-trunc, trunc)
-
-    abs_target = target_all.abs().masked_fill(~valid, float("inf"))
-    best_abs, best_view = abs_target.min(dim=1)
-    in_range = torch.isfinite(best_abs)
-    if not in_range.any():
-        return f(x[:1].detach()).sum() * 0.0
-    target = target_all[torch.arange(x.shape[0], device=x.device), best_view].detach()
-
-    pred = f(x[in_range])
-    target = target[in_range]
-    if smooth > 0:
-        loss = F.smooth_l1_loss(pred / smooth, target / smooth, reduction="none") * smooth
-    else:
-        loss = F.l1_loss(pred, target, reduction="none")
-
-    far_weight = torch.ones_like(target)
-    if far_thresh > 0 and far_att != 1.0:
-        far_weight = torch.where(target.abs() > far_thresh,
-                                 torch.full_like(target, far_att),
-                                 far_weight)
-    near_weight = torch.ones_like(target)
-    if near_thresh > 0 and near_att != 1.0:
-        near_weight = torch.where(target.abs() < near_thresh,
-                                  torch.full_like(target, near_att),
-                                  near_weight)
-    loss = (loss * far_weight * near_weight).mean()
-
-    if step % 50 == 0:
-        with torch.no_grad():
-            err = (pred.detach() - target).abs()
-            print(f"  mvs_sdf: valid={in_range.sum().item()}/{x.shape[0]} views={V}"
-                  f"  |f-l| mean={err.mean():.3f} p90={err.quantile(.9):.3f}"
-                  f"  target=[{target.min():.3f},{target.max():.3f}]")
-    return loss
-
-
-def mvsdf_carving_loss(
-    f: FTheta,
-    x: Tensor,
-    w2c_all: Tensor,
-    K_all: Tensor,
-    depth_maps: Tensor,
-    valid_maps: Tensor,
-    H: int, W: int, down: int,
-    out_thresh_perc: float,
-    trunc: float,
-    smooth: float,
-    far_thresh: float, far_att: float,
-    near_thresh: float, near_att: float,
-    step: int,
-) -> Tensor:
-    """MVSDF-style depth loss with multi-view carving consensus (Zhang et al. 2021).
-
-    For each 3D sample point, projects into all depth maps and votes:
-      - inside   (point_depth > surface_depth, behind surface): SDF target < 0
-      - outside  (point_depth < surface_depth, in front):       SDF target > 0
-      - invalid  (in frustum but no depth measurement):         counts as 0.5 outside
-                 — matches carving_t (paper default). This applies a weak free-space
-                 prior to pixels where depth estimation failed.
-
-    scene_outside = (n_outside + 0.5 * n_invalid) / n_in_range > out_thresh_perc
-
-    SDF target = -(point_depth - surface_depth), clamped to ±trunc.
-    Supervision is only applied where at least one view sees the point.
-    """
-    V, H_d, W_d = depth_maps.shape
-    N = x.shape[0]
-    BIG = 1e6
-
-    x_det = x.detach()
-
-    total_in_range  = torch.zeros(N, device=x.device)
-    total_valid     = torch.zeros(N, device=x.device)
-    total_inside    = torch.zeros(N, device=x.device)
-    best_inside_d   = torch.full((N,), BIG,  device=x.device)
-    best_outside_d  = torch.full((N,), -BIG, device=x.device)
-
-    for v in range(V):
-        R = w2c_all[v, :3, :3]; t = w2c_all[v, :3, 3]
-        xc = x_det @ R.T + t                                         # (N, 3)
-        point_depth = xc[:, 2]                                       # (N,)
-
-        xp  = xc @ K_all[v].T                                        # (N, 3)
-        uv  = xp[:, :2] / xp[:, 2:3].clamp(min=1e-6)                # (N, 2) full-res
-        uv_d = uv / down                                              # (N, 2) depth-map res
-
-        # normalize to [-1,1] for grid_sample (align_corners=False)
-        u_n = uv_d[:, 0] / W_d * 2 - 1
-        v_n = uv_d[:, 1] / H_d * 2 - 1
-        grid = torch.stack([u_n, v_n], dim=1).view(1, N, 1, 2)
-
-        in_range = (xc[:, 2] > 0) & (u_n >= -1) & (u_n <= 1) & (v_n >= -1) & (v_n <= 1)
-
-        gathered = F.grid_sample(
-            depth_maps[v].unsqueeze(0).unsqueeze(0), grid,
-            mode='nearest', padding_mode='zeros', align_corners=False,
-        ).view(N)
-        g_valid = F.grid_sample(
-            valid_maps[v].float().unsqueeze(0).unsqueeze(0), grid,
-            mode='nearest', padding_mode='zeros', align_corners=False,
-        ).view(N) > 0.5
-
-        valid   = (gathered > 0) & in_range & g_valid
-        inside  = (point_depth > gathered * 0.99) & valid
-        outside = valid & ~inside
-        dist    = point_depth - gathered                              # + = inside, − = outside
-
-        total_in_range += in_range.float()
-        total_valid    += valid.float()
-        total_inside   += inside.float()
-
-        # keep closest-to-surface distance per vote direction (RunningTopK k=1)
-        best_inside_d  = torch.where(inside  & (dist < best_inside_d),  dist, best_inside_d)
-        best_outside_d = torch.where(outside & (dist > best_outside_d), dist, best_outside_d)
-
-    # vote — invalid pixels (in frustum, no depth) count as 0.5 outside (carving_t paper default)
-    total_invalid  = total_in_range - total_valid
-    outside_perc   = (total_valid - total_inside + total_invalid * 0.5) / (total_in_range + 1e-9)
-    scene_in_range = total_in_range > 0
-    scene_valid    = total_valid > 0
-    scene_outside  = (outside_perc > out_thresh_perc) & scene_in_range
-    scene_inside   = scene_in_range & ~scene_outside
-
-    # signed depth diff: positive inside, negative outside → negate for SDF target
-    # Clamp BIG sentinel values to ±trunc before computing target
-    safe_inside_d  = best_inside_d.clamp(max=trunc)
-    safe_outside_d = best_outside_d.clamp(min=-trunc)
-    ave_dist = safe_inside_d * scene_inside.float() + safe_outside_d * scene_outside.float()
-    target   = (-ave_dist).clamp(-trunc, trunc).detach()
-
-    # Only supervise where at least one view has a valid depth measurement.
-    # Points in frustum but with zero valid depth (sparse MVS coverage) would
-    # otherwise get best_inside_d=BIG → target=-trunc for all of them, which
-    # collapses the SDF to constant -trunc everywhere.
-    in_range_mask = scene_valid
-    if not in_range_mask.any():
-        return f(x[:1].detach()).sum() * 0.0
-
-    pred   = f(x[in_range_mask])
-    tgt    = target[in_range_mask]
-
-    if smooth > 0:
-        loss = F.smooth_l1_loss(pred / smooth, tgt / smooth, reduction='none') * smooth
-    else:
-        loss = F.l1_loss(pred, tgt, reduction='none')
-
-    far_w  = torch.where(tgt.abs() > far_thresh,  torch.full_like(tgt, far_att),  torch.ones_like(tgt))
-    near_w = torch.where(tgt.abs() < near_thresh, torch.full_like(tgt, near_att), torch.ones_like(tgt))
-    loss   = (loss * far_w * near_w).mean()
-
-    if step % 50 == 0:
-        with torch.no_grad():
-            err = (pred.detach() - tgt).abs()
-            print(f"  mvsdf_carv: pts={in_range_mask.sum()}/{N} "
-                  f"inside={scene_inside.sum()} outside={scene_outside.sum()} "
-                  f"|f-t| mean={err.mean():.3f} p90={err.quantile(.9):.3f} "
-                  f"tgt=[{tgt.min():.3f},{tgt.max():.3f}]")
-    return loss
-
-
-def behind_hit_loss(f: FTheta, x_theta: Tensor, hit: Tensor,
-                    u: Tensor, eps: float) -> Tensor:
-    """Points just behind the surface along the ray must have f < 0."""
-    if not hit.any():
-        return torch.zeros(1, device=x_theta.device).squeeze()
-    return F.relu(f(x_theta[hit].detach() + eps * u[hit])).mean()

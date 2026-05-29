@@ -1,4 +1,4 @@
-"""Positional encoding for 1-Lipschitz SDF networks."""
+"""Positional encoding for SDF networks."""
 from __future__ import annotations
 
 import torch
@@ -11,7 +11,11 @@ class PositionalEncoding(nn.Module):
     Output dim: input_dims * (2 * multires + 1).
     """
 
-    def __init__(self, multires: int, input_dims: int = 3) -> None:
+    def __init__(
+        self,
+        multires: int,
+        input_dims: int = 3,
+    ) -> None:
         super().__init__()
         if multires < 0:
             raise ValueError(f"multires must be non-negative, got {multires}")
@@ -28,7 +32,8 @@ class PositionalEncoding(nn.Module):
             raise ValueError(f"expected last dim {self.input_dims}, got {x.shape[-1]}")
         if self.multires == 0:
             return x
-        xb = x.unsqueeze(-2) * self.freq_bands.to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+        freq = self.freq_bands.to(dtype=x.dtype, device=x.device)
+        xb = x.unsqueeze(-2) * freq.unsqueeze(-1)
         sin_cos = torch.stack((torch.sin(xb), torch.cos(xb)), dim=-2)
         sin_cos = sin_cos.reshape(*x.shape[:-1], 2 * self.multires * self.input_dims)
         return torch.cat((x, sin_cos), dim=-1)

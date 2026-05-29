@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data, checkpoints, outputs
+data/
+outputs/
+artifacts/
+figs/
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.ply
+*.obj
+*.blend
+*.blend1
+
+# Images / media
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.gif
+
+# Cluster / scratch
+*.slurm
+*.out
+*.err
+.codex/

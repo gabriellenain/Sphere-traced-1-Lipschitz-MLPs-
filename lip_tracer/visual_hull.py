@@ -17,10 +17,54 @@ from .visualize import _trace_view
 # ------------------------------------------------------------------ carving --
 
 def _load_masked_views(scene: Path) -> dict:
-    """Load views with masks for either Blender or DTU scenes."""
+    """Load views with masks for Blender, DTU, or NSVF-T&T scenes.
+    For T&T, masks are read from scene/mask/<stem>.png (e.g. SegFormer sky masks)."""
+    if (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
+        return load_views(scene)   # NSVF-T&T (reads scene/mask/* if present)
     if (scene / "meta_data.json").exists() or (scene / "cameras.npz").exists():
         return load_views(scene)
     return load_blender_views(scene, split="train", down=1)
+
+
+def _percentile_inside_masks(
+    pts: np.ndarray,
+    masks: np.ndarray,
+    c2ws: np.ndarray,
+    Ks: np.ndarray,
+    H: int,
+    W: int,
+    percentile: float = 0.99,
+    min_views: int = 8,
+) -> np.ndarray:
+    """Visibility-aware probabilistic visual hull.
+
+    A voxel V is inside iff:
+      n_view(V) >= min_views,                              # not unseen
+      n_fg(V) / n_view(V) >= percentile                    # tolerated outliers
+
+    Robust to a handful of noisy masks per voxel — required for many-view
+    (e.g. 336) noisy seg-derived silhouettes where strict AND collapses.
+    """
+    N = len(pts)
+    n_view = np.zeros(N, dtype=np.int32)
+    n_fg   = np.zeros(N, dtype=np.int32)
+    for mask, c2w, K in zip(masks, c2ws, Ks):
+        R, t = c2w[:3, :3], c2w[:3, 3]
+        cam = (pts - t[None]) @ R
+        z   = cam[:, 2]
+        valid = z > 1e-3
+        zz = np.where(valid, z, 1.0)
+        px = (cam[:, 0] / zz) * K[0, 0] + K[0, 2]
+        py = (cam[:, 1] / zz) * K[1, 1] + K[1, 2]
+        xi = np.floor(px).astype(np.int32)
+        yi = np.floor(py).astype(np.int32)
+        in_bounds = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H) & valid
+        n_view += in_bounds.astype(np.int32)
+        if in_bounds.any():
+            is_fg = np.zeros(N, dtype=bool)
+            is_fg[in_bounds] = mask[yi[in_bounds], xi[in_bounds]]
+            n_fg += is_fg.astype(np.int32)
+    return (n_view >= min_views) & (n_fg >= percentile * np.maximum(n_view, 1))
 
 
 def _points_inside_masks(
@@ -69,7 +113,12 @@ def _points_inside_masks(
 
 
 def carve(scene: Path = BLENDER_SCENE, res: int = 128, bound: float = 1.5) -> np.ndarray:
-    """Returns (res, res, res) bool occupancy grid."""
+    """Returns (res, res, res) bool occupancy grid.
+
+    For NSVF-T&T scenes (intrinsics.txt + pose/ + scene/mask/), masks are
+    SegFormer sky-derived and noisy — uses visibility-aware percentile
+    carving at p>=0.99 instead of strict AND.
+    """
     views = _load_masked_views(scene)
     masks = views["masks"].numpy().astype(np.float32)   # (V, H, W) in [0, 1]
     c2ws  = views["c2w"].numpy()     # (V, 4, 4)
@@ -79,10 +128,20 @@ def carve(scene: Path = BLENDER_SCENE, res: int = 128, bound: float = 1.5) -> np
     lin = np.linspace(-bound, bound, res, dtype=np.float32)
     zz, yy, xx = np.meshgrid(lin, lin, lin, indexing="ij")
     pts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)  # (N, 3)
-    inside = _points_inside_masks(pts, masks, c2ws, Ks, H, W)
-    occ = inside.reshape(res, res, res)
-    is_dtu = (scene / "cameras.npz").exists() or (scene / "meta_data.json").exists()
-    return keep_central_component(occ) if is_dtu else occ
+    is_tnt = (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir()
+    if is_tnt:
+        print(f"  [carve] T&T scene → visibility-aware percentile p>=0.99")
+        inside = _percentile_inside_masks(pts, masks, c2ws, Ks, H, W,
+                                          percentile=0.99, min_views=8)
+        occ = inside.reshape(res, res, res)
+        # Open-air scenes have multiple legitimate components (barn + ground +
+        # trees + ...); skip keep_central_component which assumes one central
+        # object and would collapse the hull to a few voxels.
+        return occ
+    else:
+        inside = _points_inside_masks(pts, masks, c2ws, Ks, H, W)
+        occ = inside.reshape(res, res, res)
+        return keep_central_component(occ)
 
 
 
@@ -100,9 +159,14 @@ def save_views(occ: np.ndarray, out: Path) -> None:
 # ------------------------------------------------------------------ fitting --
 
 def keep_central_component(occ: np.ndarray) -> np.ndarray:
-    """Keep only the connected component closest to the grid center (DTU objects are centered)."""
+    """Keep only the connected component whose center-of-mass is closest to the grid center.
+
+    Uses 26-connectivity so diagonally-adjacent voxels are treated as connected,
+    which prevents noisy occupancy grids from fragmenting into thousands of 1-voxel components.
+    """
     from scipy.ndimage import label, center_of_mass
-    labeled, n = label(occ)
+    struct = np.ones((3, 3, 3), dtype=np.int8)  # 26-connectivity
+    labeled, n = label(occ, structure=struct)
     if n <= 1:
         return occ
     center = np.array(occ.shape) / 2.0
@@ -205,7 +269,7 @@ def fit_to_hull(
             hw = getattr(f, "head_weight", None)
             head_gnorm = hw.grad.norm().item() if (hw is not None and hw.grad is not None) else 0.0
             from .model import ConvexPotentialLayer
-            first_cpl = next((m for m in f.net if isinstance(m, ConvexPotentialLayer)), None)
+            first_cpl = next((m for m in getattr(f, "net", []) if isinstance(m, ConvexPotentialLayer)), None)
             first_gnorm = first_cpl.weight.grad.norm().item() if (first_cpl is not None and first_cpl.weight.grad is not None) else 0.0
             print(f"  [grad@0] total={gnorm:.3e}  head={head_gnorm:.3e}  first_cpl={first_gnorm:.3e}")
         opt.step()
@@ -277,7 +341,7 @@ def fit_to_hull(
                 f"narrow={narrow_err:.4f} sign={sign_acc:.1%}/{narrow_sign:.1%} "
                 f"sdf=[{pred.mean():+.3f},{pred.std():.3f}] "
                 f"t=[{target.mean():+.3f},{target.std():.3f}] "
-                {grad_str}"
+                f"{grad_str}"
             )
             print(
                 f"      split: uniform err/sign/t/p+={uniform_err:.3f}/{uniform_sign:.1%}/{uniform_t:+.3f}/{uniform_pred_pos:.1%} "

@@ -315,13 +315,16 @@ def trace_idr(
         for i in range(cfg.iters):
             escaped = t >= t_far_ray
             active = ~(converged | escaped)
-            if not active.any():
+            # The compacted loop already materialises idx via nonzero (a device
+            # sync); break on its size instead of a separate active.any() → one
+            # fewer host sync per iteration, and never feed an empty batch to f.
+            idx   = active.nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
                 break
             iters_per_ray = iters_per_ray + active.float()
             if eik_buf is not None and i % cfg.eik_stride == 0:
                 eik_buf[eik_slot * B:(eik_slot + 1) * B] = o + t.unsqueeze(-1) * d
                 eik_slot += 1
-            idx   = active.nonzero(as_tuple=True)[0]
             t_a   = t[idx]
             sdf_a = f(o[idx] + t_a.unsqueeze(-1) * d[idx])
             sdf_min[idx] = torch.minimum(sdf_min[idx], sdf_a)
@@ -358,14 +361,12 @@ def trace_idr(
         hit    = converged & (t < t_far_ray) & (t >= 0)
         hit_bg = (~hit) & (t >= t_far_ray - cfg.eps)
 
-        # Newton refinement — real hits only
-        eps_fd = 1e-3
+        # Newton refinement — real hits only. Keep the directional derivative's
+        # sign and clamp the correction: otherwise a near-grazing hit can jump
+        # far beyond t_far while remaining marked as a valid photo-loss hit.
+        newton_gate = hit & ~bracketed
         for _ in range(cfg.newton_steps):
-            x    = o + t.unsqueeze(-1) * d
-            fval = f(x)
-            ddir = (f(x + eps_fd * d) - fval) / eps_fd
-            ddir = ddir.abs().clamp(min=1e-6)
-            t    = t - torch.where(hit & ~bracketed, fval / ddir, torch.zeros_like(t))
+            t = _newton_step(f, o, d, t, newton_gate, cfg.eps)
 
     # --- differentiable sdf_min via soft-min over detached trace points ---
     # IDR's no-grad trace gives a detached sdf_min, which kills mask_loss_min_sdf.
@@ -451,9 +452,11 @@ def trace_nograd(
     for _ in range(cfg.iters):
         escaped = t >= t_far_ray
         active  = ~(converged | escaped)
-        if not active.any():
-            break
+        # break on the compacted index size (already materialised by nonzero)
+        # instead of a separate active.any() → one fewer host sync per iteration.
         idx   = active.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            break
         t_a   = t[idx]
         sdf_a = f(o[idx] + t_a.unsqueeze(-1) * d[idx])
         if use_bracket:

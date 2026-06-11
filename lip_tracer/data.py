@@ -39,6 +39,35 @@ def colmap_visibility_counts(pts: Tensor, views: dict, chunk: int = 4096) -> Ten
     return counts
 
 
+def colmap_visibility_matrix(pts: Tensor, views: dict, chunk: int = 4096) -> Tensor:
+    """Boolean (V, P): does each masked camera see each COLMAP point.
+
+    Per-view version of colmap_visibility_counts (counts == matrix.sum(0)).
+    This is Geo-Neus's view_id.npy: row v lists the points visible in view v,
+    used for per-view SDF supervision. Built by projection with the same camera
+    arrays the training loop uses, so view rows align with K/w2c indexing.
+    """
+    H, W   = views["H"], views["W"]
+    masks  = views["masks"]
+    w2c    = torch.linalg.inv(views["c2w"])
+    R, t   = w2c[:, :3, :3], w2c[:, :3, 3]
+    K      = views["K"]
+    V      = masks.shape[0]
+    vis    = torch.zeros(V, len(pts), dtype=torch.bool)
+    for i in range(0, len(pts), chunk):
+        p   = pts[i:i + chunk]
+        xc  = torch.einsum("vij,nj->vni", R, p) + t[:, None, :]
+        uvh = torch.einsum("vij,vnj->vni", K, xc)
+        uv  = uvh[..., :2] / uvh[..., 2:3].clamp_min(1e-6)
+        u_, v_ = uv[..., 0], uv[..., 1]
+        in_b = (u_ >= 0) & (u_ < W) & (v_ >= 0) & (v_ < H) & (xc[..., 2] > 1e-4)
+        ui   = u_.round().long().clamp(0, W - 1)
+        vi   = v_.round().long().clamp(0, H - 1)
+        vrow = torch.arange(V)[:, None].expand_as(ui)
+        vis[:, i:i + chunk] = in_b & masks[vrow, vi, ui]
+    return vis
+
+
 def load_camera_centers(scene: Path = SCENE) -> Tensor:
     meta = json.loads((scene / "meta_data.json").read_text())
     c = np.stack([np.asarray(fr["camtoworld"], dtype=np.float32)[:3, 3]
@@ -99,18 +128,31 @@ def load_sfm_pairs(scene: Path = SCENE, allowed_points: Tensor | np.ndarray | No
 
 
 def _load_dtu_views(scene: Path, down: int = 1) -> dict:
-    """Load DTU data from cameras.npz + image/ + mask/ layout."""
+    """Load DTU / NeuS-BlendedMVS data from cameras*.npz + image/ + mask/ layout.
+
+    DTU ships ``cameras.npz``; the NeuS-preprocessed BlendedMVS scenes ship the
+    same IDR-format archive under ``cameras_sphere.npz`` (world_mat_i / scale_mat_i,
+    object normalised to the unit sphere). Both decode identically here.
+    """
     import imageio.v2 as imageio
     from PIL import Image as _PIL
     from scipy.linalg import rq
 
-    cam_dict = np.load(scene / "cameras.npz")
+    cam_path = scene / "cameras.npz"
+    if not cam_path.exists():
+        cam_path = scene / "cameras_sphere.npz"
+    cam_dict = np.load(cam_path)
     img_paths = sorted(p for p in (scene / "image").glob("*.png") if not p.name.startswith("._"))
-    mask_paths = sorted(p for p in (scene / "mask").glob("*.png") if not p.name.startswith("._"))
+    # Prefer eval_mask/ when present (MVMannequin ships clean eval masks next to
+    # the noisy training mask/ — ~50x fewer stray foreground specks). DTU has no
+    # eval_mask dir, so it transparently falls back to mask/.
+    mask_dir = scene / "eval_mask" if (scene / "eval_mask").is_dir() else scene / "mask"
+    mask_paths = sorted(p for p in mask_dir.glob("*.png") if not p.name.startswith("._"))
     if not img_paths:
         raise FileNotFoundError(f"no images found under {scene / 'image'}")
     if len(mask_paths) < len(img_paths):
-        raise FileNotFoundError(f"expected at least {len(img_paths)} masks under {scene / 'mask'}")
+        raise FileNotFoundError(f"expected at least {len(img_paths)} masks under {mask_dir}")
+    print(f"  [data] masks from {mask_dir.name}/  ({len(mask_paths)} files)")
 
     imgs, c2ws, Ks, masks = [], [], [], []
     for i, img_path in enumerate(img_paths):
@@ -195,6 +237,12 @@ def _load_tnt_views(scene: Path, down: int = 1) -> dict:
     for pp in pose_paths:
         ip = scene / "rgb" / (pp.stem + ".png")
         if not ip.exists():
+            for suffix in (".jpg", ".jpeg", ".JPG", ".JPEG"):
+                alt = scene / "rgb" / (pp.stem + suffix)
+                if alt.exists():
+                    ip = alt
+                    break
+        if not ip.exists():
             continue
         img = imageio.imread(ip).astype(np.float32) / 255.0
         if img.ndim == 3 and img.shape[-1] == 4:
@@ -236,7 +284,32 @@ def _load_tnt_views(scene: Path, down: int = 1) -> dict:
     }
 
 
-def load_views(scene: Path = SCENE, down: int = 1) -> dict:
+def load_view_keep(path) -> list[int]:
+    """Read a newline/whitespace-separated list of view indices to keep."""
+    txt = Path(path).read_text()
+    return [int(t) for t in txt.split()]
+
+
+def load_views(scene: Path = SCENE, down: int = 1,
+               view_keep=None) -> dict:
+    """Load all views, optionally subsetting to `view_keep` (list of indices
+    into the full, file-order view list). The subset is applied uniformly to
+    every per-view tensor so downstream indexing (alt-view NN, masks, depths)
+    stays consistent."""
+    out = _load_views_dispatch(scene, down=down)
+    if view_keep is not None:
+        idx = [int(i) for i in view_keep]
+        n_full = out["c2w"].shape[0]
+        if max(idx) >= n_full or min(idx) < 0:
+            raise ValueError(f"view_keep index out of range for {n_full} views")
+        for k in ("images", "masks", "c2w", "K"):
+            if k in out and torch.is_tensor(out[k]):
+                out[k] = out[k][idx]
+        print(f"  view_keep: using {len(idx)}/{n_full} views")
+    return out
+
+
+def _load_views_dispatch(scene: Path = SCENE, down: int = 1) -> dict:
     if (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
         return _load_tnt_views(scene, down=down)
     if not (scene / "meta_data.json").exists() or (scene / "image").exists():
@@ -437,3 +510,121 @@ def precompute_alt_cameras(views: dict, n_alt: int) -> Tensor:
     dists.fill_diagonal_(float("inf"))
     _, nn_idx = dists.topk(n_alt, largest=False, dim=1)
     return nn_idx
+
+
+def precompute_alt_cameras_arccos(views: dict, n_alt: int) -> Tensor:
+    """(V, n_alt) int tensor sorted by arccos angular distance between viewing
+    directions.
+
+    For each camera k, compute d_k = normalise(scene_centre − cam_centre_k)
+    where scene_centre is the mean camera centre. Sort all other cameras by
+    arccos(dot(d_ref, d_src)) — smallest angle first (most similar viewing
+    direction). This is the source-view score used in papers such as
+    PatchmatchNet / MVSNet.
+    """
+    origins = views["c2w"][:, :3, 3]           # (V, 3)
+    scene_centre = origins.mean(dim=0)          # (3,)
+    dirs = scene_centre.unsqueeze(0) - origins  # (V, 3) — cam → scene centre
+    dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+    # cos similarity matrix → angular distance (smaller = more similar direction)
+    cos_sim = dirs @ dirs.T                     # (V, V)
+    cos_sim.clamp_(-1.0, 1.0)
+    ang_dist = torch.acos(cos_sim)              # (V, V) in [0, π]
+    ang_dist.fill_diagonal_(float("inf"))
+
+    _, nn_idx = ang_dist.topk(n_alt, largest=False, dim=1)
+    return nn_idx
+
+
+def load_pair_file(path: Path) -> dict[int, list[int]]:
+    """Parse an MVSNet / NeuralWarp ``pair.txt`` into {ref_id: ranked src ids}.
+
+    Canonical format::
+
+        <N>                                   # number of reference views
+        <ref_id>
+        <num_src> s0 score0 s1 score1 ...     # sources ranked best-first
+        ...                                   # repeated N times
+
+    Pair scores are ignored — only the left-to-right ranking of source ids is
+    kept. Robust to the score-less variant (``<num_src> s0 s1 ...``).
+    """
+    lines = [ln.strip() for ln in Path(path).read_text().splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError(f"empty pair file: {path}")
+    n_ref = int(float(lines[0]))
+    ranking: dict[int, list[int]] = {}
+    i = 1
+    for _ in range(n_ref):
+        if i + 1 >= len(lines):
+            break
+        ref_id = int(float(lines[i])); i += 1
+        toks = lines[i].split(); i += 1
+        if not toks:
+            ranking[ref_id] = []
+            continue
+        num = int(float(toks[0]))
+        rest = toks[1:]
+        if num > 0 and len(rest) == 2 * num:          # interleaved (id, score)
+            ids = rest[0::2]
+        elif num > 0 and len(rest) == num:            # ids only, no scores
+            ids = rest
+        else:                                         # best-effort: assume interleaved
+            ids = rest[0::2]
+        ranking[ref_id] = [int(float(t)) for t in ids]
+    return ranking
+
+
+def alt_cameras_from_pairs(path: Path, n_views: int, n_alt: int) -> Tensor:
+    """(V, n_alt) source-camera ids from a pair.txt, ranking preserved.
+
+    For every reference view, take its ranked source list and keep the first
+    ``n_alt`` valid ids — excluding out-of-range ids, the reference itself, and
+    duplicates. Errors if a reference view has fewer than ``n_alt`` valid
+    sources (so a too-thin pair file fails loudly instead of silently padding).
+    """
+    ranking = load_pair_file(path)
+    alt = torch.empty(n_views, n_alt, dtype=torch.long)
+    for r in range(n_views):
+        ranked = ranking.get(r)
+        if ranked is None:
+            raise ValueError(f"pair file {path}: no entry for reference view {r}")
+        seen: set[int] = set()
+        valid: list[int] = []
+        for s in ranked:
+            if s == r or s < 0 or s >= n_views or s in seen:
+                continue
+            seen.add(s)
+            valid.append(s)
+        if len(valid) < n_alt:
+            raise ValueError(
+                f"pair file {path}: reference view {r} has only {len(valid)} valid "
+                f"source views after excluding self / out-of-range / duplicates, "
+                f"need n_alt={n_alt}")
+        alt[r] = torch.tensor(valid[:n_alt], dtype=torch.long)
+    return alt
+
+
+def selected_pair_triangulation_angles(views: dict, alt_nn: Tensor,
+                                        scene: Path | None = None) -> np.ndarray:
+    """(V, n_alt) parallax angle (deg) at the object centre for each selected pair.
+
+    Object centre = centroid of ``sparse_sfm_points.txt`` when present, else the
+    world origin. This is a cheap, dataset-agnostic triangulation-angle proxy
+    that tracks the per-point SfM median within ~1° on DTU. Logging-only.
+    """
+    centres = views["c2w"][:, :3, 3].cpu().numpy().astype(np.float64)
+    obj = np.zeros(3, dtype=np.float64)
+    if scene is not None and (Path(scene) / "sparse_sfm_points.txt").exists():
+        pts = np.loadtxt(Path(scene) / "sparse_sfm_points.txt", dtype=np.float64)
+        if pts.size:
+            obj = pts.reshape(-1, 3).mean(axis=0)
+    vec = centres - obj
+    vec /= np.clip(np.linalg.norm(vec, axis=1, keepdims=True), 1e-12, None)
+    alt = alt_nn.cpu().numpy()
+    ang = np.empty(alt.shape, dtype=np.float64)
+    for r in range(alt.shape[0]):
+        cos = np.clip(vec[alt[r]] @ vec[r], -1.0, 1.0)
+        ang[r] = np.degrees(np.arccos(cos))
+    return ang

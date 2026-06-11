@@ -1,32 +1,59 @@
-# Python
+# --- Python caches (regenerable) ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
 
-# Data, checkpoints, outputs
-data/
-outputs/
-artifacts/
-figs/
-*.ckpt
-*.pt
-*.pth
-*.npz
+# --- Datasets (large, not source) ---
+/data/
+
+# --- Training outputs / checkpoints / experiment results ---
+/outputs/
+/_diagnostics/
+/artifacts/
+/wandb/
+/figs/
+/figures/
+/neus_100k_meshes/
+/neus_100k_dossier/
+/sfm_parasite_check/
+/paper_render_test/
+/tnt_eval/
+/zoom_preview/
+/zoom_preview_phong/
+/depth_carve_diag_out/
+/depth_carve_diag_out_noclip/
+/depth_carve_diag_out_sfmroi_noclip/
+lip_tracer/dtu_ckpt/
+!lip_tracer/dtu_ckpt/
+!lip_tracer/dtu_ckpt/config.json
+lip_tracer/dtu_ckpt/*.pth
+lip_tracer/dtu_ckpt/*.pt
+lip_tracer/dtu_ckpt/*.ckpt
+
+# --- Local Codex / machine state ---
+.codex/
+
+# --- Logs / ad-hoc local artifacts ---
+*.log
 *.ply
 *.obj
 *.blend
 *.blend1
-
-# Images / media
 *.png
 *.jpg
 *.jpeg
 *.mp4
 *.gif
+*.npy
+*.npz
+*.pth
+*.pt
 
-# Cluster / scratch
-*.slurm
-*.out
-*.err
-.codex/
+# --- Stray / debug files ---
+_debug_view.png
+slurm-*.out
+
+# --- Editor / OS ---
+.DS_Store
+*.swp

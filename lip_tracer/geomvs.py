@@ -125,7 +125,7 @@ def load_mast3r_depths_idr(scene: Path, depth_dir: Path) -> dict | None:
     per-view least-squares scale+shift fit on projected SFM points — the same
     strategy as load_aligned_depths for sdfstudio-format scenes.
 
-    depth_dir must contain a manifest.json produced by precompute_mast3r_depths.py.
+    depth_dir must contain a manifest.json produced by archive/precompute_mast3r_depths.py.
     Returns the same dict as load_aligned_depths, or None on error.
     """
     manifest_path = depth_dir / "manifest.json"
@@ -235,7 +235,7 @@ def load_mvsformer_depths_idr(scene: Path, depth_dir: Path,
     """Load MVSFormer++ depth maps for an IDR-style DTU scan.
 
     Reads <depth_dir>/<scan>/{depth_est/*.pfm, confidence/*.npy} produced by
-    precompute_mvsformer_depths.py. Cameras are reconstructed from cameras.npz;
+    tools/precompute_mvsformer_depths.py. Cameras are reconstructed from cameras.npz;
     depths are already in IDR-normalised cam-z (cam.txt was written in that
     frame), so no SFM scale alignment is needed.
 
@@ -253,7 +253,10 @@ def load_mvsformer_depths_idr(scene: Path, depth_dir: Path,
         print(f"  [geomvs] no .pfm files under {scan_root}")
         return None
 
-    cam_dict = np.load(scene / "cameras.npz")
+    cam_path = scene / "cameras.npz"
+    if not cam_path.exists():
+        cam_path = scene / "cameras_sphere.npz"   # NeuS-BlendedMVS archive name
+    cam_dict = np.load(cam_path)
     img_paths = sorted(p for p in (scene / "image").iterdir()
                        if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
                        and not p.name.startswith("._"))

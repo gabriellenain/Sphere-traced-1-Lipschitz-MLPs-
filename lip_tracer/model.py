@@ -79,11 +79,14 @@ class FTheta(nn.Module):
         activation: str = "groupsort",
         input_encoding: str = "identity",
         multires: int = 6,
+        lipschitz_mode: str = "none",
     ) -> None:
         super().__init__()
         assert activation in ("groupsort", "nact"), f"unknown activation {activation!r}"
         assert input_encoding in ("identity", "pe"), \
             f"unknown input_encoding {input_encoding!r}"
+        assert lipschitz_mode in ("none", "uniform", "per_band"), \
+            f"unknown lipschitz_mode {lipschitz_mode!r}"
         if activation == "groupsort":
             assert hidden % group_size == 0
         self.hidden         = hidden
@@ -93,8 +96,12 @@ class FTheta(nn.Module):
         self.architecture   = "cpl"
         self.input_encoding = input_encoding
         self.multires       = multires
+        self.lipschitz_mode = lipschitz_mode
         if input_encoding == "pe":
-            self.encoder = PositionalEncoding(multires=multires, input_dims=3)
+            self.encoder = PositionalEncoding(
+                multires=multires, input_dims=3,
+                lipschitz_mode=None if lipschitz_mode == "none" else lipschitz_mode,
+            )
             if self.encoder.out_dim > hidden:
                 raise ValueError(
                     f"encoded dim {self.encoder.out_dim} exceeds hidden dim {hidden}"
@@ -148,18 +155,23 @@ class NeuSMLP(nn.Module):
 
     def __init__(self, hidden: int = 256, depth: int = 8, skip_layer: int = 4,
                  input_encoding: str = "pe", multires: int = 6,
+                 lipschitz_mode: str = "none",
                  beta: float = 100.0) -> None:
         super().__init__()
+        assert lipschitz_mode in ("none", "uniform", "per_band"), \
+            f"unknown lipschitz_mode {lipschitz_mode!r}"
         self.hidden         = hidden
         self.depth          = depth
         self.skip_layer     = skip_layer
         self.input_encoding = input_encoding
         self.multires       = multires
+        self.lipschitz_mode = lipschitz_mode
         self.group_size     = 2
         self.activation     = "softplus"
         self.architecture   = "neus"
         self.encoder = PositionalEncoding(
             multires=multires, input_dims=3,
+            lipschitz_mode=None if lipschitz_mode == "none" else lipschitz_mode,
         ) if input_encoding == "pe" else None
         in_dim = self.encoder.out_dim if self.encoder is not None else 3
         self.in_dim = in_dim
@@ -190,10 +202,12 @@ class NeuSMLP(nn.Module):
 
 def make_model(hidden: int, depth: int, group_size: int = 2,
                activation: str = "groupsort", input_encoding: str = "identity",
-               multires: int = 6, architecture: str = "cpl") -> "FTheta | NeuSMLP":
+               multires: int = 6, architecture: str = "cpl",
+               lipschitz_mode: str = "none") -> "FTheta | NeuSMLP":
     if architecture == "neus":
         return NeuSMLP(hidden=hidden, depth=depth,
-                       input_encoding=input_encoding, multires=multires)
+                       input_encoding=input_encoding, multires=multires,
+                       lipschitz_mode=lipschitz_mode)
     return FTheta(hidden=hidden, depth=depth, group_size=group_size,
                   activation=activation, input_encoding=input_encoding,
-                  multires=multires)
+                  multires=multires, lipschitz_mode=lipschitz_mode)

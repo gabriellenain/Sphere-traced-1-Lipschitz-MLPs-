@@ -1,0 +1,9 @@
+[submodule "baselines/NeuS"]
+	path = baselines/NeuS
+	url = https://github.com/Totoro97/NeuS.git
+[submodule "baselines/Geo-Neus"]
+	path = baselines/Geo-Neus
+	url = https://github.com/GhiXu/Geo-Neus.git
+[submodule "baselines/ProbeSDF"]
+	path = baselines/ProbeSDF
+	url = https://gitlab.inria.fr/projects-morpheo/ProbeSDF.git

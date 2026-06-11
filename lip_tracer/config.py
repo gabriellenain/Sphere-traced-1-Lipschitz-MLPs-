@@ -23,6 +23,7 @@ class ModelConfig:
     input_encoding: str = "pe"  # "identity" | "pe"
     multires: int = 6  # PE frequencies when input_encoding="pe"
     architecture: str = "cpl"  # "cpl" | "neus" | "mlp"
+    lipschitz_mode: str = "none"  # "none" | "uniform" | "per_band" — rescale PE so γ is 1-Lipschitz
 
 
 # --------------------------------------------------------- sphere tracing ----
@@ -30,10 +31,17 @@ class ModelConfig:
 @dataclass
 class TraceConfig:
     iters:          int   =  64  # max sphere-tracing iterations
-    eps:            float = 1e-4   # convergence threshold |f(x)| < eps → hit
+    eps:            float = 1e-3   # convergence threshold |f(x)| < eps → hit
     t_far:          float = 5.0   # ray cut-off distance (fallback when bsphere_radius=0)
     eik_stride:     int   = 8      # collect one eikonal sample every N iters
     newton_steps:   int   = 2      # Newton refinement iters on hit rays after tracing
+    # --- occlusion-trace overrides (photo loss visibility test) ---
+    # The occlusion trace produces a thresholded visibility boolean, so it does
+    # not need primary-trace precision. Sentinels (<0) fall back to the primary
+    # iters/newton_steps/eps above, so defaults reproduce the old behaviour.
+    occ_iters:        int   = -1   # max iters for the occ trace (-1 → use `iters`)
+    occ_newton_steps: int   = -1   # Newton steps for the occ trace (-1 → use `newton_steps`; 0 = none)
+    occ_eps:          float = -1.0 # hit threshold for the occ trace (<0 → use `eps`)
     grad_mode:      str   = "idr"  # "backprop" | "idr"
     bsphere_radius: float = 0.0    # >0: use per-ray exit depth of this bounding sphere as t_far;
                                    # rays that reach the sphere exit are marked hit_bg=True so the
@@ -57,10 +65,27 @@ class InitConfig:
     lr:       float        = 1e-1
     radius:   float | None = None      # sphere only: None → auto-detect from COLMAP p80
     hull_res: int          = 256      # hull only: voxel carving resolution
+    hull_sfm_roi: bool      = False    # hull only: crop unconstrained outer volume to padded SFM AABB
+    hull_min_views: int     = 0        # hull only: require projection inside this many views
+    hull_border_aware: bool = False    # hull only: carve off-frame voxels through clear image edges
+                                       # (removes silhouette bloat when the object spills past the frame;
+                                       # switches cleanup to largest-component). See visual_hull.carve.
+    w_sfm_free: float       = 0.0      # hull only: enforce f>0 along camera→COLMAP-point sight-lines
+    sfm_free_eps: float     = 0.02     # hull only: stop the free-space ray this far before the point
     w_depth_surface: float = 0.0  # blender hull-init only: weight on GT depth surface samples
     init_mesh: str | None  = None  # hull-init source: silhouette carving (default) or
                                    # voxelisation of this PLY mesh (e.g. COLMAP poisson.ply,
                                    # in NSVF-COLMAP / un-normalised frame).
+    init_sdf_grid: str | None = None  # hull-init source: precomputed signed-distance
+                                      # grid on [-bound,bound]^3; inside is sdf < 0.
+    # --- "points" init: reconstruct a surface directly from the COLMAP sparse
+    # cloud (sparse_sfm_points.txt, already in the normalized training frame).
+    # No masks, no dense MVS — kNN-PCA normals oriented toward the cameras, a
+    # screened-Poisson surface, then SDF regression (see fit_points_init).
+    points_poisson_depth: int   = 9     # octree depth for screened Poisson (8=coarse, 9=fine)
+    points_trim_quantile: float = 0.02  # drop Poisson vertices below this density quantile
+                                        # (removes balloon extrapolation in unseen regions)
+    points_normal_knn:    int   = 16    # kNN for PCA normal estimation + orientation MST
 
 
 # ------------------------------------------------------- MVSDF schedule ------
@@ -115,12 +140,38 @@ class MvsdfScheduleConfig:
 
 @dataclass
 class BundleAdjustConfig:
-    """Joint photometric BA: refine camera extrinsics through the existing
-    photo/NCC loss. Intrinsics stay fixed. See bundle_adjustment.py."""
+    """Block-coordinate photometric bundle adjustment.
+
+    Refines the per-camera extrinsics φ jointly with the SDF θ by alternating
+    minimisation of the photometric objective E(θ, φ), starting from a converged
+    checkpoint. See bundle_adjustment.py (run_bundle_adjustment). Intrinsics stay
+    fixed by default (DTU / MVMannequin calibration is trusted); set opt_intrinsics
+    to refine the per-camera K (fx, fy, cx, cy) jointly in the φ-block."""
     enabled:      bool  = False
-    lr:           float = 1e-5     # ~100x smaller than MLP lr
-    freeze_steps: int   = 20000    # don't optimize cameras until SDF is reasonable
     lock_first:   bool  = True     # fix camera 0 (gauge lock — prevents global drift)
+
+    # --- block coordinate descent (block-diagonal alternation) ---------------
+    # One BA "cycle" runs a φ-block (refine extrinsics, SDF frozen) followed by a
+    # θ-block (refine SDF, extrinsics frozen) — or the reverse when phi_first is
+    # False. The φ-block minimises the bare photometric E; the θ-block minimises
+    # E plus the same SDF regularisers the model was trained with (eikonal /
+    # silhouette / behind-hit), so f stays a valid 1-Lipschitz SDF.
+    cycles:       int   = 20       # number of (φ-block, θ-block) alternations
+    block_phi:    int   = 200      # optimiser steps per φ-block (θ frozen)
+    block_theta:  int   = 200      # optimiser steps per θ-block (φ frozen)
+    phi_first:    bool  = True     # start each cycle with the φ-block
+    lr:           float = 1e-5     # φ (extrinsics) learning rate
+    lr_theta:     float = 1e-5     # θ (SDF) learning rate during BA — small, refinement only
+    opt_intrinsics: bool  = False  # also refine per-camera intrinsics K (fx,fy,cx,cy) in the φ-block
+    lr_intrinsics:  float = 1e-4   # intrinsics learning rate (dimensionless delta; see CameraParams)
+    batch:        int   = 0        # rays per BA step; 0 → reuse TrainConfig.batch
+    ckpt_every:   int   = 1        # save a BA checkpoint every N cycles
+    log_every:    int   = 20       # stdout per-step log cadence (CSV logs every step)
+    w_eikonal:    float = 0.0      # >0: eikonal weight for the θ-block ONLY (overrides
+                                   # TrainConfig.w_eikonal during BA). Keeps f a valid
+                                   # SDF (|∇f|≈1) when refining θ jointly with poses;
+                                   # required for a sound joint BA when the run trained
+                                   # with w_eikonal=0 (else θ overfits bare photo E).
 
 
 # ----------------------------------------------------------------- train ----
@@ -135,6 +186,17 @@ class TrainConfig:
 
     profile: bool = False  # one-shot compute/memory breakdown at startup
 
+    # torch.compile the SDF network used in the hot path (trace + photo loss).
+    # dynamic=True because the compacted trace feeds variable-size batches each
+    # iteration. fp32-exact w.r.t. the eager model up to op-fusion reordering
+    # (no precision change — does NOT enable TF32/autocast). ~1.3-2x on the
+    # matmul/kernel-launch-bound CPL forward. Off → plain eager module.
+    compile: bool = True
+
+    # mask handling / ray sampling
+    use_masks: bool = True          # False: ignore loaded masks during training;
+                                    # no fg/bg split, no photo-mask gate
+
     # ray sampling: uniform within fg/bg strata, OR image-gradient-weighted (fg only)
     grad_weighted_sampling: bool =  False  # True: sample fg rays ∝ image-gradient
                                           # magnitude → more samples on edges/texture,
@@ -142,6 +204,30 @@ class TrainConfig:
     grad_sampling_alpha:    float = 0.8   # mix: p = α·grad + (1−α)·uniform. The uniform
                                           # floor keeps smooth-but-real regions (flat
                                           # surfaces, silhouette interiors) from starving.
+    fg_fraction:             float = 0.7   # foreground-ray share when sampling both strata
+    force_fg_bg_split:       bool = False # preserve fg/bg split without a bg-sensitive loss
+    init_hit_sampling:       bool = False # mask-free fg: trace det rays vs the init SDF once
+                                          # and set fg = hit. Concentrates sampling on the
+                                          # object (init hull is a conservative superset) with
+                                          # no segmentation mask. Pair with fg_fraction<1 +
+                                          # force_fg_bg_split for a full-frame escape valve.
+
+    # alternative-view selection (which source cameras each reference view pairs
+    # with). "nearest": the n_alt nearest camera centres (default, unchanged).
+    # "pairs_file": read a precomputed MVSNet/NeuralWarp pair.txt and take the
+    # first n_alt ranked source ids per reference view (scores ignored).
+    # "uniform": pick n_alt source cameras uniformly at random (excluding self).
+    # "arccos": sort by arccos(dot(d_i,d_j)) where d_k=norm(scene_centre−cam_k),
+    #   i.e. angular separation of viewing directions; take n_alt smallest angles.
+    #   NOTE: "arccos" ALSO switches per-step ray sampling to the 2-level
+    #   uniform-cam scheme (one ref cam ~ Uniform(V) per step, all rays from it).
+    # "arccos_nn": MINIMAL variant — identical arccos angular-distance neighbour
+    #   ranking, but reference-view and ray selection are left EXACTLY as
+    #   "nearest" (default flat sampling). Use this to isolate the effect of the
+    #   neighbour-ranking change alone. Only the source-view *set* changes;
+    #   visibility filtering, ZNCC, init, and sampling are untouched.
+    view_selection: str         = "nearest"   # "nearest" | "pairs_file" | "uniform" | "arccos" | "arccos_nn"
+    pairs_path:     Path | None = None         # required when view_selection=="pairs_file"
 
     # visibility filter
     n_alt:      int   = 6     # nearest-neighbour cameras per ray
@@ -192,8 +278,18 @@ class TrainConfig:
     # robust large window early + localised detail by annealing α↓.
     ncc_patch_wsigma:     float = 0.0
     ncc_patch_wsigma_end: float = 0.0  # if >0 and != ncc_patch_wsigma: anneal α→this over training
+    # Gipuma (Galliani et al. 2015) bilateral / adaptive-support-weight NCC:
+    # weight each patch pixel by photometric similarity to the centre in the
+    # REFERENCE view, w = exp(-|I_p - I_q| / γ) (intensities in [0,1]). With a
+    # FIXED large patch, annealing γ↓ shrinks the *effective* support window over
+    # training (large/robust early → small/edge-hugging late) with no geometry
+    # change. 0 → disabled. Combines multiplicatively with ncc_patch_wsigma.
+    ncc_bilateral_gamma:     float = 0.0
+    ncc_bilateral_gamma_end: float = 0.0  # if >0 and != ncc_bilateral_gamma: anneal γ→this over training
     w_cam_free:  float = 0.0
     w_sfm:       float = 0.0
+    w_geo_sdf:   float = 0.0   # pure Geo-Neus L1 SDF loss on COLMAP pts (surface term ONLY,
+                               # no free-space/behind bundle). Independent of w_sfm.
     sfm_min_views: int = 30   # filter COLMAP pts visible in fewer cameras than this
     sfm_behind_eps: float = 0.01  # step behind SFM point along camera ray; require f <= 0 there
     w_free:      float = 0.0   # free-space along SFM camera→point rays
@@ -288,12 +384,25 @@ class EvalConfig:
     nn_chunk:      int   = 4096  # chunk size for chamfer nearest-neighbour search
     n_views:       int   = 6     # number of reference views in the visualize grid
     dtu_eval_dir:  Path | None = None   # path to DTU SampleSet/ + ObsMask/ for official Chamfer
-    dtu_chamfer_freq:  int   = 500   # log fast DTU-style Chamfer every N train steps (0 = off)
-    dtu_chamfer_res:   int   = 256   # MC resolution for in-training DTU Chamfer (fast)
-    dtu_chamfer_bound: float = 0.8   # MC bound for chamfer only — tighter than SDF grid to maximise voxel precision
+    dtu_chamfer_freq:  int   = 0     # cadence (steps) for the cheap in-training sfm_surf diagnostic (0 = off)
+    dtu_chamfer_res:   int   = 256   # MC resolution for the sfm_surf diagnostic
+    blender_chamfer_freq: int = 0    # cadence (steps) for in-training Blender GT chamfer (0 = off)
     dtu_official_freq: int   = 0     # run DTUeval-python every N train steps (0 = off)
     dtu_official_res:  int   = 384   # MC resolution for periodic official eval
     dtu_official_bound: float = 1.0  # MC bound for periodic official eval
+    dtu_official_mask_crop: bool = True  # NeuralWarp-style eval crop with dilated DTU object masks
+    dtu_official_mask_dilate_px: int = 12
+    dtu_official_mask_crop_min_ratio: float = 1.0
+    dtu_official_mask_crop_min_views: int = 1
+    tnt_eval_dir:  Path | None = None   # root or scene dir with TnT official GT assets
+    tnt_official_scene: str | None = None  # official TnT scene name when scene path is staged/symlinked
+    tnt_official_frame: str = "colmap-pose"  # "colmap-pose" | "colmap-local" | "colmap-sfm"
+    tnt_official_freq: int = 0      # run official TnT F-score every N train steps (0 = off)
+    tnt_official_res:  int = 512    # MC resolution for periodic official TnT eval
+    tnt_official_bound: float = 1.5 # MC bound for periodic official TnT eval
+    tnt_official_n_samples: int = 2_000_000  # area-uniform points sampled from MC mesh
+    mc_level: float = 0.0            # marching-cubes isovalue; slightly >0 (e.g. 0.005) trims
+                                     # noisy near-zero wandering in under-supervised pockets
 
     def bound(self, use_blender: bool) -> float:
         return self.bound_blender if use_blender else self.bound_dtu
@@ -318,10 +427,14 @@ class Config:
         d["out_dir"] = str(self.out_dir)
         if d["train"]["feature_maps"] is not None:
             d["train"]["feature_maps"] = str(d["train"]["feature_maps"])
+        if d["train"]["pairs_path"] is not None:
+            d["train"]["pairs_path"] = str(d["train"]["pairs_path"])
         if d["train"]["mvs_depth_dir"] is not None:
             d["train"]["mvs_depth_dir"] = str(d["train"]["mvs_depth_dir"])
         if d["train"]["mvsformer_depth_dir"] is not None:
             d["train"]["mvsformer_depth_dir"] = str(d["train"]["mvsformer_depth_dir"])
         if d["eval"]["dtu_eval_dir"] is not None:
             d["eval"]["dtu_eval_dir"] = str(d["eval"]["dtu_eval_dir"])
+        if d["eval"]["tnt_eval_dir"] is not None:
+            d["eval"]["tnt_eval_dir"] = str(d["eval"]["tnt_eval_dir"])
         return d

@@ -10,6 +10,8 @@ where $x_\theta = o + t_\theta(o,u)\u$ is the surface hit found by differentiabl
 
 ## Structure
 
+The core package:
+
 ```
 lip_tracer/
 ├── config.py          # all hyper-parameters (ModelConfig, TraceConfig, TrainConfig, …)
@@ -20,6 +22,22 @@ lip_tracer/
 ├── train.py           # fit_sphere_init, train(), __main__ entry point
 └── visualize.py       # marching-cubes PNG, Viser viewer, Chamfer / geom metrics
 ```
+
+Supporting scripts are grouped by role at the repo root:
+
+```
+experiments/   # .slurm cluster launchers (train / fit / render / eval / carve …)
+analysis/      # diagnostics, plots, metrics, comparisons, paper-figure renders
+tools/         # reusable helpers: viz, render, precompute, hull / mesh utilities
+figures/       # diagnostic PNGs (gitignored)
+archive/       # stale one-off scripts kept for reference
+baselines/     # NeuS / Geo-Neus / ProbeSDF submodules
+```
+
+Conventions: `.slurm` scripts `cd` to the repo root, so submit them by path
+(`sbatch experiments/foo.slurm`) and any paths inside resolve from the root.
+Import-coupled `.py` modules are kept in the same folder (a script's own directory
+is on `sys.path`).
 
 ## Install
 
@@ -41,6 +59,9 @@ python -m lip_tracer.train --no-train --pt /path/to/checkpoint.pt
 
 # interactive Viser viewer
 python -m lip_tracer.train --no-train --pt /path/to/checkpoint.pt --viewer
+
+# full-resolution sphere-traced reference + novel views
+python -m lip_tracer.render_views --pt /path/to/checkpoint.pt --dataset lego
 ```
 
 ## Key hyper-parameters

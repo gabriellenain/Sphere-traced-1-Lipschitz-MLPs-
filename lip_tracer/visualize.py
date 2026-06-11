@@ -26,7 +26,7 @@ def _nn_dist(A: Tensor, B: Tensor, chunk: int = EvalConfig().nn_chunk) -> Tensor
     return out
 
 
-def _marching_cubes(f: FTheta, bound: float, res: int, device: str):
+def _marching_cubes(f: FTheta, bound: float, res: int, device: str, mc_level: float = 0.0):
     """Extract iso-surface; returns (verts, faces) or (None, None) if no crossing."""
     from skimage import measure
     grid_t = torch.linspace(-bound, bound, res, device=device)
@@ -36,9 +36,9 @@ def _marching_cubes(f: FTheta, bound: float, res: int, device: str):
     print(f"  marching cubes: evaluating {total:,} points at res={res}…", flush=True)
     vals = torch.cat([f(p) for p in pts.split(65536)]).reshape(res, res, res).detach().cpu().numpy()
     print(f"  marching cubes: done", flush=True)
-    if vals.min() > 0 or vals.max() < 0:
+    if vals.min() > mc_level or vals.max() < mc_level:
         return None, None, vals
-    verts, faces, _, _ = measure.marching_cubes(vals, level=0.0)
+    verts, faces, _, _ = measure.marching_cubes(vals, level=mc_level)
     verts = verts / (res - 1) * (2 * bound) - bound
     return verts, faces, vals
 
@@ -79,7 +79,7 @@ def visualize(f: FTheta, eval_cfg: EvalConfig = None,
     eval_cfg = eval_cfg or EvalConfig()
     device   = next(f.parameters()).device
     bound    = eval_cfg.bound(use_blender)
-    verts, faces, vals = _marching_cubes(f, bound, eval_cfg.mc_res, str(device))
+    verts, faces, vals = _marching_cubes(f, bound, eval_cfg.mc_res, str(device), mc_level=eval_cfg.mc_level)
     if verts is None:
         print(f"WARNING: no zero crossing (min={vals.min():.4f} max={vals.max():.4f})")
         return
@@ -273,7 +273,7 @@ def chamfer_stats(f: FTheta, eval_cfg: EvalConfig = None,
     """Bidirectional Chamfer distance: reconstructed surface vs SFM cloud."""
     eval_cfg = eval_cfg or EvalConfig()
     device   = next(f.parameters()).device
-    verts, _, _ = _marching_cubes(f, eval_cfg.bound_dtu, eval_cfg.mc_res, str(device))
+    verts, _, _ = _marching_cubes(f, eval_cfg.bound_dtu, eval_cfg.mc_res, str(device), mc_level=eval_cfg.mc_level)
     if verts is None:
         print("  chamfer: no zero crossing"); return {}
     A = torch.from_numpy(verts.astype(np.float32)).to(device)
@@ -324,7 +324,7 @@ def dtu_official_chamfer(
     device   = next(f.parameters()).device
 
     # ---- 1. extract mesh in normalised space ----------------------------
-    verts_norm, faces, _ = _marching_cubes(f, eval_cfg.bound_dtu, eval_cfg.mc_res, str(device))
+    verts_norm, faces, _ = _marching_cubes(f, eval_cfg.bound_dtu, eval_cfg.mc_res, str(device), mc_level=eval_cfg.mc_level)
     if verts_norm is None:
         print("  dtu_chamfer: no zero crossing"); return {}
 

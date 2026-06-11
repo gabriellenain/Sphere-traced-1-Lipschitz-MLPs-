@@ -15,10 +15,15 @@ import torch
 import torch.nn.functional as F
 
 from .config import SCENE, BLENDER_SCENE, OUT_DIR, Config, ModelConfig, InitConfig, TrainConfig, TraceConfig, EvalConfig, MvsdfScheduleConfig, BundleAdjustConfig
-from .data import (load_colmap_points, colmap_visibility_counts, load_camera_centers, load_sfm_pairs,
+from .data import (load_colmap_points, colmap_visibility_counts, colmap_visibility_matrix,
+                   load_camera_centers, load_sfm_pairs,
                    load_views, load_blender_views, load_blender_gt_points,
-                   make_deterministic_rays, precompute_alt_cameras)
-from .loss import photo_loss, eikonal_loss, cam_free_loss
+                   make_deterministic_rays, precompute_alt_cameras,
+                   precompute_alt_cameras_arccos,
+                   alt_cameras_from_pairs, selected_pair_triangulation_angles)
+from .loss import (photo_loss, idr_mask_loss, mask_loss_min_sdf, dvr_mask_loss, silhouette_loss, eikonal_loss, cam_free_loss,
+                   sfm_sdf_loss, geo_neus_sdf_loss, free_space_loss, sfm_behind_loss, surface_loss, mvs_depth_loss,
+                   mvsdf_carving_loss, behind_hit_loss, soft_argmin_photo_loss)
 from .model import FTheta, ConvexPotentialLayer, NeuSMLP, make_model
 from .profile import StepProfiler, MemorySnapshot, dump_static_accounting
 from .sphere_tracing import trace_unrolled, trace_idr, trace_nograd, get_last_trace_stats
@@ -47,6 +52,45 @@ def _dataclass_from_dict(cls, data: dict):
     """Build config dataclasses from saved JSON, ignoring keys unknown to this checkout."""
     known = {field.name for field in dataclasses.fields(cls)}
     return cls(**{key: value for key, value in data.items() if key in known})
+
+
+def _try_compile_model(f):
+    """torch.compile(f, dynamic=True) IFF inductor/Triton can actually build here.
+
+    Inductor codegen gcc-compiles a CUDA helper that #include <Python.h>, so on
+    nodes without matching python-dev headers (or a broken gcc/CUDA toolchain) the
+    very first compiled forward raises InductorError and kills the run. Pre-flight
+    a trivial compiled kernel on the GPU so a broken toolchain degrades to the
+    eager module (with a warning) instead of crashing training.
+
+    Returns (module, ok, msg): the compiled wrapper if the probe ran, else f.
+    """
+    if not torch.cuda.is_available():
+        return f, False, "cuda unavailable"
+    # Inductor gcc-builds a CUDA helper that #include <Python.h>. This cluster has
+    # no python3.9-devel (sysconfig include dir lacks Python.h), so point gcc at a
+    # copied 3.9 header set via CPATH (gcc searches CPATH after -I). Override the
+    # location with LIPTRACER_PY_INCLUDE; falls through to the eager probe-fail
+    # path if neither the system headers nor the copy are present.
+    import os
+    import sysconfig
+    inc = sysconfig.get_path("include")
+    if not os.path.exists(os.path.join(inc, "Python.h")):
+        fallback = os.environ.get(
+            "LIPTRACER_PY_INCLUDE",
+            "/scratch/_projets_/willow/1-lip-tracer-new/py39_dev_include/python3.9",
+        )
+        if os.path.exists(os.path.join(fallback, "Python.h")):
+            prev = os.environ.get("CPATH", "")
+            os.environ["CPATH"] = fallback + (os.pathsep + prev if prev else "")
+    try:
+        probe = torch.compile(lambda z: z * 2.0 + 1.0, dynamic=True)
+        probe(torch.zeros(8, device="cuda"))
+        torch.cuda.synchronize()
+    except Exception as e:  # InductorError, CalledProcessError, etc.
+        first = (str(e).splitlines() or [""])[0][:160]
+        return f, False, f"{type(e).__name__}: {first}"
+    return torch.compile(f, dynamic=True), True, "ok"
 
 
 def _trace_stat_float(stats: dict, key: str, default: float = 0.0) -> float:
@@ -79,13 +123,15 @@ def load_config_json(path: Path) -> Config:
         BundleAdjustConfig,
         train_data.get("bundle", {}),
     )
-    for key in ("feature_maps", "mvs_depth_dir"):
+    for key in ("feature_maps", "mvs_depth_dir", "mvsformer_depth_dir", "pairs_path"):
         if train_data.get(key) is not None:
             train_data[key] = Path(train_data[key])
 
     eval_data = dict(data.get("eval", {}))
     if eval_data.get("dtu_eval_dir") is not None:
         eval_data["dtu_eval_dir"] = Path(eval_data["dtu_eval_dir"])
+    if eval_data.get("tnt_eval_dir") is not None:
+        eval_data["tnt_eval_dir"] = Path(eval_data["tnt_eval_dir"])
 
     return Config(
         model=_dataclass_from_dict(ModelConfig, data.get("model", {})),
@@ -159,8 +205,36 @@ def fit_hull_init(
     from .visual_hull import carve, fit_to_hull
     model_cfg = model_cfg or ModelConfig()
     init_cfg  = init_cfg  or InitConfig()
-    print(f"  hull init: carving at res={init_cfg.hull_res} …")
-    occ = carve(scene=scene, res=init_cfg.hull_res, bound=bound)
+    if init_cfg.init_sdf_grid:
+        sdf_path = Path(init_cfg.init_sdf_grid)
+        print(f"  hull init: loading SDF grid target from {sdf_path}")
+        sdf_grid = np.load(sdf_path)
+        if sdf_grid.ndim != 3 or len(set(sdf_grid.shape)) != 1:
+            raise ValueError(f"init_sdf_grid must be a cubic 3D grid, got shape {sdf_grid.shape}")
+        if sdf_grid.shape[0] != init_cfg.hull_res:
+            print(f"  hull init: overriding hull_res {init_cfg.hull_res} -> {sdf_grid.shape[0]}")
+            init_cfg.hull_res = int(sdf_grid.shape[0])
+        if not np.isfinite(sdf_grid).all():
+            raise ValueError(f"init_sdf_grid contains non-finite values: {sdf_path}")
+        occ = sdf_grid < 0.0
+        if not occ.any() or occ.all():
+            raise ValueError(f"init_sdf_grid has degenerate occupancy: {sdf_path}")
+    else:
+        print(f"  hull init: carving at res={init_cfg.hull_res} …")
+        roi_bounds = None
+        if init_cfg.hull_sfm_roi:
+            try:
+                sfm_pts = load_colmap_points(scene).numpy()
+                sfm_lo = sfm_pts.min(axis=0)
+                sfm_hi = sfm_pts.max(axis=0)
+                pad = np.maximum(0.15, 0.15 * (sfm_hi - sfm_lo))
+                roi_bounds = (np.maximum(sfm_lo - pad, -bound),
+                              np.minimum(sfm_hi + pad, bound))
+            except (FileNotFoundError, ValueError) as e:
+                print(f"  hull init: SFM ROI unavailable ({e})")
+        occ = carve(scene=scene, res=init_cfg.hull_res, bound=bound,
+                    roi_bounds=roi_bounds, min_views=init_cfg.hull_min_views,
+                    border_aware=init_cfg.hull_border_aware)
     print(f"  occupied voxels: {occ.sum()} / {occ.size}")
     depth_pts = None
     w_depth_surface = init_cfg.w_depth_surface
@@ -177,12 +251,23 @@ def fit_hull_init(
     cam_origins_np = _views["c2w"][:, :3, 3].numpy()
 
     is_blender = (scene / "transforms_train.json").exists()
+    sfm_pairs = None
+    if init_cfg.w_sfm_free > 0 and not is_blender:
+        try:
+            from .data import load_sfm_pairs
+            sfm_pairs = load_sfm_pairs(scene)
+            print(f"  hull init: loaded {sfm_pairs[0].shape[0]} SFM sight-line pairs "
+                  f"for free-space (w={init_cfg.w_sfm_free})")
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  hull init: SFM pairs unavailable for free-space ({e})")
     # MLP has no Lipschitz bound → large initial gradients with high-freq PE → need lower lr
     hull_lr = init_cfg.lr if getattr(model_cfg, "architecture", "cpl") == "cpl" else min(init_cfg.lr, 5e-4)
     f = fit_to_hull(occ, bound=bound, steps=init_cfg.steps, batch=init_cfg.batch,
                     lr=hull_lr, cfg=model_cfg,
                     depth_points=depth_pts, w_depth_surface=w_depth_surface,
-                    cam_origins=cam_origins_np, w_cam_free=0.0 if is_blender else 1.0)
+                    cam_origins=cam_origins_np, w_cam_free=0.0 if is_blender else 1.0,
+                    sfm_pairs=sfm_pairs, w_sfm_free=init_cfg.w_sfm_free,
+                    sfm_free_eps=init_cfg.sfm_free_eps)
     print("  hull init done")
     if return_info:
         return f, occ
@@ -197,15 +282,18 @@ def fit_colmap_init(
 ) -> tuple[FTheta, np.ndarray]:
     """Warm-start f_theta from a COLMAP dense mesh (poisson.ply, fused.ply).
 
-    Carves an occupancy grid by querying the mesh's signed distance at each
-    voxel centre (negative = inside), then reuses fit_to_hull just like the
-    silhouette path. Leaves fit_hull_init / carve / load_views untouched.
+    Regresses f_theta directly to the mesh's signed distance field (computed
+    by Open3D RaycastingScene) on a near-surface ± uniform-volume mixture —
+    same recipe as fit_gt_sdf.py. This gives mm-accurate surface localisation
+    at hand-off instead of the binary occupancy that fit_to_hull would produce.
+
+    An occupancy grid is still built from the same SDF (`sd < 0`) for downstream
+    AABB sampling (_visual_hull_sample_bounds); the sibling fused.ply union is
+    kept solely to tighten that AABB, not as a fit target.
 
     Mesh is expected in NSVF-COLMAP (un-normalised) frame; we re-normalise it
     into the unit cube the model lives in via scene/bbox.txt.
     """
-    from .visual_hull import fit_to_hull
-    from .data import load_views
     import open3d as o3d
 
     model_cfg = model_cfg or ModelConfig()
@@ -263,17 +351,195 @@ def fit_colmap_init(
     else:
         print(f"  colmap init: no sibling fused.ply at {fused_path} (mesh-only)")
 
-    # camera origins (for fit_to_hull's free-space term — same as hull path)
-    is_blender = (scene / "transforms_train.json").exists()
-    _views = load_views(scene)
-    cam_origins_np = _views["c2w"][:, :3, 3].numpy()
-    hull_lr = init_cfg.lr if getattr(model_cfg, "architecture", "cpl") == "cpl" else min(init_cfg.lr, 5e-4)
-    f = fit_to_hull(occ, bound=bound, steps=init_cfg.steps, batch=init_cfg.batch,
-                    lr=hull_lr, cfg=model_cfg,
-                    depth_points=None, w_depth_surface=0.0,
-                    cam_origins=cam_origins_np,
-                    w_cam_free=0.0 if is_blender else 1.0)
-    print("  colmap init done")
+    # --- SDF regression on the same voxel grid hull-init uses ---
+    # We already evaluated true SDF (`sd`) at every voxel of the
+    # `init_cfg.hull_res^3` grid via RaycastingScene above. Reuse those
+    # points + values as the regression dataset (continuous-mesh signed
+    # distance, sub-voxel accurate) via the shared regressor.
+    f = _fit_sdf_to_grid(pts, sd, model_cfg, init_cfg, bound, tag="colmap init")
+    return f, occ
+
+
+def _fit_sdf_to_grid(
+    pts: np.ndarray,
+    sd: np.ndarray,
+    model_cfg: ModelConfig,
+    init_cfg: InitConfig,
+    bound: float,
+    tag: str = "colmap init",
+) -> FTheta:
+    """Regress f_θ to a precomputed signed-distance field sampled on a
+    [-bound,bound]^3 grid (``pts``, ``sd``).
+
+    Mirrors fit_to_hull's recipe (MSE loss, half-batch biased to the narrow band
+    |sdf| < 4·voxel_size, lr=1e-1 — which empirically lands ‖∇f‖≈1) but with the
+    continuous-mesh signed distance instead of a discrete EDT. Shared by the
+    COLMAP-mesh (fit_colmap_init) and sparse-points (fit_points_init) warm-starts.
+    """
+    res = init_cfg.hull_res
+    voxel_size = 2.0 * bound / max(res - 1, 1)
+    band_width = 4.0 * voxel_size
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    grid_pts_t = torch.from_numpy(pts.astype(np.float32)).to(device)
+    grid_sdf_t = torch.from_numpy(sd.astype(np.float32)).to(device)
+    N_grid = grid_pts_t.shape[0]
+    narrow_idx = torch.nonzero(grid_sdf_t.abs() <= band_width,
+                               as_tuple=False).squeeze(-1)
+    print(f"  {tag}: SDF target on {N_grid:,} grid pts  "
+          f"(narrow band |sdf|<{band_width:.4f}: {len(narrow_idx):,} pts)")
+
+    f = make_model(hidden=model_cfg.hidden, depth=model_cfg.depth,
+                   group_size=model_cfg.group_size, activation=model_cfg.activation,
+                   input_encoding=model_cfg.input_encoding, multires=model_cfg.multires,
+                   architecture=model_cfg.architecture).to(device)
+    with torch.enable_grad():
+        f(torch.zeros(1, 3, device=device))  # instantiate any lazy buffers
+
+    steps = init_cfg.steps
+    batch = init_cfg.batch
+    lr    = init_cfg.lr if getattr(model_cfg, "architecture", "cpl") == "cpl" \
+            else min(init_cfg.lr, 5e-4)
+    opt = torch.optim.Adam(f.parameters(), lr=lr)
+    n_narrow_b = min(batch // 2, int(narrow_idx.numel())) if narrow_idx.numel() > 0 else 0
+    n_uniform_b = batch - n_narrow_b
+    print(f"  {tag}: SDF regression  steps={steps}  batch={batch}  "
+          f"narrow={n_narrow_b}/{n_narrow_b + n_uniform_b}  lr={lr}")
+
+    for step in range(steps + 1):
+        idx_u = torch.randint(0, N_grid, (n_uniform_b,), device=device)
+        if n_narrow_b > 0:
+            idx_n = narrow_idx[torch.randint(0, narrow_idx.numel(),
+                                             (n_narrow_b,), device=device)]
+            idx = torch.cat([idx_u, idx_n], dim=0)
+        else:
+            idx = idx_u
+        x = grid_pts_t[idx]
+        y = grid_sdf_t[idx]
+        pred = f(x)
+        loss = F.mse_loss(pred, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(f.parameters(), 1.0)
+        opt.step()
+        if step % 500 == 0 or step == steps:
+            with torch.no_grad():
+                idx_e_n = narrow_idx[torch.randint(0, narrow_idx.numel(),
+                                                   (min(8192, narrow_idx.numel()),),
+                                                   device=device)] \
+                    if narrow_idx.numel() > 0 else None
+                idx_e_v = torch.randint(0, N_grid,
+                                        (min(8192, N_grid),), device=device)
+                if idx_e_n is not None:
+                    near_l1 = (f(grid_pts_t[idx_e_n])
+                               - grid_sdf_t[idx_e_n]).abs().mean().item()
+                else:
+                    near_l1 = float("nan")
+                vol_l1  = (f(grid_pts_t[idx_e_v])
+                           - grid_sdf_t[idx_e_v]).abs().mean().item()
+            with torch.enable_grad():
+                if idx_e_n is not None:
+                    xn = grid_pts_t[idx_e_n].detach().clone().requires_grad_(True)
+                    gn = torch.autograd.grad(f(xn).sum(), xn)[0]
+                    gn_norm = gn.norm(dim=-1).mean().item()
+                else:
+                    gn_norm = float("nan")
+                xv = grid_pts_t[idx_e_v].detach().clone().requires_grad_(True)
+                gv = torch.autograd.grad(f(xv).sum(), xv)[0]
+                gv_norm = gv.norm(dim=-1).mean().item()
+            print(f"  [{tag}@{step:6d}] loss={loss.item():.6f}  "
+                  f"near_l1={near_l1:.6f}  vol_l1={vol_l1:.6f}  "
+                  f"|∇f|near={gn_norm:.3f}  |∇f|vol={gv_norm:.3f}", flush=True)
+    print(f"  {tag} done")
+    return f
+
+
+def fit_points_init(
+    model_cfg: ModelConfig = None,
+    init_cfg:  InitConfig  = None,
+    scene:     Path        = SCENE,
+    bound:     float       = 1.5,
+) -> tuple[FTheta, np.ndarray]:
+    """Minimal warm-start straight from the COLMAP sparse cloud.
+
+    Reconstructs an initial surface directly from ``sparse_sfm_points.txt``
+    (already in the normalized training frame) — no masks, no dense MVS. The
+    recipe is the textbook oriented-point → implicit-surface pipeline:
+
+      1. per-point normals via kNN-PCA;
+      2. orient each normal toward its nearest camera centre (resolves the
+         inside/outside sign), then propagate consistency with open3d's
+         tangent-plane MST (and globally flip back if the MST inverted us);
+      3. screened-Poisson surface, density-trimmed to drop the balloon
+         extrapolation Poisson invents in unobserved regions;
+      4. keep the largest connected component;
+      5. regress f_θ to that mesh's signed distance (shared _fit_sdf_to_grid).
+
+    Returns (f, occ) like fit_colmap_init, so downstream AABB sampling works.
+    """
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+    from .data import load_views
+
+    model_cfg = model_cfg or ModelConfig()
+    init_cfg  = init_cfg  or InitConfig()
+
+    pts_cloud = load_colmap_points(scene).numpy().astype(np.float64)
+    print(f"  points init: {len(pts_cloud):,} COLMAP points  "
+          f"r_mean={np.linalg.norm(pts_cloud, axis=1).mean():.3f}")
+    cams = load_views(scene)["c2w"][:, :3, 3].numpy().astype(np.float64)
+
+    # --- oriented normals (kNN-PCA → nearest-camera flip → consistent MST) ---
+    knn = init_cfg.points_normal_knn
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts_cloud))
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=knn))
+    n = np.asarray(pcd.normals)
+    ci = cKDTree(cams).query(pts_cloud, k=1)[1]
+    view = cams[ci] - pts_cloud
+    view /= np.linalg.norm(view, axis=1, keepdims=True).clip(1e-9)
+    n[(n * view).sum(1) < 0] *= -1
+    pcd.normals = o3d.utility.Vector3dVector(n)
+    pcd.orient_normals_consistent_tangent_plane(k=knn)
+    n = np.asarray(pcd.normals)
+    if ((n * view).sum(1) < 0).mean() > 0.5:   # MST flipped the global sign
+        n *= -1
+        pcd.normals = o3d.utility.Vector3dVector(n)
+    print(f"  points init: normals oriented  mean·camera-dir={(n * view).sum(1).mean():.3f}")
+
+    # --- screened Poisson + density trim + largest component ---
+    depth = init_cfg.points_poisson_depth
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, scale=1.1)
+    dens = np.asarray(dens)
+    q = init_cfg.points_trim_quantile
+    if q > 0:
+        mesh.remove_vertices_by_mask(dens < np.quantile(dens, q))
+        mesh.remove_unreferenced_vertices()
+    tri_ids, tri_counts, _ = mesh.cluster_connected_triangles()
+    tri_counts = np.asarray(tri_counts)
+    if len(tri_counts) > 1:
+        keep = np.asarray(tri_ids) == int(tri_counts.argmax())
+        mesh.remove_triangles_by_mask(~keep)
+        mesh.remove_unreferenced_vertices()
+    V = np.asarray(mesh.vertices)
+    if len(V) == 0 or len(mesh.triangles) == 0:
+        raise ValueError("points init: Poisson reconstruction produced an empty mesh "
+                         "(try a lower --points-trim-quantile or smaller --points-poisson-depth)")
+    print(f"  points init: Poisson depth={depth} trim_q={q} -> "
+          f"V={len(V):,} F={len(mesh.triangles):,}  "
+          f"bbox=[{V.min(0).round(3)} .. {V.max(0).round(3)}]")
+
+    # --- signed distance on the regression grid ---
+    res = init_cfg.hull_res
+    grid = np.linspace(-bound, bound, res, dtype=np.float32)
+    zz, yy, xx = np.meshgrid(grid, grid, grid, indexing="ij")
+    pts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3).astype(np.float32)
+    scene_rc = o3d.t.geometry.RaycastingScene()
+    scene_rc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    sd = scene_rc.compute_signed_distance(o3d.core.Tensor(pts)).numpy()
+    occ = (sd < 0).reshape(res, res, res)
+    print(f"  points init: occupied {occ.sum()} / {occ.size} ({100 * occ.mean():.2f}%)")
+
+    f = _fit_sdf_to_grid(pts, sd, model_cfg, init_cfg, bound, tag="points init")
     return f, occ
 
 
@@ -416,8 +682,13 @@ def _render_residual_map(
 # ---------- periodic render ----------
 
 def _render_poses(f, views, step: int, run_dir: Path, device: str,
-                  res: int = 400, trace_cfg: TraceConfig | None = None) -> None:
-    """Sphere-trace 4 training views with Phong shading → PNG strip."""
+                  res: int = 400, trace_cfg: TraceConfig | None = None,
+                  crop_fg: bool = False) -> None:
+    """Sphere-trace 4 training views with Phong shading → PNG strip.
+
+    crop_fg=True (e.g. MVMannequin, where the object fills ~9% of the frame)
+    crops every panel to its view's foreground-mask bbox to drop empty margins.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -438,7 +709,7 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
     light = np.array([0.577, 0.577, 0.577], dtype=np.float32)
     base  = np.array([0.72, 0.72, 0.85],    dtype=np.float32)
 
-    imgs_phong, imgs_color, imgs_hit = [], [], []
+    imgs_phong, imgs_color, imgs_hit, crop_boxes = [], [], [], []
     for vi in ids:
         K   = views["K"][vi].numpy()
         c2w = views["c2w"][vi].numpy()
@@ -498,6 +769,25 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
         hmap[fg &  hit2.astype(bool)] = [0.4, 0.85, 0.4]     # green = correct hit
         hmap[fg & ~hit2.astype(bool)] = [0.9, 0.2,  0.2]     # red   = missed fg (hole)
         imgs_hit.append(hmap)
+
+        # zoom-to-object: bbox of the foreground mask (12% pad), full frame if empty
+        box = (0, H, 0, W)
+        if crop_fg:
+            ys_fg, xs_fg = np.where(fg)
+            if ys_fg.size:
+                pad = 0.12
+                r0, r1, c0, c1 = ys_fg.min(), ys_fg.max(), xs_fg.min(), xs_fg.max()
+                dr, dc = int((r1 - r0) * pad) + 1, int((c1 - c0) * pad) + 1
+                box = (max(r0 - dr, 0), min(r1 + dr, H - 1) + 1,
+                       max(c0 - dc, 0), min(c1 + dc, W - 1) + 1)
+        crop_boxes.append(box)
+
+    if crop_fg:
+        def _cb(im, b):
+            return im[b[0]:b[1], b[2]:b[3]]
+        imgs_phong = [_cb(im, b) for im, b in zip(imgs_phong, crop_boxes)]
+        imgs_color = [_cb(im, b) for im, b in zip(imgs_color, crop_boxes)]
+        imgs_hit   = [_cb(im, b) for im, b in zip(imgs_hit,   crop_boxes)]
 
     fig, axes = plt.subplots(3, 4, figsize=(20, 15))
     labels = ["view A", "view B", "view C", f"back (v{back_id})"]
@@ -618,12 +908,52 @@ def _dump_mc_normal_maps(f, views, view_ids: list[int], step: int,
         cams = views["c2w"][:, :3, 3].numpy()
         origins = c2w_all[:, :3, 3]
 
+        # --- zoom-to-object: the mannequin fills only ~9% of frame height, so
+        # crop every panel to the mesh's projected bbox (per view) to drop the
+        # large empty margins. Fractional bbox so the normals raster (H_d×W_d)
+        # and coverage maps (Hc×Wc) crop consistently.
+        mesh_v = np.asarray(mesh.vertices, dtype=np.float64)
+
+        def _obj_crop_frac(vi, pad=0.12):
+            """Fractional (fu0, fu1, fv0, fv1) bbox of the mesh in view vi."""
+            try:
+                K0 = views["K"][vi].numpy().astype(np.float64)
+                w2c = np.linalg.inv(views["c2w"][vi].numpy().astype(np.float64))
+                Xc = mesh_v @ w2c[:3, :3].T + w2c[:3, 3]
+                front = Xc[:, 2] > 1e-6
+                if int(front.sum()) < 3:
+                    return 0.0, 1.0, 0.0, 1.0
+                uv = Xc[front] @ K0.T
+                u = uv[:, 0] / uv[:, 2]
+                v = uv[:, 1] / uv[:, 2]
+                u0, u1, v0, v1 = u.min(), u.max(), v.min(), v.max()
+                du, dv = (u1 - u0) * pad, (v1 - v0) * pad
+                fu0 = min(max((u0 - du) / W_full, 0.0), 1.0)
+                fu1 = min(max((u1 + du) / W_full, 0.0), 1.0)
+                fv0 = min(max((v0 - dv) / H_full, 0.0), 1.0)
+                fv1 = min(max((v1 + dv) / H_full, 0.0), 1.0)
+                if fu1 - fu0 < 1e-3 or fv1 - fv0 < 1e-3:
+                    return 0.0, 1.0, 0.0, 1.0
+                return fu0, fu1, fv0, fv1
+            except Exception:
+                return 0.0, 1.0, 0.0, 1.0
+
+        def _crop2obj(arr, frac):
+            """Crop arr (H, W[, C]) to fractional bbox frac=(fu0,fu1,fv0,fv1)."""
+            fu0, fu1, fv0, fv1 = frac
+            H, W = arr.shape[:2]
+            c0, c1 = int(np.floor(fu0 * W)), int(np.ceil(fu1 * W))
+            r0, r1 = int(np.floor(fv0 * H)), int(np.ceil(fv1 * H))
+            c1, r1 = max(c1, c0 + 1), max(r1, r0 + 1)
+            return arr[r0:r1, c0:c1]
+
         show_coverage = train_cfg is not None and trace_cfg is not None
         n_rows = 2 if show_coverage else 1
         fig, axes = plt.subplots(n_rows, len(ids), figsize=(5 * len(ids), 5 * n_rows),
                                  squeeze=False)
         for col, vi in enumerate(ids):
             ax = axes[0, col]
+            frac = _obj_crop_frac(vi)
             K = views["K"][vi].numpy().copy()
             K[0, 0] /= d; K[1, 1] /= d
             K[0, 2] = (K[0, 2] + 0.5) / d - 0.5
@@ -631,7 +961,7 @@ def _dump_mc_normal_maps(f, views, view_ids: list[int], step: int,
             img = render_normals_only(mesh, intersector,
                                       views["c2w"][vi].numpy(), K,
                                       H_d, W_d, 1)
-            ax.imshow(np.clip(img, 0, 1)); ax.axis("off")
+            ax.imshow(np.clip(_crop2obj(img, frac), 0, 1)); ax.axis("off")
             ax.set_title(f"view {vi} normals", fontsize=10)
 
             if not show_coverage:
@@ -793,10 +1123,13 @@ def _dump_mc_normal_maps(f, views, view_ids: list[int], step: int,
                         arr=gm, title=f"|∇I| ({ncc_clr})  α={ncc_ga:.2f}",
                         cmap="inferno", vmin=0, vmax=max(gvmax, 1e-6),
                         label="image gradient magnitude"))
+                for p in _panels:
+                    p["arr"] = _crop2obj(p["arr"], frac)
                 _save_view_diag_png(_panels, vi, step, run_dir)
 
                 ax_cov = axes[1, col]
-                im_cov = ax_cov.imshow(cov, cmap="viridis", vmin=0, vmax=max(len(alts), 1))
+                im_cov = ax_cov.imshow(_crop2obj(cov, frac), cmap="viridis",
+                                       vmin=0, vmax=max(len(alts), 1))
                 ax_cov.axis("off")
                 ax_cov.set_title(f"view {vi} K_valid / {len(alts)}", fontsize=10)
                 fig.colorbar(im_cov, ax=ax_cov, fraction=.046, shrink=.8)
@@ -1396,7 +1729,7 @@ def _chamfer(pred: torch.Tensor, gt: torch.Tensor, chunk: int = 4096) -> dict[st
 
 
 def _mc_chamfer(f, gt_pts: torch.Tensor, device: str,
-                bound: float = 1.5, res: int = 128) -> dict[str, float] | None:
+                bound: float = 1.5, res: int = 128, mc_level: float = 0.0) -> dict[str, float] | None:
     """Marching-cubes surface extraction + split Chamfer vs GT point cloud.
 
     The MC mesh is reduced to its largest connected component (by surface area)
@@ -1412,7 +1745,7 @@ def _mc_chamfer(f, gt_pts: torch.Tensor, device: str,
     if vol.min() > 0 or vol.max() < 0:
         return None
     spacing = 2 * bound / (res - 1)
-    verts, faces, *_ = marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
+    verts, faces, *_ = marching_cubes(vol, level=mc_level, spacing=(spacing,) * 3)
     verts = (verts - bound).astype(np.float32)
     if len(verts) == 0 or len(faces) == 0:
         return None
@@ -1435,6 +1768,7 @@ def _mc_sfm_surface_distance(
     device: str,
     bound: float = 1.5,
     res: int = 128,
+    mc_level: float = 0.0,
 ) -> dict[str, float] | None:
     """Approximate e_i = min_x_surface ||x_sfm_i - x_surface|| from MC vertices."""
     from skimage.measure import marching_cubes
@@ -1448,7 +1782,7 @@ def _mc_sfm_surface_distance(
         return None
 
     spacing = 2 * bound / (res - 1)
-    verts, *_ = marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
+    verts, *_ = marching_cubes(vol, level=mc_level, spacing=(spacing,) * 3)
     verts = (verts - bound).astype(np.float32)
     if len(verts) == 0:
         return None
@@ -1474,101 +1808,8 @@ def _mc_sfm_surface_distance(
     }
 
 
-def _load_dtu_eval_data(dtu_eval_dir: Path, scan_id: int, device: str) -> dict | None:
-    """Load GT cloud + ObsMask for in-training DTU Chamfer. Returns None on error.
-
-    dtu_eval_dir should be the 'SampleSet/MVS Data' directory from the official
-    DTU SampleSet.zip download, containing Points/stl/ and ObsMask/ subdirs.
-    GT points are pre-filtered by the ObsMask so NN search stays fast.
-    """
-    try:
-        import open3d as o3d
-        from scipy.io import loadmat
-    except ImportError as e:
-        print(f"  [dtu_chamfer] skipping — missing dependency: {e}"); return None
-    # stl006 has better surface coverage; fall back to stl001
-    ply = dtu_eval_dir / "Points" / "stl" / "stl006_total.ply"
-    if not ply.exists():
-        ply = dtu_eval_dir / "Points" / "stl" / "stl001_total.ply"
-    mat = dtu_eval_dir / "ObsMask" / f"ObsMask{scan_id}_10.mat"
-    if not ply.exists() or not mat.exists():
-        print(f"  [dtu_chamfer] eval files not found under {dtu_eval_dir}"); return None
-    m = loadmat(str(mat))
-    ObsMask = m["ObsMask"].astype(bool)
-    BB      = m["BB"].astype(np.float64)
-    Res     = float(m["Res"].flat[0])
-
-    # load full GT cloud and pre-filter to this scene's ObsMask (avoids slow NN over all scenes)
-    all_pts = np.asarray(o3d.io.read_point_cloud(str(ply)).points, dtype=np.float32)
-    in_bb   = np.all((all_pts >= BB[0]) & (all_pts <= BB[1]), axis=1)
-    idx_bb  = np.clip(np.round((all_pts[in_bb] - BB[0]) / Res).astype(int),
-                      0, np.array(ObsMask.shape) - 1)
-    in_mask = ObsMask[idx_bb[:, 0], idx_bb[:, 1], idx_bb[:, 2]]
-    gt_pts  = all_pts[in_bb][in_mask]
-    print(f"  [dtu_chamfer] GT cloud (scan{scan_id}): {len(gt_pts):,} pts after ObsMask filter "
-          f"(from {len(all_pts):,} total in {ply.name})")
-    return {"gt_pts": torch.from_numpy(gt_pts).to(device),
-            "ObsMask": ObsMask, "BB": BB, "Res": Res}
-
-
-def _mc_chamfer_dtu(f, dtu_data: dict, scale_mat: np.ndarray, device: str,
-                    bound: float = 1.5, res: int = 128) -> dict[str, float] | None:
-    """Fast in-training DTU Chamfer: MC in normalised space → world → ObsMask-masked.
-
-    Uses scipy cKDTree on CPU to avoid materialising the full distance matrix
-    (GT cloud has ~2M points; brute-force GPU NN would OOM).
-    """
-    from skimage.measure import marching_cubes
-    from scipy.spatial import cKDTree
-
-    vox = torch.linspace(-bound, bound, res, device=device)
-    grid = torch.stack(torch.meshgrid(vox, vox, vox, indexing="ij"), dim=-1).reshape(-1, 3)
-    with torch.no_grad():
-        vals = torch.cat([f(grid[i:i+4096]) for i in range(0, len(grid), 4096)])
-    vol = vals.reshape(res, res, res).cpu().numpy()
-    if vol.min() > 0 or vol.max() < 0:
-        return None
-    spacing = 2 * bound / (res - 1)
-    verts_norm, faces_norm, *_ = marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
-    verts_norm = (verts_norm - bound).astype(np.float32)
-    if len(verts_norm) == 0 or len(faces_norm) == 0:
-        return None
-
-    # largest connected component (by surface area) — drop MC floaters
-    import trimesh
-    mesh = trimesh.Trimesh(vertices=verts_norm, faces=faces_norm, process=False)
-    parts = mesh.split(only_watertight=False)
-    if len(parts) > 1:
-        mesh = max(parts, key=lambda m: m.area)
-    verts_norm = np.asarray(mesh.vertices, dtype=np.float32)
-    if len(verts_norm) == 0:
-        return None
-
-    # normalised → DTU world
-    v_h = np.concatenate([verts_norm, np.ones((len(verts_norm), 1), dtype=np.float32)], axis=1)
-    verts_world = (scale_mat @ v_h.T).T[:, :3].astype(np.float32)
-
-    ObsMask, BB, Res = dtu_data["ObsMask"], dtu_data["BB"], dtu_data["Res"]
-    def _in_obs(pts):
-        in_bb = np.all((pts >= BB[0]) & (pts <= BB[1]), axis=1)
-        idx   = np.clip(np.round((pts - BB[0]) / Res).astype(int), 0, np.array(ObsMask.shape) - 1)
-        return in_bb & ObsMask[idx[:, 0], idx[:, 1], idx[:, 2]]
-
-    pred_np = verts_world[_in_obs(verts_world)]
-    gt_np   = dtu_data["gt_pts"].cpu().numpy()   # already pre-filtered at load time
-    if len(pred_np) == 0 or len(gt_np) == 0:
-        return None
-
-    tree_gt   = cKDTree(gt_np)
-    tree_pred = cKDTree(pred_np)
-    acc,  _ = tree_gt.query(pred_np, k=1, workers=-1)
-    comp, _ = tree_pred.query(gt_np,  k=1, workers=-1)
-    return {"precision": float(acc.mean()), "completeness": float(comp.mean()),
-            "chamfer": 0.5 * (float(acc.mean()) + float(comp.mean()))}
-
-
 def _extract_world_mesh_for_dtu(f, scale_mat: np.ndarray, device: str, out_ply: Path,
-                                bound: float = 1.0, res: int = 384) -> Path | None:
+                                bound: float = 1.0, res: int = 384, mc_level: float = 0.0) -> Path | None:
     from skimage.measure import marching_cubes
     import trimesh
 
@@ -1581,8 +1822,22 @@ def _extract_world_mesh_for_dtu(f, scale_mat: np.ndarray, device: str, out_ply: 
         return None
 
     spacing = 2 * bound / (res - 1)
-    verts_norm, faces, *_ = marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
+    verts_norm, faces, *_ = marching_cubes(vol, level=mc_level, spacing=(spacing,) * 3)
     verts_norm = (verts_norm - bound).astype(np.float32)
+    if len(verts_norm) == 0:
+        return None
+
+    # largest connected component (by surface area) — drop MC/PE floaters that
+    # form in under-observed pockets (in-FG but off-frame in most views), which
+    # neither silhouette nor sparse-SFM carving can remove (see _carve_sightlines).
+    mesh = trimesh.Trimesh(vertices=verts_norm, faces=faces, process=False)
+    parts = mesh.split(only_watertight=False)
+    if len(parts) > 1:
+        mesh = max(parts, key=lambda m: m.area)
+        print(f"  [dtu_official] kept largest of {len(parts)} components "
+              f"({len(mesh.faces)}/{len(faces)} faces)", flush=True)
+    verts_norm = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces)
     if len(verts_norm) == 0:
         return None
 
@@ -1593,9 +1848,119 @@ def _extract_world_mesh_for_dtu(f, scale_mat: np.ndarray, device: str, out_ply: 
     return out_ply
 
 
+def _dilate_masks_disk_np(masks: np.ndarray, radius: int) -> np.ndarray:
+    masks = masks.astype(bool)
+    if radius <= 0:
+        return masks
+    from skimage import morphology as morph
+
+    elem = morph.disk(int(radius))
+    return np.stack([morph.binary_dilation(m, elem) for m in masks]).astype(bool)
+
+
+def _crop_dtu_mesh_by_foreground_masks(
+    mesh_ply: Path,
+    scene: Path,
+    out_dir: Path,
+    dilate_px: int = 12,
+    min_ratio: float = 1.0,
+    min_views: int = 1,
+    chunk: int = 32768,
+) -> tuple[Path, dict]:
+    """NeuralWarp-style eval crop: 12px-dilated DTU masks, projected face centroids."""
+    import trimesh
+
+    views = load_views(scene, down=1)
+    masks = views["masks"].detach().cpu().numpy().astype(bool)
+    masks = _dilate_masks_disk_np(masks, dilate_px)
+    K = views["K"].detach().cpu().numpy().astype(np.float64)
+    c2w = views["c2w"].detach().cpu().numpy().astype(np.float64)
+    w2c = np.linalg.inv(c2w)
+    R = w2c[:, :3, :3]
+    tcw = w2c[:, :3, 3]
+    H, W = int(views["H"]), int(views["W"])
+
+    scale_mat = np.load(scene / "cameras.npz")["scale_mat_0"].astype(np.float64)
+    s = float(scale_mat[0, 0])
+    t = scale_mat[:3, 3].astype(np.float64)
+
+    mesh = trimesh.load(str(mesh_ply), force="mesh", process=False)
+    if isinstance(mesh, trimesh.Scene):
+        geoms = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        mesh = trimesh.util.concatenate(geoms)
+    mesh.remove_unreferenced_vertices()
+    faces = np.asarray(mesh.faces)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    if len(faces) == 0:
+        raise ValueError(f"mesh has no faces: {mesh_ply}")
+    cent_norm = (verts[faces].mean(axis=1) - t) / s
+
+    V = masks.shape[0]
+    keep = np.zeros(len(faces), dtype=bool)
+    min_views = max(1, int(min_views))
+    min_ratio = float(min_ratio)
+    seen_mean_acc = 0.0
+    fg_mean_acc = 0.0
+
+    print(f"  [dtu_official] mask crop: {len(faces):,} faces, {V} masks, "
+          f"dilate={dilate_px}px ratio={min_ratio:g}", flush=True)
+    for start in range(0, len(cent_norm), chunk):
+        end = min(start + chunk, len(cent_norm))
+        p = cent_norm[start:end]
+        xc = np.einsum("vij,nj->vni", R, p) + tcw[:, None, :]
+        uvh = np.einsum("vij,vnj->vni", K, xc)
+        z = uvh[..., 2]
+        denom = np.where(z > 1e-6, z, 1.0)
+        u = uvh[..., 0] / denom
+        v = uvh[..., 1] / denom
+        in_b = (z > 1e-6) & (xc[..., 2] > 1e-4) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        ui = np.rint(u).astype(np.int64).clip(0, W - 1)
+        vi = np.rint(v).astype(np.int64).clip(0, H - 1)
+
+        fg = np.zeros_like(in_b, dtype=bool)
+        for view_idx in range(V):
+            fg[view_idx] = masks[view_idx, vi[view_idx], ui[view_idx]]
+        seen = in_b.sum(axis=0)
+        fg_seen = (fg & in_b).sum(axis=0)
+        ratio = np.divide(
+            fg_seen, np.maximum(seen, 1),
+            out=np.zeros(len(seen), dtype=np.float32),
+            where=seen > 0,
+        )
+        keep[start:end] = (seen >= min_views) & (ratio >= min_ratio)
+        seen_mean_acc += float(seen.sum())
+        fg_mean_acc += float(fg_seen.sum())
+
+    if not keep.any():
+        raise RuntimeError("foreground-mask crop removed every DTU mesh face")
+
+    cropped = trimesh.Trimesh(vertices=verts, faces=faces[keep], process=False)
+    cropped.remove_unreferenced_vertices()
+    out_ply = out_dir / f"{mesh_ply.stem}_fgmask_dilate{int(dilate_px)}.ply"
+    cropped.export(str(out_ply))
+    stats = {
+        "enabled": True,
+        "dilate_px": int(dilate_px),
+        "min_ratio": min_ratio,
+        "min_views": min_views,
+        "faces_before": int(len(faces)),
+        "faces_after": int(keep.sum()),
+        "face_keep_fraction": float(keep.mean()),
+        "vertices_before": int(len(verts)),
+        "vertices_after": int(len(cropped.vertices)),
+        "seen_views_mean": float(seen_mean_acc / max(len(faces), 1)),
+        "fg_views_mean": float(fg_mean_acc / max(len(faces), 1)),
+        "mesh": str(out_ply),
+    }
+    print(f"  [dtu_official] mask crop faces {stats['faces_before']:,} → "
+          f"{stats['faces_after']:,} ({100.0 * stats['face_keep_fraction']:.1f}%)",
+          flush=True)
+    return out_ply, stats
+
+
 def _run_mvmannequin_official_eval(f, scene: Path, out_dir: Path,
                                    bound: float, res: int, device: str,
-                                   ) -> dict[str, float] | None:
+                                   mc_level: float = 0.0) -> dict[str, float] | None:
     """In-training MVMannequin Chamfer eval. Reproduces Inria-Morpheo's official
     protocol exactly: z>0.05 m slice + largest CC + ICP-p2l (Tukey, 25 mm)
     + pysdf point-to-mesh distance + clamp@100 mm.
@@ -1603,7 +1968,7 @@ def _run_mvmannequin_official_eval(f, scene: Path, out_dir: Path,
     Two-stage: (1) extract pred mesh in WORLD frame from this venv, (2) subprocess
     to the pixi env which has pysdf + open3d.
     """
-    eval_script = Path(__file__).resolve().parent.parent / "eval_mvmannequin_official.py"
+    eval_script = Path(__file__).resolve().parent.parent / "analysis/eval_mvmannequin_official.py"
     if not eval_script.exists():
         print(f"  [mvm_official] skipped — missing {eval_script}", flush=True)
         return None
@@ -1626,7 +1991,7 @@ def _run_mvmannequin_official_eval(f, scene: Path, out_dir: Path,
                   f"[{vol.min():.3f},{vol.max():.3f}])", flush=True)
             return None
         spacing = 2 * bound / (res - 1)
-        v_norm, faces, *_ = marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
+        v_norm, faces, *_ = marching_cubes(vol, level=mc_level, spacing=(spacing,) * 3)
         v_norm = (v_norm - bound).astype(np.float64)
         scale_mat = np.load(scene / "cameras.npz")["scale_mat_0"].astype(np.float64)
         v_h = np.concatenate([v_norm, np.ones((len(v_norm), 1))], axis=1)
@@ -1660,13 +2025,32 @@ def _run_mvmannequin_official_eval(f, scene: Path, out_dir: Path,
 
 
 def _run_dtu_official_eval(mesh_ply: Path, scan_id: int, dtu_eval_dir: Path,
-                           out_dir: Path) -> dict[str, float] | None:
+                           out_dir: Path, scene: Path | None = None,
+                           mask_crop: bool = True, mask_dilate_px: int = 12,
+                           mask_crop_min_ratio: float = 1.0,
+                           mask_crop_min_views: int = 1) -> dict[str, float] | None:
     eval_script = Path(__file__).resolve().parent.parent / "DTUeval-python" / "eval.py"
     if not eval_script.exists():
         print(f"  [dtu_official] skipped — missing {eval_script}", flush=True)
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    crop_stats = {"enabled": False}
+    if mask_crop:
+        if scene is None:
+            print("  [dtu_official] mask crop skipped — scene unavailable", flush=True)
+        else:
+            try:
+                mesh_ply, crop_stats = _crop_dtu_mesh_by_foreground_masks(
+                    mesh_ply, scene, out_dir,
+                    dilate_px=mask_dilate_px,
+                    min_ratio=mask_crop_min_ratio,
+                    min_views=mask_crop_min_views,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"  [dtu_official] mask crop failed: {e}", flush=True)
+                return None
+
     try:
         import open3d  # noqa: F401
         eval_python = sys.executable
@@ -1694,9 +2078,131 @@ def _run_dtu_official_eval(mesh_ply: Path, scan_id: int, dtu_eval_dir: Path,
     except (IndexError, ValueError):
         print(f"  [dtu_official] failed to parse metrics; see {out_dir}", flush=True)
         return None
-    payload = {"accuracy": acc, "completeness": comp, "chamfer": chamfer}
+    payload = {"accuracy": acc, "completeness": comp, "chamfer": chamfer,
+               "mesh": str(mesh_ply), "foreground_mask_crop": crop_stats}
     (out_dir / "dtu_official.json").write_text(json.dumps(payload, indent=2))
     return payload
+
+
+def _infer_tnt_scene_name(scene: Path, eval_dir: Path | None,
+                          explicit: str | None = None) -> str | None:
+    if explicit:
+        return explicit
+    candidates: set[str] = {scene.name}
+    for part in scene.parts:
+        candidates.add(part)
+        candidates.add(part.capitalize())
+    if eval_dir is not None and eval_dir.exists():
+        candidates.add(eval_dir.name)
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tnt_eval"))
+        from config import scenes_tau_dict
+        for name in scenes_tau_dict:
+            lowered = name.lower()
+            if name in candidates or any(lowered in c.lower() for c in candidates):
+                return name
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _resolve_tnt_gt_dir(eval_dir: Path, scene_name: str) -> Path | None:
+    direct = eval_dir
+    nested = eval_dir / scene_name
+    for cand in (nested, direct):
+        if all((cand / f).exists() for f in (
+            f"{scene_name}.ply",
+            f"{scene_name}_trans.txt",
+            f"{scene_name}.json",
+            f"{scene_name}_COLMAP_SfM.log",
+        )):
+            return cand
+    return None
+
+
+def _extract_tnt_eval_points(f, scene: Path, out_dir: Path, device: str,
+                             bound: float = 1.5, res: int = 512,
+                             n_samples: int = 2_000_000,
+                             mc_level: float = 0.0) -> Path | None:
+    """Extract current SDF surface in TnT world frame and sample eval points."""
+    import open3d as o3d
+    from skimage.measure import marching_cubes
+
+    bbox_p = scene / "bbox.txt"
+    if not bbox_p.exists():
+        print(f"  [tnt_official] skipped — missing {bbox_p}", flush=True)
+        return None
+    bbox = np.loadtxt(bbox_p, dtype=np.float32)
+    center = 0.5 * (bbox[:3] + bbox[3:6])
+    scale = float(np.max(0.5 * (bbox[3:6] - bbox[:3])))
+    lo_n = (bbox[:3] - center) / scale
+    hi_n = (bbox[3:6] - center) / scale
+    pad = 0.10 * (hi_n - lo_n)
+    lo_n = np.clip(lo_n - pad, -bound, bound)
+    hi_n = np.clip(hi_n + pad, -bound, bound)
+
+    gx = torch.linspace(float(lo_n[0]), float(hi_n[0]), res, device=device)
+    gy = torch.linspace(float(lo_n[1]), float(hi_n[1]), res, device=device)
+    gz = torch.linspace(float(lo_n[2]), float(hi_n[2]), res, device=device)
+    grid = torch.stack(torch.meshgrid(gx, gy, gz, indexing="ij"), dim=-1).reshape(-1, 3)
+    print(f"  [tnt_official] MC eval {grid.shape[0]:,} pts at res={res} "
+          f"scene-box(norm) lo={lo_n} hi={hi_n}", flush=True)
+    with torch.no_grad():
+        vals = torch.cat([f(grid[i:i + 65536]) for i in range(0, len(grid), 65536)])
+    vol = vals.reshape(res, res, res).detach().cpu().numpy()
+    if vol.min() > 0 or vol.max() < 0:
+        print(f"  [tnt_official] n/a (surface not in bounds; "
+              f"f in [{vol.min():.4f},{vol.max():.4f}])", flush=True)
+        return None
+
+    verts, faces, *_ = marching_cubes(vol, level=mc_level)
+    span = (hi_n - lo_n).astype(np.float32)
+    verts = lo_n.astype(np.float32) + verts.astype(np.float32) / (res - 1) * span
+    verts_w = verts * scale + center
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(verts_w.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    mesh.compute_vertex_normals()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mesh_p = out_dir / "mesh.ply"
+    points_p = out_dir / "points.ply"
+    o3d.io.write_triangle_mesh(str(mesh_p), mesh)
+    pcd = mesh.sample_points_uniformly(number_of_points=int(n_samples))
+    o3d.io.write_point_cloud(str(points_p), pcd)
+    print(f"  [tnt_official] wrote {mesh_p.name} and {points_p.name} "
+          f"({int(n_samples):,} pts)", flush=True)
+    return points_p
+
+
+def _run_tnt_official_eval(points_ply: Path, scene: Path, eval_dir: Path,
+                           scene_name: str, out_dir: Path,
+                           frame: str = "colmap-pose") -> dict[str, float] | None:
+    eval_script = Path(__file__).resolve().parent.parent / "analysis" / "eval_tnt_official.py"
+    if not eval_script.exists():
+        print(f"  [tnt_official] skipped — missing {eval_script}", flush=True)
+        return None
+    gt_dir = _resolve_tnt_gt_dir(eval_dir, scene_name)
+    if gt_dir is None:
+        print(f"  [tnt_official] skipped — missing GT assets for {scene_name} under {eval_dir}",
+              flush=True)
+        return None
+
+    try:
+        sys.path.insert(0, str(eval_script.parent))
+        from eval_tnt_official import run_tnt_eval
+        run_tnt_eval(points_ply, scene, gt_dir, scene_name, out_dir, frame=frame)
+        payload = json.loads((out_dir / "fscore.json").read_text())
+        return {
+            "precision": float(payload["precision"]),
+            "recall": float(payload["recall"]),
+            "fscore": float(payload["fscore"]),
+            "tau": float(payload["tau"]),
+        }
+    except Exception as e:  # noqa: BLE001
+        print(f"  [tnt_official] failed: {e}; see {out_dir}", flush=True)
+        return None
 
 
 # ---------- debug region monitoring ----------
@@ -1854,7 +2360,7 @@ def _log_debug_regions(f, regions: list[dict], cfg, step: int,
 # ---------- training ----------
 
 def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = None,
-          run_dir: Path | None = None) -> Path:
+          run_dir: Path | None = None, view_keep=None, lr_warm_restart: bool = False) -> Path:
     """Train the 1-Lip SDF and save checkpoints to a timestamped run directory.
 
     Returns the path to the final checkpoint.
@@ -1869,6 +2375,21 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     eval_cfg  = cfg.eval
     scene     = cfg.scene
     out_dir   = cfg.out_dir
+
+    if not train_cfg.use_masks:
+        mask_loss_weights = {
+            "w_mask_fg": train_cfg.w_mask_fg,
+            "w_mask_bg": train_cfg.w_mask_bg,
+            "w_idr_mask": train_cfg.w_idr_mask,
+            "w_sil": train_cfg.w_sil,
+        }
+        active_mask_losses = [k for k, v in mask_loss_weights.items() if v > 0]
+        if active_mask_losses:
+            raise ValueError(
+                "train.use_masks=False is incompatible with mask-supervised losses: "
+                + ", ".join(active_mask_losses)
+                + ". Set those weights to 0 or enable masks."
+            )
 
     # Skip the differentiable soft-min compute only when no active loss consumes
     # sdf_min. In IDR tracing the hard sdf_min is collected under no_grad, so
@@ -1933,11 +2454,17 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
 
     # --- data ---
     if train_cfg.use_blender:
+        if view_keep is not None:
+            raise NotImplementedError("view_keep not supported for Blender scenes")
         views = load_blender_views(scene=scene, down=train_cfg.down)
     else:
-        views = load_views(scene)
+        views = load_views(scene, view_keep=view_keep)
+    if not train_cfg.use_masks and "masks" in views:
+        views = dict(views)
+        views["masks"] = torch.ones_like(views["masks"], dtype=torch.bool)
+        print("  [mask-free] ignoring dataset masks for training, ray labels, and SFM visibility")
     images      = views["images"].to(device).half()
-    masks       = views["masks"].to(device) if "masks" in views else None
+    masks       = views["masks"].to(device) if train_cfg.use_masks and "masks" in views else None
     c2w_all     = views["c2w"].to(device)
     K_all       = views["K"].to(device)
     H, W        = views["H"], views["W"]
@@ -1946,13 +2473,10 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     origins_all = c2w_all[:, :3, 3]
     w2c_all     = torch.linalg.inv(c2w_all)
 
-    # --- bundle adjustment (joint photometric, see bundle_adjustment.py) ---
-    cam_params = None
-    if train_cfg.bundle.enabled:
-        from .bundle_adjustment import CameraParams, rays_from_pixels
-        cam_params = CameraParams(c2w_all, lock_first=train_cfg.bundle.lock_first).to(device)
-        print(f"  BA enabled  lr={train_cfg.bundle.lr}  freeze_steps={train_cfg.bundle.freeze_steps}  "
-              f"lock_first={train_cfg.bundle.lock_first}")
+    # Bundle adjustment is a separate post-training pass — block-coordinate
+    # refinement of (θ, φ) from a converged checkpoint. It lives entirely in
+    # bundle_adjustment.run_bundle_adjustment; this training loop only ever
+    # optimises θ with the cameras held at their calibrated poses.
 
     feature_maps = None
     if train_cfg.w_feature > 0 and train_cfg.feature_maps is None:
@@ -1972,6 +2496,8 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         print(f"  feature maps: {train_cfg.feature_maps}  {tuple(feature_maps.shape)}  "
               f"w_feature={train_cfg.w_feature}")
 
+    sfm_vis = None   # (V, P) per-view COLMAP visibility for Geo-Neus per-view SDF loss
+    is_mvm = False
     if train_cfg.use_blender:
         try:
             gt_pts = load_blender_gt_points(scene=scene)
@@ -1987,35 +2513,51 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         mvs_data     = None
     else:
         gt_pts = None
-        # official DTU eval data (GT cloud + ObsMask) for in-training Chamfer
-        dtu_eval_data  = None
+        # scale_mat + scan id for periodic official DTU eval
         dtu_scale_mat  = None
         dtu_scan_id    = None
-        if eval_cfg.dtu_eval_dir is not None and (eval_cfg.dtu_chamfer_freq > 0 or eval_cfg.dtu_official_freq > 0):
+        if eval_cfg.dtu_eval_dir is not None and eval_cfg.dtu_official_freq > 0:
             import re
             m = re.search(r"scan(\d+)", str(scene))
             if m:
                 dtu_scan_id = int(m.group(1))
                 dtu_scale_mat = np.load(scene / "cameras.npz")["scale_mat_0"].astype(np.float64)
-                if eval_cfg.dtu_chamfer_freq > 0:
-                    dtu_eval_data = _load_dtu_eval_data(eval_cfg.dtu_eval_dir, dtu_scan_id, device)
         # MVMannequin scene auto-detect: presence of GT mesh next to cameras.npz.
         # Reuses dtu_official_freq for cadence; gt_mesh.ply lives in normalized frame.
         is_mvm = (scene / "gt_mesh.ply").exists() and (scene / "cameras.npz").exists() and not dtu_scan_id
-        if train_cfg.w_sfm > 0:
+        tnt_scene_name = None
+        if eval_cfg.tnt_eval_dir is not None and eval_cfg.tnt_official_freq > 0:
+            tnt_scene_name = _infer_tnt_scene_name(
+                scene, eval_cfg.tnt_eval_dir, eval_cfg.tnt_official_scene)
+            if tnt_scene_name is None:
+                print(f"  [tnt_official] disabled — cannot infer official scene name from {scene}")
+            elif _resolve_tnt_gt_dir(eval_cfg.tnt_eval_dir, tnt_scene_name) is None:
+                print(f"  [tnt_official] disabled — missing GT assets for {tnt_scene_name} "
+                      f"under {eval_cfg.tnt_eval_dir}")
+                tnt_scene_name = None
+            else:
+                print(f"  [tnt_official] {tnt_scene_name}: every "
+                      f"{eval_cfg.tnt_official_freq} steps  res={eval_cfg.tnt_official_res}  "
+                      f"n={eval_cfg.tnt_official_n_samples:,}  frame={eval_cfg.tnt_official_frame}")
+        if train_cfg.w_sfm > 0 or train_cfg.w_geo_sdf > 0:
             try:
                 sfm_pts_all = load_colmap_points(scene)
                 if train_cfg.sfm_min_views > 0:
-                    sfm_vis = colmap_visibility_counts(sfm_pts_all, views)
-                    sfm_pts = sfm_pts_all[sfm_vis >= train_cfg.sfm_min_views].to(device)
+                    sfm_counts = colmap_visibility_counts(sfm_pts_all, views)
+                    sfm_pts = sfm_pts_all[sfm_counts >= train_cfg.sfm_min_views].to(device)
                     print(f"  loaded {sfm_pts.shape[0]}/{sfm_pts_all.shape[0]} SFM points "
                           f"(>={train_cfg.sfm_min_views} views)")
                 else:
                     sfm_pts = sfm_pts_all.to(device)
                     print(f"  loaded {sfm_pts.shape[0]} SFM points")
+                # Geo-Neus per-view SDF: (V, P) visibility = their view_id.npy.
+                sfm_vis = colmap_visibility_matrix(sfm_pts.cpu(), views).to(device)
+                _ppv = sfm_vis.sum(1)
+                print(f"  per-view SDF supervision: {sfm_vis.shape[0]} views, "
+                      f"{_ppv.float().mean():.0f} pts/view (min {_ppv.min()}, max {_ppv.max()})")
             except FileNotFoundError as e:
-                print(f"  sparse_sfm_points.txt not found — w_sfm disabled ({e})")
-                train_cfg = dataclasses.replace(train_cfg, w_sfm=0.0)
+                print(f"  sparse_sfm_points.txt not found — w_sfm/w_geo_sdf disabled ({e})")
+                train_cfg = dataclasses.replace(train_cfg, w_sfm=0.0, w_geo_sdf=0.0)
                 sfm_pts = torch.zeros(1, 3, device=device)
         else:
             sfm_pts = torch.zeros(1, 3, device=device)
@@ -2090,14 +2632,15 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                   f"y=[{lo_np[1]:+.3f},{hi_np[1]:+.3f}] "
                   f"z=[{lo_np[2]:+.3f},{hi_np[2]:+.3f}]")
         torch.cuda.empty_cache()
-    elif init_cfg.init == "colmap":
-        f, hull_occ = fit_colmap_init(
+    elif init_cfg.init in ("colmap", "points"):
+        _init_fn = fit_points_init if init_cfg.init == "points" else fit_colmap_init
+        f, hull_occ = _init_fn(
             model_cfg=model_cfg, init_cfg=init_cfg, scene=scene, bound=bound,
         )
         mvs_sdf_bounds_np = _visual_hull_sample_bounds(hull_occ, bound)
         if mvs_sdf_bounds_np is not None:
             lo_np, hi_np = mvs_sdf_bounds_np
-            print(f"  mvs-sdf samples: COLMAP-hull AABB "
+            print(f"  mvs-sdf samples: {init_cfg.init}-hull AABB "
                   f"x=[{lo_np[0]:+.3f},{hi_np[0]:+.3f}] "
                   f"y=[{lo_np[1]:+.3f},{hi_np[1]:+.3f}] "
                   f"z=[{lo_np[2]:+.3f},{hi_np[2]:+.3f}]")
@@ -2114,6 +2657,19 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     act_tag = getattr(f, "activation", "-")
     print(f"  model: hidden={f.hidden}  depth={n_cpl or f.depth}  params={total_params:,}  "
           f"arch={arch_tag}  act={act_tag}  enc={f.input_encoding}  multires={f.multires}")
+    # f_fwd: compiled view of f for the hot path (trace + photo loss). Shares
+    # parameters/buffers with f, so the optimiser (over f.parameters()) and all
+    # checkpointing/introspection keep using the raw `f` — only forward calls in
+    # the inner loop route through the fused graph. dynamic=True: the compacted
+    # trace passes variable-size batches each iteration.
+    if getattr(train_cfg, "compile", True):
+        f_fwd, _ok, _msg = _try_compile_model(f)
+        if _ok:
+            print("  torch.compile(dynamic=True) enabled for hot-path f")
+        else:
+            print(f"  [warn] torch.compile unavailable ({_msg}) — running eager")
+    else:
+        f_fwd = f
     if train_cfg.profile:
         from .profiling import profile_model
         _prof = profile_model(f, device, batch=train_cfg.batch,
@@ -2133,6 +2689,32 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     total_rays = det["o"].shape[0]
     rpv        = det["rays_per_view"]
     print(f"  det rays: {total_rays} total, {rpv}/view, {V} views, down={train_cfg.down}")
+    # mask-free object-focused sampling: trace det rays vs the init SDF once and
+    # set fg = hit. The carved init hull is a conservative superset of the object,
+    # so true-surface rays are covered; pair with fg_fraction<1 + force_fg_bg_split
+    # for a full-frame escape valve. No segmentation mask involved.
+    if train_cfg.init_hit_sampling:
+        # cheap occ-style trace — fg is a boolean, no need for primary-trace precision
+        fg_trace_cfg = dataclasses.replace(
+            trace_cfg, iters=trace_cfg.occ_iters,
+            newton_steps=trace_cfg.occ_newton_steps,
+            eps=max(trace_cfg.occ_eps, trace_cfg.eps))
+        hit_fg = torch.empty(total_rays, dtype=torch.bool)
+        chunk  = 1 << 21
+        with torch.no_grad():
+            for s in range(0, total_rays, chunk):
+                e = min(s + chunk, total_rays)
+                _, _, hit_c = trace_nograd(f_fwd, det["o"][s:e].to(device),
+                                           det["d"][s:e].to(device), fg_trace_cfg)
+                hit_fg[s:e] = hit_c.cpu()
+                print(f"    init-hit trace {e}/{total_rays}", flush=True)
+        n_hit = int(hit_fg.sum())
+        print(f"  init-hit sampling: {n_hit}/{total_rays} rays hit init SDF "
+              f"({100 * n_hit / max(total_rays, 1):.1f}%) → fg")
+        if n_hit == 0:
+            print("  [init-hit] WARNING: no rays hit init SDF — keeping original fg")
+        else:
+            det["fg"] = hit_fg
     fg_frac = det["fg"].float().mean().item()
     print(f"  fg rays: {det['fg'].sum():.0f}/{total_rays} ({fg_frac:.1%})"
           f"{'  [NO MASKS]' if masks is None else ''}")
@@ -2142,14 +2724,16 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         train_cfg.w_mask_bg, train_cfg.w_idr_mask, train_cfg.w_sil,
         train_cfg.w_behind_hit, train_cfg.w_ray_free,
     ))
-    if len(bg_idx) == 0 or not _bg_loss_active:
+    if not 0.0 <= train_cfg.fg_fraction <= 1.0:
+        raise ValueError(f"fg_fraction must be in [0, 1], got {train_cfg.fg_fraction}")
+    if len(bg_idx) == 0 or (not _bg_loss_active and not train_cfg.force_fg_bg_split):
         n_fg = train_cfg.batch
         n_bg = 0
     elif len(fg_idx) == 0:
         n_fg = 0
         n_bg = train_cfg.batch
     else:
-        n_fg = int(train_cfg.batch * 0.7)
+        n_fg = int(train_cfg.batch * train_cfg.fg_fraction)
         n_bg = train_cfg.batch - n_fg
     print(f"  batch split: n_fg={n_fg}  n_bg={n_bg}  "
           f"(bg_loss_active={_bg_loss_active}, |bg_idx|={len(bg_idx)})")
@@ -2203,8 +2787,49 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         fg_idx = det["fg"].nonzero(as_tuple=True)[0]
         bg_idx = (~det["fg"]).nonzero(as_tuple=True)[0]
 
-    alt_nn = precompute_alt_cameras(views, train_cfg.n_alt).to(device)
-    print(f"  alt cameras: {train_cfg.n_alt} NN per view")
+    _vsel = getattr(train_cfg, "view_selection", "nearest")
+    if _vsel == "pairs_file":
+        _pp = getattr(train_cfg, "pairs_path", None)
+        if _pp is None:
+            raise ValueError("view_selection='pairs_file' requires train.pairs_path")
+        alt_nn = alt_cameras_from_pairs(_pp, views["c2w"].shape[0],
+                                        train_cfg.n_alt).to(device)
+        print(f"  alt cameras: pairs_file '{_pp}' — first {train_cfg.n_alt} "
+              f"ranked srcs per view")
+    elif _vsel in ("arccos", "arccos_nn"):
+        alt_nn = precompute_alt_cameras_arccos(views, train_cfg.n_alt).to(device)
+        _mode = "minimal (flat sampling)" if _vsel == "arccos_nn" else "2-level uniform-cam"
+        print(f"  alt cameras: {train_cfg.n_alt} arccos-nearest (angular distance) per view "
+              f"[{_mode}]")
+    else:
+        alt_nn = precompute_alt_cameras(views, train_cfg.n_alt).to(device)
+        print(f"  alt cameras: {train_cfg.n_alt} nearest NN per view")
+
+    # arccos mode: precompute sorted fg/bg index tables for vectorised 2-level
+    # sampling (camera ~ Uniform(V) → ray ~ Uniform within that camera's pool).
+    if _vsel == "arccos":
+        _vi_all = det["vi"]   # (total_rays,) CPU
+        def _build_view_table(pool):
+            """Returns (sorted_pool, view_offsets[V+1], view_counts[V]) on CPU."""
+            vi_pool = _vi_all[pool]
+            order   = vi_pool.argsort()
+            sorted_pool = pool[order]
+            counts  = torch.bincount(vi_pool, minlength=V)
+            offsets = torch.zeros(V + 1, dtype=torch.long)
+            offsets[1:] = counts.cumsum(0)
+            return sorted_pool, offsets, counts
+        _fg_sorted, _fg_offsets, _fg_counts = _build_view_table(fg_idx)
+        _bg_sorted, _bg_offsets, _bg_counts = _build_view_table(bg_idx)
+        print(f"  [arccos] one-ref-view-per-step: ref cam ~ Uniform(V), all rays from that cam")
+
+    # one-time comparison log: selected source ids + triangulation angle per ref
+    _ang = selected_pair_triangulation_angles(views, alt_nn, scene)
+    _alt_cpu = alt_nn.cpu().tolist()
+    print(f"  [view-select:{_vsel}] per-view selected src ids "
+          f"(triangulation angle deg @object-centre):")
+    for r in range(alt_nn.shape[0]):
+        _pairs = "  ".join(f"{s}({a:.1f})" for s, a in zip(_alt_cpu[r], _ang[r]))
+        print(f"    ref {r:3d}: {_pairs}")
 
     # --- optional image-gradient-weighted fg sampling ---
     fg_cdf = None   # CDF for grad-weighted sampling (searchsorted, no 2^24 limit)
@@ -2255,21 +2880,30 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
 
     # --- optimiser ---
     opt       = torch.optim.Adam(f.parameters(), lr=train_cfg.lr)
-    if cam_params is not None:
-        opt.add_param_group({"params": list(cam_params.parameters()),
-                             "lr": train_cfg.bundle.lr})
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg.steps,
                                                              eta_min=train_cfg.lr / 10)
     start_step = 0
     if _resume_ckpt is not None:
         start_step = int(_resume_ckpt.get("step", -1)) + 1
-        if "opt" in _resume_ckpt:
-            opt.load_state_dict(_resume_ckpt["opt"])
-        if "scheduler" in _resume_ckpt:
-            scheduler.load_state_dict(_resume_ckpt["scheduler"])
+        if lr_warm_restart:
+            # Warm restart: keep the trained weights but give a FRESH cosine that
+            # anneals lr -> eta_min over the remaining [start_step, steps) segment,
+            # and reset the optimiser moments. Without this, a plain resume restores
+            # the floored scheduler (lr ~= eta_min) and the continuation barely moves.
+            remaining = max(train_cfg.steps - start_step, 1)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=remaining, eta_min=train_cfg.lr / 10)
+            print(f"  [resume] LR warm-restart: fresh cosine "
+                  f"lr={train_cfg.lr:g} -> {train_cfg.lr / 10:g} over {remaining} steps "
+                  f"(optimiser + scheduler reset)")
         else:
-            for _ in range(start_step):
-                scheduler.step()
+            if "opt" in _resume_ckpt:
+                opt.load_state_dict(_resume_ckpt["opt"])
+            if "scheduler" in _resume_ckpt:
+                scheduler.load_state_dict(_resume_ckpt["scheduler"])
+            else:
+                for _ in range(start_step):
+                    scheduler.step()
         print(f"  [resume] continuing from step {start_step} / {train_cfg.steps}")
     best_score        = float("inf"); best_step = -1
     best_photo_score  = float("inf")
@@ -2295,33 +2929,39 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     for step in range(start_step, train_cfg.steps):
         prof.step_begin()
         parts = []
-        if n_fg > 0 and len(fg_idx) > 0:
-            if fg_cdf is not None:
-                fg_draw = torch.searchsorted(fg_cdf, torch.rand(n_fg))
-            else:
-                fg_draw = torch.randint(0, len(fg_idx), (n_fg,))
-            parts.append(fg_idx[fg_draw])
-        if n_bg > 0 and len(bg_idx) > 0:
-            parts.append(bg_idx[torch.randint(0, len(bg_idx), (n_bg,))])
+        if _vsel == "arccos":
+            # One reference view per step (IDR/NeuS-style): pick a single camera
+            # uniformly, then draw all this step's rays from THAT camera's pools.
+            ref_cam = int(torch.randint(0, V, (1,)).item())
+            def _draw_from_cam(n, sorted_pool, offsets, counts, fallback_pool):
+                cnt = int(counts[ref_cam])
+                if cnt == 0:                      # camera empty in this stratum → global fallback
+                    return fallback_pool[torch.randint(0, len(fallback_pool), (n,))]
+                local = torch.randint(0, cnt, (n,))
+                return sorted_pool[offsets[ref_cam] + local]
+            if n_fg > 0 and len(fg_idx) > 0:
+                parts.append(_draw_from_cam(n_fg, _fg_sorted, _fg_offsets, _fg_counts, fg_idx))
+            if n_bg > 0 and len(bg_idx) > 0:
+                parts.append(_draw_from_cam(n_bg, _bg_sorted, _bg_offsets, _bg_counts, bg_idx))
+        else:
+            if n_fg > 0 and len(fg_idx) > 0:
+                if fg_cdf is not None:
+                    fg_draw = torch.searchsorted(fg_cdf, torch.rand(n_fg))
+                else:
+                    fg_draw = torch.randint(0, len(fg_idx), (n_fg,))
+                parts.append(fg_idx[fg_draw])
+            if n_bg > 0 and len(bg_idx) > 0:
+                parts.append(bg_idx[torch.randint(0, len(bg_idx), (n_bg,))])
         idx      = torch.cat(parts)                            # CPU — indexes det on CPU
         idx_dev  = idx.to(device)
         vi       = det["vi"][idx].to(device);  gt = det["gt"][idx].to(device)
         fg_self  = det["fg"][idx].to(device)
-        if cam_params is not None and step >= train_cfg.bundle.freeze_steps:
-            # Refresh world-frame cameras from the current BA parameters and
-            # rebuild this batch's rays so gradients flow into the extrinsics.
-            c2w_all     = cam_params()
-            origins_all = c2w_all[:, :3, 3]
-            w2c_all     = torch.linalg.inv(c2w_all)
-            px = det["px"][idx].to(device);  py = det["py"][idx].to(device)
-            o, u = rays_from_pixels(c2w_all, K_all, px, py, vi)
-        else:
-            o = det["o"][idx].to(device);   u  = det["d"][idx].to(device)
+        o = det["o"][idx].to(device);   u  = det["d"][idx].to(device)
 
         _need_eik = train_cfg.w_eikonal > 0 or train_cfg.w_mvs_sdf > 0 or train_cfg.mvsdf_schedule.enabled
         _trace_fn = trace_idr if trace_cfg.grad_mode == "idr" else trace_unrolled
         with prof.timed("trace"):
-            x_theta, t, hit, eik_pts, n_raw, sdf_min, hit_bg = _trace_fn(f, o, u, trace_cfg,
+            x_theta, t, hit, eik_pts, n_raw, sdf_min, hit_bg = _trace_fn(f_fwd, o, u, trace_cfg,
                                                                           collect_eik=_need_eik,
                                                                           diff_normal=train_cfg.w_ncc_normal > 0)
         neus_trace_stats = get_last_trace_stats() if f.architecture == "neus" else None
@@ -2375,10 +3015,20 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         else:
             _eff_wsigma = _wsig_start
 
+        # Gipuma bilateral γ schedule (exp anneal): fixed large patch, γ↓ shrinks
+        # the effective support window large→small (coarse→fine) over training.
+        _bg_start = getattr(train_cfg, "ncc_bilateral_gamma", 0.0)
+        _bg_end   = getattr(train_cfg, "ncc_bilateral_gamma_end", 0.0)
+        if _bg_start > 0 and _bg_end > 0 and _bg_end != _bg_start:
+            _t = step / max(train_cfg.steps - 1, 1)
+            _eff_bgamma = _bg_start * (_bg_end / _bg_start) ** _t
+        else:
+            _eff_bgamma = _bg_start
+
         # --- losses ---
         with prof.timed("photo_ncc"):
             ph, ph_stats = photo_loss(
-                f, x_theta, hit_for_photo, n,
+                f_fwd, x_theta, hit_for_photo, n,
                 vi, alt_nn, origins_all,
                 images, K_all, w2c_all, feature_maps, masks, fg_self,
                 H, W, uv_self,
@@ -2394,15 +3044,123 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 ncc_normal_patch=train_cfg.ncc_normal_patch,
                 ncc_normal_half_pix=train_cfg.ncc_normal_half_pix,
                 ncc_patch_wsigma=_eff_wsigma,
+                ncc_patch_bilateral_gamma=_eff_bgamma,
                 trace_cfg=trace_cfg,
                 prof=prof,
             )
 
+        # --- soft-argmin photo-coherence (method.pdf §2) ---
+        _sa_active = train_cfg.w_soft_argmin > 0 and step >= train_cfg.sa_start_step
+        if _sa_active:
+            # Temperature annealed from tau_start (soft global pull) to tau_end (sharp local pick)
+            _prog_sa = step / max(train_cfg.steps - 1, 1)
+            _sa_tau  = train_cfg.sa_tau_start * (
+                train_cfg.sa_tau_end / max(train_cfg.sa_tau_start, 1e-9)
+            ) ** _prog_sa
+            _sa_t_far = train_cfg.sa_t_far if train_cfg.sa_t_far > 0 else trace_cfg.t_far
+            sa_pull, sa_stats = soft_argmin_photo_loss(
+                f,
+                x_theta, hit, o, u, vi,
+                alt_nn, origins_all,
+                images, K_all, w2c_all,
+                H, W,
+                train_cfg.sa_n_candidates,
+                _sa_tau,
+                train_cfg.sa_t_near,
+                _sa_t_far,
+                train_cfg.sa_use_bg,
+                train_cfg.sa_bg_color,
+                trace_cfg=trace_cfg,
+                prof=prof,
+            )
+        else:
+            sa_pull = torch.zeros(1, device=device).squeeze()
+            sa_stats = {}
+
+        if train_cfg.sil_s_interval > 0:
+            n_doublings = min(step // train_cfg.sil_s_interval, train_cfg.sil_s_max_mults)
+            alpha = train_cfg.sil_s * (2.0 ** n_doublings)
+        else:
+            alpha = train_cfg.sil_s
+
+        with prof.timed("idr_mask"):
+            idr_mask, idr_stats = (idr_mask_loss(f, o, u, hit, fg_self, alpha,
+                                                 train_cfg.idr_n_samples,
+                                                 train_cfg.sil_t_near, train_cfg.sil_t_far)
+                                   if train_cfg.w_idr_mask > 0
+                                   else (torch.zeros(1, device=device).squeeze(), {}))
+        sil  = (mask_loss_min_sdf(sdf_min, fg_self, alpha,
+                                  fg_offset=train_cfg.sil_fg_offset,
+                                  bg_offset=train_cfg.sil_bg_offset,
+                                  focal_gamma=train_cfg.sil_focal_gamma,
+                                  balance_classes=train_cfg.sil_balance,
+                                  normalize_by_alpha=train_cfg.sil_norm_alpha)
+                if train_cfg.w_sil > 0 else torch.zeros(1, device=device).squeeze())
+        mask_fg, mask_bg = (dvr_mask_loss(f, o, u, fg_self, trace_cfg.t_far,
+                                          train_cfg.mask_fg_margin, train_cfg.mask_bg_margin,
+                                          train_cfg.n_mask_fg, train_cfg.n_mask_bg)
+                            if (train_cfg.w_mask_fg > 0 or train_cfg.w_mask_bg > 0)
+                            else (torch.zeros(1, device=device).squeeze(),
+                                  torch.zeros(1, device=device).squeeze()))
         with prof.timed("eikonal"):
             eik  = (eikonal_loss(f, eik_pts, train_cfg.n_eik_vol, device)
                     if train_cfg.w_eikonal > 0 else torch.zeros(1, device=device).squeeze())
         cfr  = (cam_free_loss(f, o)
                 if train_cfg.w_cam_free > 0 else torch.zeros(1, device=device).squeeze())
+        if train_cfg.w_sfm > 0:
+            # Geo-Neus exact SDF loss: L1, one view's visible COLMAP points per
+            # step (cycling iter % V, as in exp_runner). Falls back to global L1
+            # when no per-view visibility is available (e.g. blender GT points).
+            _view_sel = (step % sfm_vis.shape[0]) if sfm_vis is not None else None
+            sfm_surface = geo_neus_sdf_loss(f, sfm_pts, vis=sfm_vis,
+                                            view_sel=_view_sel, batch=train_cfg.batch)
+            sfm_clear = (free_space_loss(f, sfm_origins, sfm_targets, n_sfm_pairs,
+                                         train_cfg.batch, train_cfg.n_free)
+                         if n_sfm_pairs > 0 else torch.zeros(1, device=device).squeeze())
+            sfm_behind = (sfm_behind_loss(f, sfm_origins, sfm_targets, n_sfm_pairs,
+                                          train_cfg.batch, train_cfg.sfm_behind_eps)
+                          if n_sfm_pairs > 0 and train_cfg.sfm_behind_eps > 0
+                          else torch.zeros(1, device=device).squeeze())
+            sfm = sfm_surface + sfm_clear + sfm_behind
+        else:
+            sfm = torch.zeros(1, device=device).squeeze()
+        # Pure Geo-Neus SDF loss (surface term ONLY), independent of the w_sfm
+        # bundle above. Exactly exp_runner's L1, per-view. No free-space/behind.
+        if train_cfg.w_geo_sdf > 0:
+            _gv = (step % sfm_vis.shape[0]) if sfm_vis is not None else None
+            sfm_geo = geo_neus_sdf_loss(f, sfm_pts, vis=sfm_vis,
+                                        view_sel=_gv, batch=train_cfg.batch)
+        else:
+            sfm_geo = torch.zeros(1, device=device).squeeze()
+        fs   = (free_space_loss(f, sfm_origins, sfm_targets, n_sfm_pairs,
+                                train_cfg.batch, train_cfg.n_free)
+                if train_cfg.w_free > 0 and n_sfm_pairs > 0
+                else torch.zeros(1, device=device).squeeze())
+        surf = (surface_loss(f, o, u, vi, c2w_all, mvs_depth_flat, mvs_valid_flat, idx_dev)
+                if train_cfg.w_surf > 0 else torch.zeros(1, device=device).squeeze())
+        mvs  = (mvs_depth_loss(x_theta, o, u, vi, hit, c2w_all,
+                               mvs_depth_flat, mvs_valid_flat, idx_dev, step)
+                if train_cfg.w_mvs > 0 else torch.zeros(1, device=device).squeeze())
+        with prof.timed("mvs_sdf"):
+            if _eff_w_msdf > 0:
+                mvs_sdf_pts = mvs_sdf_lo + torch.rand(
+                    train_cfg.n_mvs_sdf, 3, device=device,
+                ) * (mvs_sdf_hi - mvs_sdf_lo)
+                msdf = mvsdf_carving_loss(
+                    f, mvs_sdf_pts,
+                    w2c_all, K_all,
+                    mvs_depth_maps, mvs_valid_maps,
+                    H, W, train_cfg.down,
+                    train_cfg.mvs_sdf_out_thresh,
+                    train_cfg.mvs_sdf_trunc, train_cfg.mvs_sdf_smooth,
+                    train_cfg.mvs_sdf_far_thresh, train_cfg.mvs_sdf_far_att,
+                    train_cfg.mvs_sdf_near_thresh, train_cfg.mvs_sdf_near_att,
+                    step,
+                )
+            else:
+                msdf = torch.zeros(1, device=device).squeeze()
+        beh  = (behind_hit_loss(f, x_theta, hit, u, train_cfg.behind_eps)
+                if train_cfg.w_behind_hit > 0 else torch.zeros(1, device=device).squeeze())
 
         if train_cfg.w_ray_free > 0 and hit.any():
             t_samp = torch.rand(hit.sum(), train_cfg.n_ray_free, device=device)
@@ -2431,10 +3189,13 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         else:
             nrm = torch.zeros(1, device=device).squeeze()
 
-        loss = (ph + train_cfg.w_eikonal * eik
-                + train_cfg.w_cam_free * cfr
-                + train_cfg.w_ray_free * rf
-                + train_cfg.w_normal * nrm)
+        loss = (ph + train_cfg.w_idr_mask * idr_mask + train_cfg.w_sil * sil + train_cfg.w_eikonal * eik
+                + train_cfg.w_mask_fg * mask_fg + train_cfg.w_mask_bg * mask_bg
+                + train_cfg.w_cam_free * cfr + train_cfg.w_sfm * sfm + train_cfg.w_geo_sdf * sfm_geo + train_cfg.w_free * fs
+                + train_cfg.w_surf * surf + train_cfg.w_mvs * mvs + _eff_w_msdf * msdf
+                + train_cfg.w_behind_hit * beh + train_cfg.w_ray_free * rf
+                + train_cfg.w_normal * nrm
+                + train_cfg.w_soft_argmin * sa_pull)
         photo_history.append((step, ph.item()))
 
         opt.zero_grad(set_to_none=True)
@@ -2473,12 +3234,14 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                         "opt": opt.state_dict(),
                         "scheduler": scheduler.state_dict()}, step_out)
             print(f"  [ckpt] saved step checkpoint → {step_out.name}", flush=True)
-            _dump_mc_normal_maps(f, views, NORMAL_DUMP_VIEWS, step, run_dir,
-                                 device, mc_res=NORMAL_DUMP_MC_RES,
-                                 bound=eval_cfg.bound(train_cfg.use_blender),
-                                 trace_cfg=trace_cfg, train_cfg=train_cfg,
-                                 alt_nn=alt_nn,
-                                 coverage_res=NORMAL_DUMP_COVERAGE_RES)
+            # Disabled to keep training fast: the 10k-step MC normal-map dump +
+            # per-view diag PNGs are heavy diagnostics. Re-enable if needed.
+            # _dump_mc_normal_maps(f, views, NORMAL_DUMP_VIEWS, step, run_dir,
+            #                      device, mc_res=NORMAL_DUMP_MC_RES,
+            #                      bound=eval_cfg.bound(train_cfg.use_blender),
+            #                      trace_cfg=trace_cfg, train_cfg=train_cfg,
+            #                      alt_nn=alt_nn,
+            #                      coverage_res=NORMAL_DUMP_COVERAGE_RES)
 
         # --- logging every 50 steps ---
         if step % 50 == 0:
@@ -2534,16 +3297,32 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                     f"{pm.get('ncc_grad_n_xeq_p90', 0.0):.2e}  mean/med/p90  "
                     f"n/x={pm.get('ncc_grad_ratio', 0.0):.2f}  "
                     f"(raw ∂n={pm.get('ncc_grad_n', 0.0):.2e}/rad)]")
+            sa_str = ""
+            if _sa_active and sa_stats:
+                sa_str = (f"  sa_pull {sa_pull.item():.4f}[w={train_cfg.w_soft_argmin}]"
+                          f"  sa_τ={sa_stats['sa_tau']:.3f}"
+                          f"  sa_Δt={sa_stats['sa_t_err']:.3f}"
+                          f"  sa_sig={sa_stats['sa_signal_frac']:.2f}")
             _hit_bg_str = (f"+bg{hit_bg.sum()}(ph:{ph_stats['n_mask_bg']})"
                            if trace_cfg.bsphere_radius > 0 else "")
+            if train_cfg.w_idr_mask > 0 and idr_stats:
+                print(f"  idr_mask {idr_mask.item():.4f}[w={train_cfg.w_idr_mask} α={alpha:.0f}]  "
+                      f"pout={idr_stats['idr_n_pout']}  "
+                      f"fn={idr_stats['idr_n_fn']}(S={idr_stats['idr_S_fn']:.3f} sdf={idr_stats['idr_sdf_fn']:.4f})  "
+                      f"fp={idr_stats['idr_n_fp']}(S={idr_stats['idr_S_fp']:.3f} sdf={idr_stats['idr_sdf_fp']:.4f})")
             print(f"step {step:5d}  cams {vi.unique().numel():2d}  "
-                  f"loss {loss.item():.4f}  {photo_str}  "
+                  f"loss {loss.item():.4f}  {photo_str}  sil {sil.item():.4f}  "
+                  f"mask_fg {mask_fg.item():.4f}[w={train_cfg.w_mask_fg}]  "
+                  f"mask_bg {mask_bg.item():.4f}[w={train_cfg.w_mask_bg}]  "
                   f"hit {hit.sum()}{_hit_bg_str}/{train_cfg.batch}  x_r {xh_str}  "
                   f"mask {pm['n_mask']}/{pm['n_in_frame']}/{pm['n_not_occl']}/"
                   f"{pm['n_cos_ok']}/{pm['n_total']}  "
                   f"f(o)<0 {frac_fo_neg:.2f}  t_far {frac_t_far:.2f}  "
+                  f"sfm {sfm.item():.4f}  geo_sdf {sfm_geo.item():.4f}  free {fs.item():.4f}  "
+                  f"surf {surf.item():.4f}  mvs {mvs.item():.4f}  "
+                  f"msdf {msdf.item():.4f}[w={_eff_w_msdf}]  beh {beh.item():.4f}  "
                   f"rf {rf.item():.4f}  eik {eik.item():.4f}[w={train_cfg.w_eikonal}]  "
-                  f"nrm {nrm.item():.4f}  ∇head {grad_norm:.6f}{neus_trace_str}")
+                  f"nrm {nrm.item():.4f}  ∇head {grad_norm:.6f}{neus_trace_str}{sa_str}")
 
             # geometry metrics on held-out subset
             with torch.no_grad():
@@ -2620,7 +3399,7 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                             "multires": f.multires}, BEST_OUT)
                 print(f"  [best_geo@{step}] score={score:.4f} → {BEST_OUT.name}")
                 torch.cuda.empty_cache()
-                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg)
+                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
                 render_src = render_dir / f"render_{step:05d}.png"
                 if render_src.exists():
                     shutil.copy(render_src, render_dir / "render_best_geo.png")
@@ -2641,7 +3420,7 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                             "multires": f.multires}, BEST_LOSS_OUT)
                 print(f"  [best_loss@{step}] loss={_cur_loss:.4f} → {BEST_LOSS_OUT.name}")
                 torch.cuda.empty_cache()
-                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg)
+                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
                 render_src = render_dir / f"render_{step:05d}.png"
                 if render_src.exists():
                     shutil.copy(render_src, render_dir / "render_best_loss.png")
@@ -2671,26 +3450,36 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             sfm_surf = None
             dtu_official = None
             mvm_official = None
-            if train_cfg.use_blender and gt_pts is not None and step % 500 == 0:
-                cd = _mc_chamfer(f, gt_pts, device, bound=eval_cfg.bound_blender)
+            tnt_official = None
+            if (train_cfg.use_blender and gt_pts is not None
+                    and eval_cfg.blender_chamfer_freq > 0
+                    and step % eval_cfg.blender_chamfer_freq == 0):
+                cd = _mc_chamfer(f, gt_pts, device, bound=eval_cfg.bound_blender, mc_level=eval_cfg.mc_level)
                 if cd is not None:
                     print(f"  [chamfer@{step:5d}] sym={cd['chamfer']:.6f}  "
                           f"precision={cd['precision']:.6f}  completeness={cd['completeness']:.6f}")
                 else:
                     print(f"  [chamfer@{step:5d}] n/a (surface not in bounds)")
             elif not train_cfg.use_blender:
-                fast_dtu_due = eval_cfg.dtu_chamfer_freq > 0 and step % eval_cfg.dtu_chamfer_freq == 0
+                sfm_surf_due = eval_cfg.dtu_chamfer_freq > 0 and step % eval_cfg.dtu_chamfer_freq == 0
                 official_due = (
-                    eval_cfg.dtu_official_freq > 0 and step > 0
+                    eval_cfg.dtu_official_freq > 0 and step >= 0
                     and step % eval_cfg.dtu_official_freq == 0
                     and dtu_scale_mat is not None and dtu_scan_id is not None
                     and eval_cfg.dtu_eval_dir is not None
                 )
-                if fast_dtu_due and train_cfg.w_sfm > 0 and sfm_pts.numel() > 3:
+                tnt_official_due = (
+                    eval_cfg.tnt_official_freq > 0 and step >= 0
+                    and step % eval_cfg.tnt_official_freq == 0
+                    and eval_cfg.tnt_eval_dir is not None
+                    and tnt_scene_name is not None
+                )
+                if sfm_surf_due and (train_cfg.w_sfm > 0 or train_cfg.w_geo_sdf > 0) and sfm_pts.numel() > 3:
                     sfm_surf = _mc_sfm_surface_distance(
                         f, sfm_pts, device,
                         bound=eval_cfg.bound_dtu,
                         res=eval_cfg.dtu_chamfer_res,
+                        mc_level=eval_cfg.mc_level,
                     )
                     if sfm_surf is not None:
                         print(f"  [sfm_surf@{step:5d}] mean={sfm_surf['mean']:.4f}  "
@@ -2698,26 +3487,24 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                               f"p99={sfm_surf['p99']:.4f}")
                     else:
                         print(f"  [sfm_surf@{step:5d}] n/a (surface not in bounds)")
-                if fast_dtu_due and dtu_eval_data is not None:
-                    cd = _mc_chamfer_dtu(f, dtu_eval_data, dtu_scale_mat, device,
-                                         bound=eval_cfg.dtu_chamfer_bound, res=eval_cfg.dtu_chamfer_res)
-                    if cd is not None:
-                        print(f"  [dtu_chamfer@{step:5d}] sym={cd['chamfer']:.4f}  "
-                              f"acc={cd['precision']:.4f}  comp={cd['completeness']:.4f}")
-                    else:
-                        print(f"  [dtu_chamfer@{step:5d}] n/a (surface not in bounds)")
                 if official_due:
                     off_dir = run_dir / "dtu_official" / f"step_{step:06d}"
                     mesh_ply = _extract_world_mesh_for_dtu(
                         f, dtu_scale_mat, device, off_dir / "pred_world_mesh.ply",
                         bound=eval_cfg.dtu_official_bound,
                         res=eval_cfg.dtu_official_res,
+                        mc_level=eval_cfg.mc_level,
                     )
                     if mesh_ply is None:
                         print(f"  [dtu_official@{step:5d}] n/a (surface not in bounds)")
                     else:
                         dtu_official = _run_dtu_official_eval(
                             mesh_ply, dtu_scan_id, eval_cfg.dtu_eval_dir, off_dir,
+                            scene=scene,
+                            mask_crop=eval_cfg.dtu_official_mask_crop,
+                            mask_dilate_px=eval_cfg.dtu_official_mask_dilate_px,
+                            mask_crop_min_ratio=eval_cfg.dtu_official_mask_crop_min_ratio,
+                            mask_crop_min_views=eval_cfg.dtu_official_mask_crop_min_views,
                         )
                         if dtu_official is not None:
                             print(f"  [dtu_official@{step:5d}] chamfer={dtu_official['chamfer']:.4f}mm  "
@@ -2735,15 +3522,38 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                         bound=eval_cfg.dtu_official_bound,
                         res=eval_cfg.dtu_official_res,
                         device=device,
+                        mc_level=eval_cfg.mc_level,
                     )
                     if mvm_official is not None:
                         print(f"  [mvm_official@{step:5d}] chamfer={mvm_official['chamfer']:.4f}mm  "
                               f"acc={mvm_official['accuracy']:.4f}mm  "
                               f"comp={mvm_official['completeness']:.4f}mm  out={off_dir}")
+                if tnt_official_due:
+                    off_dir = run_dir / "tnt_official" / f"step_{step:06d}"
+                    points_ply = _extract_tnt_eval_points(
+                        f, scene, off_dir, device,
+                        bound=eval_cfg.tnt_official_bound,
+                        res=eval_cfg.tnt_official_res,
+                        n_samples=eval_cfg.tnt_official_n_samples,
+                        mc_level=eval_cfg.mc_level,
+                    )
+                    if points_ply is not None:
+                        tnt_official = _run_tnt_official_eval(
+                            points_ply, scene, eval_cfg.tnt_eval_dir,
+                            tnt_scene_name, off_dir,
+                            frame=eval_cfg.tnt_official_frame,
+                        )
+                        if tnt_official is not None:
+                            print(f"  [tnt_official@{step:5d}] "
+                                  f"F={tnt_official['fscore']:.4f}  "
+                                  f"P={tnt_official['precision']:.4f}  "
+                                  f"R={tnt_official['recall']:.4f}  "
+                                  f"tau={tnt_official['tau']:.4f}  out={off_dir}")
 
             if use_wandb:
                 import wandb
-                log = {"loss": loss.item(), "photo": ph.item(),
+                log = {"loss": loss.item(), "photo": ph.item(), "sil": sil.item(),
+                       "sfm": sfm.item(), "geo_sdf": sfm_geo.item(),
                        "photo_l1": ph_stats["l1"], "photo_ncc": ph_stats["ncc"],
                        "photo_ncc_weighted": ph_stats.get("ncc_weighted", 0.0),
                        "photo_ncc_normal": ph_stats.get("ncc_normal", 0.0),
@@ -2781,6 +3591,11 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                     log["mvm_official_chamfer"] = mvm_official["chamfer"]
                     log["mvm_official_acc"] = mvm_official["accuracy"]
                     log["mvm_official_comp"] = mvm_official["completeness"]
+                if tnt_official is not None:
+                    log["tnt_official_fscore"] = tnt_official["fscore"]
+                    log["tnt_official_precision"] = tnt_official["precision"]
+                    log["tnt_official_recall"] = tnt_official["recall"]
+                    log["tnt_official_tau"] = tnt_official["tau"]
                 if (render_dir / "render_{:05d}.png".format(step)).exists():
                     log["render"] = wandb.Image(str(render_dir / "render_{:05d}.png".format(step)))
                 wandb.log(log, step=step)
@@ -2797,7 +3612,7 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     print(f"saved → {OUT}")
     print(f"final → {FINAL_OUT.name}")
     try:
-        _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg)
+        _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
         final_render = render_dir / f"render_{step:05d}.png"
         if final_render.exists():
             shutil.copy(final_render, render_dir / "render_final.png")
@@ -2838,12 +3653,24 @@ if __name__ == "__main__":
     ap.add_argument("--batch",      type=int,   default=_tc.batch)
     ap.add_argument("--lr",         type=float, default=_tc.lr)
     ap.add_argument("--down",       type=int,   default=_tc.down)
+    ap.add_argument("--use-masks", action=argparse.BooleanOptionalAction, default=None,
+                    help="use dataset masks for fg/bg sampling and photo-loss gates "
+                         f"(default {_tc.use_masks}; --no-use-masks ignores them, "
+                         "and overrides the value in --config)")
     ap.add_argument("--grad-weighted-sampling", action="store_true",
                     default=_tc.grad_weighted_sampling,
                     help="sample fg rays ∝ image-gradient magnitude (fine-detail focus)")
     ap.add_argument("--grad-sampling-alpha", type=float,
                     default=_tc.grad_sampling_alpha,
                     help="grad/uniform mix for --grad-weighted-sampling (0=uniform, 1=pure grad)")
+    ap.add_argument("--fg-fraction", type=float, default=_tc.fg_fraction,
+                    help="foreground-ray share when sampling both fg/bg strata")
+    ap.add_argument("--force-fg-bg-split", action="store_true",
+                    help="sample both fg/bg strata even without a bg-sensitive loss")
+    ap.add_argument("--init-hit-sampling", dest="init_hit_sampling",
+                    action="store_true", default=_tc.init_hit_sampling,
+                    help="mask-free fg: trace det rays vs the init SDF once and set fg=hit "
+                         "(object-focused sampling without a segmentation mask)")
     ap.add_argument("--blender",    action="store_true", help="use a Blender synthetic dataset")
     ap.add_argument("--dataset",    choices=["dtu", "skull", "lego"], default=None)
     ap.add_argument("--scene",      type=Path, default=None,
@@ -2864,6 +3691,19 @@ if __name__ == "__main__":
     _trc = TraceConfig()
     ap.add_argument("--trace-iters", type=int, default=_trc.iters,
                     help="max sphere-tracing iterations (increase when using PE)")
+    ap.add_argument("--occ-iters", type=int, default=_trc.occ_iters,
+                    help="max iters for the photo-loss occlusion trace (-1 = same as --trace-iters). "
+                         "The occ trace is a thresholded visibility boolean, so it tolerates far "
+                         "fewer iters than the primary trace.")
+    ap.add_argument("--occ-newton-steps", type=int, default=_trc.occ_newton_steps,
+                    help="Newton steps for the occlusion trace (-1 = same as primary; 0 = none). "
+                         "Each Newton step is ~3x a regular iter (fwd+bwd) and is pointless for a boolean.")
+    ap.add_argument("--occ-eps", type=float, default=_trc.occ_eps,
+                    help="hit threshold for the occlusion trace (<0 = same as --eps)")
+    ap.add_argument("--eps", type=float, default=_trc.eps,
+                    help="sphere-trace hit threshold |f(x)|<eps, in normalized units. "
+                         "DTU 1 unit~0.25m so 1e-3~0.25mm; MVMannequin 1 unit~1m so "
+                         "1e-3~1mm (use ~2.5e-4 to match DTU's metric precision)")
     ap.add_argument("--bsphere-radius", type=float, default=_trc.bsphere_radius,
                     help=">0: use per-ray bounding-sphere exit as t_far; rays that reach "
                          "the sphere become hit_bg and participate in photo loss with "
@@ -2874,34 +3714,77 @@ if __name__ == "__main__":
                          "Must exceed max camera distance + object radius.")
     _ic = InitConfig()
     ap.add_argument("--init",       type=str,   default=_ic.init,
-                    choices=["sphere", "hull", "colmap"],
-                    help="warm-start: sphere, silhouette visual hull, or "
-                         "voxelisation of a COLMAP dense mesh (needs --init-mesh)")
+                    choices=["sphere", "hull", "colmap", "points"],
+                    help="warm-start: sphere, silhouette visual hull, voxelisation "
+                         "of a COLMAP dense mesh (needs --init-mesh), or 'points' = "
+                         "Poisson surface reconstructed straight from the sparse SfM "
+                         "cloud (sparse_sfm_points.txt; no masks, no dense MVS)")
     ap.add_argument("--init-mesh",  type=str,   default=_ic.init_mesh,
                     help="path to a triangle mesh in NSVF-COLMAP frame "
                          "(e.g. outputs/colmap_barn/poisson.ply); only used "
                          "when --init colmap")
+    ap.add_argument("--init-sdf-grid", type=str, default=_ic.init_sdf_grid,
+                    help="hull init: fit to this precomputed SDF grid instead of "
+                         "silhouette carving; inside is sdf < 0")
+    ap.add_argument("--good-views", type=Path, default=None,
+                    help="file of view indices to keep (drops noisy-mask views "
+                         "from the multi-view training pool); see analysis/"
+                         "cat_hull_coverage_check.py for generating one")
     ap.add_argument("--init-steps", type=int,   default=_ic.steps,
                     help="gradient steps for the hull/sphere warm-start")
     ap.add_argument("--radius",     type=float, default=_ic.radius,
                     help="sphere-init radius (None = auto from COLMAP p60)")
     ap.add_argument("--hull-res",   type=int,   default=_ic.hull_res,
                     help="voxel resolution for hull carving")
+    ap.add_argument("--hull-sfm-roi", action="store_true", default=_ic.hull_sfm_roi,
+                    help="crop hull-init occupancy to a padded sparse-SFM AABB; "
+                         "useful when close-up views leave outer voxels unconstrained")
+    ap.add_argument("--hull-min-views", type=int, default=_ic.hull_min_views,
+                    help="require hull voxels to project inside at least this many views")
+    ap.add_argument("--hull-border-aware", action="store_true", default=_ic.hull_border_aware,
+                    help="carve off-frame voxels through image edges the silhouette does not touch; "
+                         "removes visual-hull bloat when the object spills past the frame (e.g. scan24)")
+    ap.add_argument("--w-sfm-free", type=float, default=_ic.w_sfm_free,
+                    help="hull init: enforce f>0 along camera→COLMAP-point sight-lines "
+                         "(carves the hull back toward the real surface, incl. concavities)")
+    ap.add_argument("--sfm-free-eps", type=float, default=_ic.sfm_free_eps,
+                    help="hull init: stop the SFM free-space ray this far (world units) before the point")
     ap.add_argument("--w-depth-surface", type=float, default=_ic.w_depth_surface,
                     help="blender hull-init only: weight on GT depth surface samples")
+    ap.add_argument("--points-poisson-depth", type=int, default=_ic.points_poisson_depth,
+                    help="points init: screened-Poisson octree depth (8=coarse, 9=fine)")
+    ap.add_argument("--points-trim-quantile", type=float, default=_ic.points_trim_quantile,
+                    help="points init: drop Poisson vertices below this density quantile "
+                         "(removes balloon extrapolation in unobserved regions)")
+    ap.add_argument("--points-normal-knn", type=int, default=_ic.points_normal_knn,
+                    help="points init: kNN for PCA normal estimation + orientation MST")
     ap.add_argument("--w-photo",    type=float, default=_tc.w_photo)
     ap.add_argument("--w-feature",  type=float, default=_tc.w_feature,
                     help="weight for cosine distance on precomputed feature maps")
     ap.add_argument("--feature-maps", type=Path, default=_tc.feature_maps,
-                    help="path to a .pt file produced by precompute_mast3r_features.py")
+                    help="path to a .pt file produced by archive/precompute_mast3r_features.py")
     ap.add_argument("--n-alt",      type=int,   default=_tc.n_alt,
                     help="nearest-neighbour alt cameras per ray (pool size; "
                          "e.g. 10 with --ncc-topk 4, or 6 for the legacy pool)")
+    ap.add_argument("--view-selection", type=str, default=_tc.view_selection,
+                    choices=["nearest", "pairs_file", "arccos", "arccos_nn"],
+                    help="how to pick the n_alt source views per reference: "
+                         "'nearest' (camera-centre NN, default), 'pairs_file' "
+                         "(first n_alt ranked ids from --pairs-path), 'arccos' "
+                         "(angular distance of viewing dirs; also enables 2-level "
+                         "uniform-camera ray sampling), or 'arccos_nn' (same "
+                         "angular-distance ranking but ref-view + ray sampling "
+                         "stay exactly as 'nearest')")
+    ap.add_argument("--pairs-path", type=Path, default=_tc.pairs_path,
+                    help="MVSNet/NeuralWarp pair.txt; required for "
+                         "--view-selection pairs_file (scores ignored)")
     ap.add_argument("--w-ncc",      type=float, default=_tc.w_ncc)
     ap.add_argument("--w-ncc-normal", type=float, default=_tc.w_ncc_normal,
                     help="weight of the normal-branch PMVS NCC term "
                          "L=w_ncc·NCC(x,detach(n))+w_ncc_normal·NCC(detach(x),n); "
                          ">0 enables a differentiable normal (double-backward)")
+    ap.add_argument("--ncc-patch", type=int, default=_tc.ncc_patch,
+                    help="PMVS patch side P (PxP sample grid)")
     ap.add_argument("--ncc-half-pix", type=float, default=_tc.ncc_half_pix,
                     help="PMVS patch half-width in reference-view pixels")
     ap.add_argument("--ncc-normal-patch", type=int, default=_tc.ncc_normal_patch,
@@ -2935,6 +3818,12 @@ if __name__ == "__main__":
                     help="spatial patch weight α in w=exp(-r/α) (grid units); 0=uniform/legacy")
     ap.add_argument("--ncc-patch-wsigma-end", type=float, default=_tc.ncc_patch_wsigma_end,
                     help="anneal patch-weight α exponentially to this by end of training")
+    ap.add_argument("--ncc-bilateral-gamma", type=float, default=_tc.ncc_bilateral_gamma,
+                    help="Gipuma adaptive-support γ in w=exp(-|Ip-Iq|/γ), reference view, "
+                         "intensities in [0,1]; fixed large patch, 0=disabled")
+    ap.add_argument("--ncc-bilateral-gamma-end", type=float, default=_tc.ncc_bilateral_gamma_end,
+                    help="anneal γ exponentially to this by end of training; γ↓ shrinks the "
+                         "effective patch (coarse→fine). e.g. 1.0 → 0.05")
     ap.add_argument("--debug-views",    type=str,   default=_tc.debug_views,
                     help='opt-in thorough per-view hole diagnostics, e.g. "16,32"')
     ap.add_argument("--debug-every",    type=int,   default=_tc.debug_every,
@@ -2981,6 +3870,9 @@ if __name__ == "__main__":
     ap.add_argument("--n-eik-vol",  type=int, default=_tc.n_eik_vol,
                     help="random volume points for eikonal loss, separate from trace samples")
     ap.add_argument("--w-sfm",          type=float, default=_tc.w_sfm)
+    ap.add_argument("--w-geo-sdf",      type=float, default=_tc.w_geo_sdf,
+                    help="pure Geo-Neus L1 SDF loss on COLMAP points (surface term only, "
+                         "no free-space/behind bundle). Independent of --w-sfm.")
     ap.add_argument("--sfm-min-views",  type=int,   default=_tc.sfm_min_views,
                     help="filter COLMAP pts visible in fewer cameras (0=keep all)")
     ap.add_argument("--sfm-behind-eps", type=float, default=_tc.sfm_behind_eps,
@@ -3028,32 +3920,73 @@ if __name__ == "__main__":
     ap.add_argument("--pt",         default=None, help="checkpoint to evaluate")
     ap.add_argument("--resume",     type=Path, default=None,
                     help="resume training from this checkpoint (skips init)")
+    ap.add_argument("--lr-warm-restart", action="store_true",
+                    help="on --resume, keep weights but reset the optimiser + cosine LR "
+                         "schedule (fresh lr->eta_min anneal over the remaining steps); "
+                         "use when extending a converged run whose LR floored out")
     ap.add_argument("--dtu-eval-dir", default=None,
                     help="path to DTU evaluation data (SampleSet/ + ObsMask/ subdirs)")
     _ec = EvalConfig()
     ap.add_argument("--dtu-chamfer-freq", type=int, default=_ec.dtu_chamfer_freq,
-                    help="fast in-training DTU Chamfer frequency in steps (0=off)")
+                    help="cadence (steps) for the cheap in-training sfm_surf diagnostic (0=off)")
+    ap.add_argument("--blender-chamfer-freq", type=int, default=_ec.blender_chamfer_freq,
+                    help="cadence (steps) for in-training Blender GT chamfer (0=off)")
     ap.add_argument("--dtu-chamfer-res", type=int, default=_ec.dtu_chamfer_res,
-                    help="MC resolution for fast in-training DTU Chamfer")
+                    help="MC resolution for the sfm_surf diagnostic")
     ap.add_argument("--dtu-official-freq", type=int, default=_ec.dtu_official_freq,
                     help="DTUeval-python official Chamfer frequency in steps (0=off)")
     ap.add_argument("--dtu-official-res", type=int, default=_ec.dtu_official_res,
                     help="MC resolution for periodic DTUeval-python official Chamfer")
     ap.add_argument("--dtu-official-bound", type=float, default=_ec.dtu_official_bound,
                     help="MC bound for periodic DTUeval-python official Chamfer")
+    ap.add_argument("--dtu-official-mask-crop", action=argparse.BooleanOptionalAction,
+                    default=_ec.dtu_official_mask_crop,
+                    help="crop periodic DTU official eval mesh with dilated DTU foreground masks "
+                         f"(default {_ec.dtu_official_mask_crop})")
+    ap.add_argument("--dtu-official-mask-dilate-px", type=int,
+                    default=_ec.dtu_official_mask_dilate_px,
+                    help="mask dilation radius in pixels for periodic DTU official eval crop")
+    ap.add_argument("--dtu-official-mask-crop-min-ratio", type=float,
+                    default=_ec.dtu_official_mask_crop_min_ratio,
+                    help="required fraction of in-frame mask projections for periodic DTU official eval crop")
+    ap.add_argument("--dtu-official-mask-crop-min-views", type=int,
+                    default=_ec.dtu_official_mask_crop_min_views,
+                    help="minimum in-frame views for periodic DTU official eval crop")
+    ap.add_argument("--tnt-eval-dir", default=None,
+                    help="root or scene dir with official TnT GT assets "
+                         "(<scene>.ply / _trans.txt / .json / _COLMAP_SfM.log)")
+    ap.add_argument("--tnt-official-scene", default=None,
+                    help="official TnT scene name; useful when training from a staged scene dir")
+    ap.add_argument("--tnt-official-frame",
+                    choices=["colmap-pose", "nsvf", "colmap-local", "colmap-sfm"],
+                    default=None,
+                    help="official TnT alignment frame; current COLMAP-derived scenes use colmap-pose")
+    ap.add_argument("--tnt-official-freq", type=int, default=None,
+                    help="official TnT F-score frequency in steps (0=off)")
+    ap.add_argument("--tnt-official-res", type=int, default=None,
+                    help="MC resolution for periodic official TnT F-score")
+    ap.add_argument("--tnt-official-bound", type=float, default=None,
+                    help="MC bound for periodic official TnT F-score")
+    ap.add_argument("--tnt-official-n-samples", type=int, default=None,
+                    help="number of sampled surface points for periodic official TnT F-score")
+    ap.add_argument("--mc-level", type=float, default=_ec.mc_level,
+                    help="marching-cubes isovalue (default 0.0); slightly >0 (e.g. 0.005) "
+                         "trims noisy near-zero wandering in under-supervised pockets")
     ap.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory (overrides auto-timestamped name); ignored on --resume")
     ap.add_argument("--viewer",      action="store_true")
     ap.add_argument("--viewer-res",  type=int, default=256)
     ap.add_argument("--profile", action="store_true",
                     help="one-shot compute/memory breakdown of the model at startup")
+    ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None,
+                    help="torch.compile(dynamic=True) the hot-path SDF forward "
+                         f"(default {_tc.compile}; fp32-exact, no TF32/autocast). "
+                         "Use --no-compile to disable; overrides the value in --config.")
     ap.add_argument("--viewer-port", type=int, default=8080)
     ap.add_argument("--render-down", type=int, default=1,
                     help="downsample for sphere-traced PNG renders (1=full res, 2=half)")
     ap.add_argument("--mc-res",           type=int,   default=256,
                     help="marching-cubes grid resolution for eval/viewer")
-    ap.add_argument("--dtu-chamfer-bound", type=float, default=_ec.dtu_chamfer_bound,
-                    help="MC bound for in-training DTU Chamfer (tighter than SDF grid for better voxel precision)")
     ap.add_argument("--wandb",       action="store_true", help="log to Weights & Biases")
     ap.add_argument("--debug-regions", type=str, default="",
                     help='semicolon-separated "name,view,u0,v0,u1,v1" pixel rectangles to monitor during training')
@@ -3075,20 +4008,75 @@ if __name__ == "__main__":
             run_cfg.scene = args.scene
         run_cfg = dataclasses.replace(
             run_cfg,
+            trace=dataclasses.replace(
+                run_cfg.trace,
+                occ_iters=args.occ_iters,
+                occ_newton_steps=args.occ_newton_steps,
+                occ_eps=args.occ_eps,
+            ),
             eval=dataclasses.replace(
                 run_cfg.eval,
                 dtu_eval_dir=Path(args.dtu_eval_dir) if args.dtu_eval_dir else run_cfg.eval.dtu_eval_dir,
                 dtu_chamfer_freq=args.dtu_chamfer_freq,
+                blender_chamfer_freq=args.blender_chamfer_freq,
                 dtu_chamfer_res=args.dtu_chamfer_res,
-                dtu_chamfer_bound=args.dtu_chamfer_bound,
                 dtu_official_freq=args.dtu_official_freq,
                 dtu_official_res=args.dtu_official_res,
                 dtu_official_bound=args.dtu_official_bound,
+                dtu_official_mask_crop=args.dtu_official_mask_crop,
+                dtu_official_mask_dilate_px=args.dtu_official_mask_dilate_px,
+                dtu_official_mask_crop_min_ratio=args.dtu_official_mask_crop_min_ratio,
+                dtu_official_mask_crop_min_views=args.dtu_official_mask_crop_min_views,
+                tnt_eval_dir=Path(args.tnt_eval_dir) if args.tnt_eval_dir else run_cfg.eval.tnt_eval_dir,
+                tnt_official_scene=(args.tnt_official_scene
+                                    if args.tnt_official_scene is not None
+                                    else run_cfg.eval.tnt_official_scene),
+                tnt_official_frame=(args.tnt_official_frame
+                                    if args.tnt_official_frame is not None
+                                    else run_cfg.eval.tnt_official_frame),
+                tnt_official_freq=(args.tnt_official_freq
+                                   if args.tnt_official_freq is not None
+                                   else run_cfg.eval.tnt_official_freq),
+                tnt_official_res=(args.tnt_official_res
+                                  if args.tnt_official_res is not None
+                                  else run_cfg.eval.tnt_official_res),
+                tnt_official_bound=(args.tnt_official_bound
+                                    if args.tnt_official_bound is not None
+                                    else run_cfg.eval.tnt_official_bound),
+                tnt_official_n_samples=(args.tnt_official_n_samples
+                                        if args.tnt_official_n_samples is not None
+                                        else run_cfg.eval.tnt_official_n_samples),
+                mc_level=args.mc_level,
             ),
         )
+        if args.steps != _tc.steps:
+            # Honour an explicit --steps on the --config/--resume path (e.g. extending
+            # a finished run to a larger horizon for a warm restart). Without this the
+            # config's own `steps` would silently win.
+            run_cfg = dataclasses.replace(
+                run_cfg, train=dataclasses.replace(run_cfg.train, steps=args.steps))
         if args.profile:
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, profile=True))
+        if args.compile is not None:
+            run_cfg = dataclasses.replace(
+                run_cfg, train=dataclasses.replace(run_cfg.train, compile=args.compile))
+        if args.use_masks is not None:
+            run_cfg = dataclasses.replace(
+                run_cfg, train=dataclasses.replace(run_cfg.train, use_masks=args.use_masks))
+        # view/sampling overrides on the --config path (same `!= default` pattern as --steps)
+        if args.view_selection != _tc.view_selection:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, view_selection=args.view_selection, pairs_path=args.pairs_path))
+        if args.init_hit_sampling != _tc.init_hit_sampling:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, init_hit_sampling=args.init_hit_sampling))
+        if args.fg_fraction != _tc.fg_fraction:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, fg_fraction=args.fg_fraction))
+        if args.force_fg_bg_split != _tc.force_fg_bg_split:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, force_fg_bg_split=args.force_fg_bg_split))
         if args.debug_regions:
             run_cfg = dataclasses.replace(run_cfg,
                 train=dataclasses.replace(run_cfg.train,
@@ -3110,24 +4098,44 @@ if __name__ == "__main__":
                               input_encoding=args.input_encoding,
                               multires=args.multires,
                               architecture=args.architecture),
-            trace=TraceConfig(iters=args.trace_iters, bsphere_radius=args.bsphere_radius,
+            trace=TraceConfig(iters=args.trace_iters, eps=args.eps,
+                              occ_iters=args.occ_iters,
+                              occ_newton_steps=args.occ_newton_steps,
+                              occ_eps=args.occ_eps,
+                              bsphere_radius=args.bsphere_radius,
                               t_far=args.t_far, sdf_min_beta=args.sdf_min_beta),
             init=InitConfig(
                 init=args.init,
                 steps=args.init_steps,
                 radius=args.radius,
                 hull_res=args.hull_res,
+                hull_sfm_roi=args.hull_sfm_roi,
+                hull_min_views=args.hull_min_views,
+                hull_border_aware=args.hull_border_aware,
+                w_sfm_free=args.w_sfm_free,
+                sfm_free_eps=args.sfm_free_eps,
                 init_mesh=args.init_mesh,
+                init_sdf_grid=args.init_sdf_grid,
+                points_poisson_depth=args.points_poisson_depth,
+                points_trim_quantile=args.points_trim_quantile,
+                points_normal_knn=args.points_normal_knn,
             ),
             train=TrainConfig(
                 steps=args.steps, batch=args.batch, lr=args.lr, down=args.down,
                 profile=args.profile,
+                compile=(_tc.compile if args.compile is None else args.compile),
+                use_masks=(_tc.use_masks if args.use_masks is None else args.use_masks),
                 grad_weighted_sampling=args.grad_weighted_sampling,
                 grad_sampling_alpha=args.grad_sampling_alpha,
+                fg_fraction=args.fg_fraction,
+                force_fg_bg_split=args.force_fg_bg_split,
+                init_hit_sampling=args.init_hit_sampling,
                 use_blender=args.blender, single_view=args.single_view,
                 w_photo=args.w_photo, w_feature=args.w_feature, feature_maps=args.feature_maps,
                 n_alt=args.n_alt,
+                view_selection=args.view_selection, pairs_path=args.pairs_path,
                 w_ncc=args.w_ncc, w_ncc_normal=args.w_ncc_normal,
+                ncc_patch=args.ncc_patch,
                 ncc_half_pix=args.ncc_half_pix, ncc_min=args.ncc_min,
                 ncc_topk=args.ncc_topk,
                 ncc_color=args.ncc_color,
@@ -3139,6 +4147,8 @@ if __name__ == "__main__":
                 gaussian_radius=args.gaussian_radius,
                 ncc_patch_wsigma=args.ncc_patch_wsigma,
                 ncc_patch_wsigma_end=args.ncc_patch_wsigma_end,
+                ncc_bilateral_gamma=args.ncc_bilateral_gamma,
+                ncc_bilateral_gamma_end=args.ncc_bilateral_gamma_end,
                 debug_views=args.debug_views, debug_every=args.debug_every,
                 debug_zoom_json=args.debug_zoom_json,
                 w_idr_mask=args.w_idr_mask, idr_n_samples=args.idr_n_samples,
@@ -3152,6 +4162,7 @@ if __name__ == "__main__":
                 mask_fg_margin=args.mask_fg_margin, mask_bg_margin=args.mask_bg_margin,
                 n_mask_fg=args.n_mask_fg, n_mask_bg=args.n_mask_bg,
                 w_eikonal=args.w_eikonal, n_eik_vol=args.n_eik_vol, w_sfm=args.w_sfm,
+                w_geo_sdf=args.w_geo_sdf,
                 sfm_min_views=args.sfm_min_views, sfm_behind_eps=args.sfm_behind_eps, w_free=args.w_free,
                 w_surf=args.w_surf, w_mvs=args.w_mvs, mvs_depth_dir=args.mvs_depth_dir,
                 mvsformer_depth_dir=args.mvsformer_depth_dir,
@@ -3177,19 +4188,44 @@ if __name__ == "__main__":
             eval=EvalConfig(
                 dtu_eval_dir=Path(args.dtu_eval_dir) if args.dtu_eval_dir else None,
                 dtu_chamfer_freq=args.dtu_chamfer_freq,
+                blender_chamfer_freq=args.blender_chamfer_freq,
                 dtu_chamfer_res=args.dtu_chamfer_res,
-                dtu_chamfer_bound=args.dtu_chamfer_bound,
                 dtu_official_freq=args.dtu_official_freq,
                 dtu_official_res=args.dtu_official_res,
                 dtu_official_bound=args.dtu_official_bound,
+                dtu_official_mask_crop=args.dtu_official_mask_crop,
+                dtu_official_mask_dilate_px=args.dtu_official_mask_dilate_px,
+                dtu_official_mask_crop_min_ratio=args.dtu_official_mask_crop_min_ratio,
+                dtu_official_mask_crop_min_views=args.dtu_official_mask_crop_min_views,
+                tnt_eval_dir=Path(args.tnt_eval_dir) if args.tnt_eval_dir else None,
+                tnt_official_scene=args.tnt_official_scene,
+                tnt_official_frame=(_ec.tnt_official_frame if args.tnt_official_frame is None
+                                    else args.tnt_official_frame),
+                tnt_official_freq=(_ec.tnt_official_freq if args.tnt_official_freq is None
+                                   else args.tnt_official_freq),
+                tnt_official_res=(_ec.tnt_official_res if args.tnt_official_res is None
+                                  else args.tnt_official_res),
+                tnt_official_bound=(_ec.tnt_official_bound if args.tnt_official_bound is None
+                                    else args.tnt_official_bound),
+                tnt_official_n_samples=(_ec.tnt_official_n_samples
+                                        if args.tnt_official_n_samples is None
+                                        else args.tnt_official_n_samples),
+                mc_level=args.mc_level,
             ),
             scene=scene_path,
         )
 
+    view_keep = None
+    if args.good_views is not None:
+        from .data import load_view_keep
+        view_keep = load_view_keep(args.good_views)
+        print(f"  good-views: keeping {len(view_keep)} views from {args.good_views}")
+
     ckpt_path: Path | None = None
     if not args.no_train:
         ckpt_path = train(run_cfg, use_wandb=args.wandb, resume=args.resume,
-                          run_dir=args.run_dir)
+                          run_dir=args.run_dir, view_keep=view_keep,
+                          lr_warm_restart=args.lr_warm_restart)
 
     if args.pt is not None:
         ckpt_path = Path(args.pt)
@@ -3240,12 +4276,30 @@ if __name__ == "__main__":
                             lego_stats, geom_stats, chamfer_stats, dtu_official_chamfer)
 
     eval_cfg = EvalConfig(mc_res=args.mc_res, render_down=args.render_down,
-                          dtu_chamfer_bound=args.dtu_chamfer_bound,
                           dtu_chamfer_res=args.dtu_chamfer_res,
                           dtu_chamfer_freq=args.dtu_chamfer_freq,
+                          blender_chamfer_freq=args.blender_chamfer_freq,
                           dtu_official_freq=args.dtu_official_freq,
                           dtu_official_res=args.dtu_official_res,
-                          dtu_official_bound=args.dtu_official_bound)
+                          dtu_official_bound=args.dtu_official_bound,
+                          dtu_official_mask_crop=args.dtu_official_mask_crop,
+                          dtu_official_mask_dilate_px=args.dtu_official_mask_dilate_px,
+                          dtu_official_mask_crop_min_ratio=args.dtu_official_mask_crop_min_ratio,
+                          dtu_official_mask_crop_min_views=args.dtu_official_mask_crop_min_views,
+                          tnt_eval_dir=Path(args.tnt_eval_dir) if args.tnt_eval_dir else None,
+                          tnt_official_scene=args.tnt_official_scene,
+                          tnt_official_frame=(_ec.tnt_official_frame if args.tnt_official_frame is None
+                                              else args.tnt_official_frame),
+                          tnt_official_freq=(_ec.tnt_official_freq if args.tnt_official_freq is None
+                                             else args.tnt_official_freq),
+                          tnt_official_res=(_ec.tnt_official_res if args.tnt_official_res is None
+                                            else args.tnt_official_res),
+                          tnt_official_bound=(_ec.tnt_official_bound if args.tnt_official_bound is None
+                                              else args.tnt_official_bound),
+                          tnt_official_n_samples=(_ec.tnt_official_n_samples
+                                                  if args.tnt_official_n_samples is None
+                                                  else args.tnt_official_n_samples),
+                          mc_level=args.mc_level)
     if args.viewer:
         view_in_viser(f, res=args.viewer_res, bound=eval_cfg.bound(args.blender),
                       port=args.viewer_port, use_blender=args.blender)

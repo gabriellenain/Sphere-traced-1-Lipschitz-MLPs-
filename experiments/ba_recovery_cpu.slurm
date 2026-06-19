@@ -43,6 +43,10 @@ python -u -m lip_tracer.bundle_adjustment \
     --block-phi       ${BLOCK_PHI:-600} \
     --block-theta     ${BLOCK_THETA:-0} \
     --lr-phi          ${LR_PHI:-1e-5} \
+    ${LR_THETA:+--lr-theta $LR_THETA} \
+    ${BATCH:+--batch $BATCH} \
+    ${OPT_INTRINSICS:+--opt-intrinsics} \
+    ${LR_INTRINSICS:+--lr-intrinsics $LR_INTRINSICS} \
     --log-every       ${LOG_EVERY:-10} \
     --perturb-cam     ${PERTURB_CAM:-1} \
     --perturb-rot-deg ${ROT:-0.3} \

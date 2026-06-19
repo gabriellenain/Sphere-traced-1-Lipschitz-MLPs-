@@ -101,10 +101,20 @@ for VIEW in ${VIEWS//,/ }; do
     # landscape frame (e.g. a tall bust's crown) is captured whole (still one trace).
     EXPAND_ARG=()
     [[ "${EXPAND_PX:-0}" != "0" ]] && EXPAND_ARG=(--expand-px "$EXPAND_PX")
+    # BA_POSES=<ba_final.pt>: override each view's c2w with the bundle-adjusted pose
+    # so the trace/render uses the cameras BA co-optimised (pair with CKPT=<ba_final.pt>
+    # to also use the BA-updated f). Unset → calibrated poses (faithful default).
+    BA_ARG=()
+    [[ -n "${BA_POSES:-}" ]] && BA_ARG=(--ba-poses "$BA_POSES")
+    # DUMP_BUFFERS=1: also write per-pixel <ST_PLY stem>_phong.png / _normals.png
+    # straight from the trace (pre-meshing, pre-Blender). Off by default.
+    DUMP_ARG=()
+    [[ "${DUMP_BUFFERS:-0}" == "1" ]] && DUMP_ARG=(--dump-buffers)
     # CHUNK lowers per-step ray batch → smaller GPU peak (use on busy/shared GPUs to avoid OOM).
     python -u analysis/sphere_traced_screen_mesh.py "$RUN_DIR" \
         --ckpt "$CKPT" --view "$VIEW" --down "$DOWN" --max-iters "$ITERS" \
-        --supersample "$SS" "${EXPAND_ARG[@]}" --chunk "${CHUNK:-32768}" \
+        --supersample "$SS" "${EXPAND_ARG[@]}" "${BA_ARG[@]}" "${DUMP_ARG[@]}" \
+        --chunk "${CHUNK:-32768}" \
         --grazing-cos "$GRAZING_COS" --rel-depth-gap "$RELGAP" \
         --out "$ST_PLY" || { echo "[error] trace failed for view $VIEW"; continue; }
 

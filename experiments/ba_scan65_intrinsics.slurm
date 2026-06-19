@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=ba_scan65_intr
-#SBATCH --output=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs/ba_scan65_intr_%j.log
-#SBATCH --error=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs/ba_scan65_intr_%j.log
+#SBATCH --job-name=ba_intr
+#SBATCH --output=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs/ba_intr_%j.log
+#SBATCH --error=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs/ba_intr_%j.log
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --gres=gpu:1
@@ -31,12 +31,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # all cameras free.
 #
 # Logs: stdout (this file) + per-step CSV (ba_metrics.csv) + wandb (1lip-tracer-ba).
-RUN=outputs/run_20260525_223035_scan65_4911692
+# RUN / OUT overridable so this same launcher serves any converged run; default scan65.
+RUN=${RUN:-outputs/run_20260525_223035_scan65_4911692}
 
 python -u -m lip_tracer.bundle_adjustment \
     --config "$RUN/config.json" \
     --ckpt   "$RUN/ckpt/checkpoint_final.pt" \
-    --out    "$RUN/bundle_adjust_intrinsics" \
+    --out    "$RUN/${OUT:-bundle_adjust_intrinsics}" \
     --cycles      ${CYCLES:-40} \
     --block-phi   ${BLOCK_PHI:-200} \
     --block-theta ${BLOCK_THETA:-200} \
@@ -45,4 +46,4 @@ python -u -m lip_tracer.bundle_adjustment \
     --opt-intrinsics \
     --lr-intrinsics ${LR_INTRINSICS:-1e-4} \
     --log-every   ${LOG_EVERY:-20} \
-    --wandb
+    ${WANDB:+--wandb}

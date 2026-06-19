@@ -126,9 +126,17 @@ class CameraParams(nn.Module):
     focal, so all four are dimensionless and share one learning rate regardless
     of the calibration's pixel units. Intrinsics are NOT gauge-locked (they are
     observable once cam-0 extrinsics fix the scene gauge).
+
+    With `shared_intrinsics`, the dK delta is a single (1, 4) tensor broadcast to
+    every view instead of a per-camera (V, 4). For a single-camera capture (e.g.
+    TnT, where all frames come from one moving lens) this is the correct model:
+    one physical intrinsic is estimated from all views jointly, so a noisy view
+    cannot warp its own focal. Use per-camera dK only for true multi-rig
+    calibrations (e.g. DTU). Shared dK leaves the *per-camera* extrinsics free.
     """
     def __init__(self, c2w_base: Tensor, lock_first: bool = True,
-                 K_base: Tensor | None = None, opt_intrinsics: bool = False):
+                 K_base: Tensor | None = None, opt_intrinsics: bool = False,
+                 shared_intrinsics: bool = False):
         super().__init__()
         V = c2w_base.shape[0]
         self.register_buffer("R_base", c2w_base[:, :3, :3].contiguous().float())
@@ -141,10 +149,13 @@ class CameraParams(nn.Module):
         self.register_buffer("free_mask", mask)
 
         self.opt_intrinsics = opt_intrinsics
+        self.shared_intrinsics = shared_intrinsics
         if K_base is not None:
             self.register_buffer("K_base", K_base.contiguous().float())
             if opt_intrinsics:
-                self.dK = nn.Parameter(torch.zeros(V, 4))   # s_fx, s_fy, r_cx, r_cy
+                # (1, 4) shared across all views, or (V, 4) per-camera.
+                nK = 1 if shared_intrinsics else V
+                self.dK = nn.Parameter(torch.zeros(nK, 4))  # s_fx, s_fy, r_cx, r_cy
         else:
             self.register_buffer("K_base", torch.empty(0))
 
@@ -231,18 +242,25 @@ class BAContext:
     device: str
 
 
-def prepare_context(views: dict, train_cfg: TrainConfig, device: str) -> BAContext:
+def prepare_context(views: dict, train_cfg: TrainConfig, device: str,
+                    images_dev: Tensor | None = None) -> BAContext:
     """Build a BAContext from loaded views — mirrors train.py's data prep.
 
     Reuses make_deterministic_rays / precompute_alt_cameras so the ray grid and
-    target-camera neighbourhoods match training exactly.
+    target-camera neighbourhoods match training exactly. Pass `images_dev` to
+    reuse an already-resident (V,H,W,3) device tensor (e.g. the training loop's
+    `images`) instead of re-uploading a duplicate — saves the full image tensor
+    of GPU memory when BA runs interleaved with training.
     """
     from .data import make_deterministic_rays, precompute_alt_cameras
 
     # fp16 only helps on CUDA; several fp16 ops (e.g. grid_sample) are unimplemented
     # on CPU, so keep images fp32 there to allow a CPU run of the recovery test.
-    images = views["images"].to(device)
-    images = images.half() if torch.device(device).type == "cuda" else images.float()
+    if images_dev is not None:
+        images = images_dev
+    else:
+        images = views["images"].to(device)
+        images = images.half() if torch.device(device).type == "cuda" else images.float()
     masks  = views["masks"].to(device) if "masks" in views else None
     K_all  = views["K"].to(device).float()
     c2w_base = views["c2w"].to(device).float()
@@ -513,7 +531,8 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
 
     cam_params = CameraParams(ctx.c2w_base, lock_first=ba.lock_first,
                               K_base=ctx.K_all,
-                              opt_intrinsics=ba.opt_intrinsics).to(device)
+                              opt_intrinsics=ba.opt_intrinsics,
+                              shared_intrinsics=ba.shared_intrinsics).to(device)
     # Optionally free ONLY one camera (e.g. the perturbed one in a recovery test):
     # zero every other camera's extrinsic gradient so the rig cannot translation-
     # drift and the recovery metric is read on that camera in isolation.
@@ -620,8 +639,10 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
           f"(φ:{ba.block_phi} + θ:{ba.block_theta})  "
           f"lr_φ={ba.lr} lr_θ={ba.lr_theta}  lock_first={ba.lock_first}")
     if ba.opt_intrinsics:
+        _Kmode = ("shared across all views (single-camera model)"
+                  if ba.shared_intrinsics else "per-camera")
         print(f"  [BA] intrinsics K (fx,fy,cx,cy) refined in φ-block  "
-              f"lr_K={ba.lr_intrinsics} (all cameras free)", flush=True)
+              f"lr_K={ba.lr_intrinsics}  [{_Kmode}]", flush=True)
     _trace_name = "trace_idr" if trace_cfg.grad_mode == "idr" else "trace_unrolled"
     _beta_note = ""
     if trace_cfg.grad_mode == "idr" and trace_cfg.sdf_min_beta > 0 and train_cfg.w_sil <= 0:
@@ -759,6 +780,122 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
     return f, cam_params
 
 
+# ─────────────────────── interleaved (in-loop) BA ──────────────────────────
+
+class InLoopBundleAdjuster:
+    """Pose refinement interleaved with the main θ-training loop.
+
+    The training loop is the θ phase; this object owns the φ side. It builds a
+    BAContext + CameraParams ONCE (poses seeded at the calibrated extrinsics) and
+    keeps a warm Adam state for φ across the whole run. Every `interval` training
+    steps the caller invokes `step()`, which — after the warmup — runs one short
+    φ-block (θ frozen) against the *current* geometry and returns the refined c2w
+    for the loop to sync into its pose tensors.
+
+    Reuses the exact post-hoc machinery (`photometric_objective`, `idr_intersection`,
+    `_sample_batch`, `CameraParams`), so the φ-gradient is identical to the proven
+    post-hoc pass; only the *scheduling* differs (warm-up gated, LR-ramped, one
+    block per interval) and θ is left to the main loop rather than a θ-block here.
+    """
+
+    def __init__(self, f, views: dict, train_cfg: TrainConfig,
+                 trace_cfg: TraceConfig, device: str,
+                 images_dev: Tensor | None = None):
+        ba = train_cfg.bundle
+        self.train_cfg = train_cfg
+        self.trace_cfg = trace_cfg
+        self.ba = ba
+        self.device = device
+        self.ctx = prepare_context(views, train_cfg, device, images_dev=images_dev)
+        self.cam_params = CameraParams(self.ctx.c2w_base, lock_first=ba.lock_first,
+                                       K_base=self.ctx.K_all,
+                                       opt_intrinsics=ba.opt_intrinsics,
+                                       shared_intrinsics=ba.shared_intrinsics).to(device)
+        # φ-block optimiser: extrinsics group [0] is LR-ramped; intrinsics (if any)
+        # stay at their fixed lr.
+        phi_groups = [{"params": [self.cam_params.log_rot, self.cam_params.dt],
+                       "lr": ba.lr}]
+        if ba.opt_intrinsics:
+            phi_groups.append({"params": self.cam_params.intrinsics_params(),
+                               "lr": ba.lr_intrinsics})
+        self.opt_phi = torch.optim.Adam(phi_groups)
+        self.target_lr = ba.lr
+        self.n_blocks = 0          # φ-blocks run so far (drives the LR ramp)
+        self.gstep = 0             # φ optimiser steps so far
+        print(f"  [inloop-BA] enabled: warmup={ba.warmup_steps} interval={ba.interval} "
+              f"block_phi={ba.block_phi} lr={ba.lr:g} ramp={ba.lr_ramp_blocks} blocks  "
+              f"lock_first={ba.lock_first}  V={self.ctx.c2w_base.shape[0]}", flush=True)
+
+    @torch.no_grad()
+    def current_c2w(self) -> Tensor:
+        """Current refined camera-to-world poses (detached)."""
+        return self.cam_params().detach()
+
+    def state_dict(self) -> dict:
+        """Persist φ + Adam state + counters (for preemption resume)."""
+        return {"cam_params": self.cam_params.state_dict(),
+                "opt_phi": self.opt_phi.state_dict(),
+                "n_blocks": self.n_blocks, "gstep": self.gstep}
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore a saved φ state so a requeued run continues, not restarts, BA."""
+        self.cam_params.load_state_dict(sd["cam_params"])
+        self.opt_phi.load_state_dict(sd["opt_phi"])
+        self.n_blocks = int(sd.get("n_blocks", 0))
+        self.gstep = int(sd.get("gstep", 0))
+        rot_deg, trans = self.cam_params.deltas()
+        print(f"  [inloop-BA] RESUME: {self.n_blocks} φ-blocks done, "
+              f"|Δφ|rot={rot_deg:.4f}° trans={trans:.3e} (φ + Adam restored)", flush=True)
+
+    def step(self, f, train_step: int) -> dict | None:
+        """If due, run one φ-block against the current geometry; else no-op.
+
+        Returns a stats dict (and implies the caller should sync `current_c2w()`)
+        when a φ-block ran, or None when warming up / not on an interval boundary.
+        """
+        ba = self.ba
+        if train_step < ba.warmup_steps:
+            return None
+        if (train_step - ba.warmup_steps) % max(ba.interval, 1) != 0:
+            return None
+
+        # LR ramp over the first `lr_ramp_blocks` φ-blocks (extrinsics group only).
+        self.n_blocks += 1
+        scale = min(1.0, self.n_blocks / max(ba.lr_ramp_blocks, 1))
+        self.opt_phi.param_groups[0]["lr"] = self.target_lr * scale
+
+        # freeze θ, train φ
+        for p in self.cam_params.parameters():
+            p.requires_grad_(True)
+        for p in f.parameters():
+            p.requires_grad_(False)
+
+        alpha = _silhouette_alpha(self.train_cfg)  # unused by bare-E φ-block; kept for parity
+        last_E = last_zncc = float("nan")
+        last_kept = 0.0
+        for _ in range(ba.block_phi):
+            idx = _sample_batch(self.ctx)
+            E, aux = photometric_objective(f, self.cam_params, idx, self.ctx,
+                                           self.train_cfg, self.trace_cfg, self.gstep)
+            self.opt_phi.zero_grad(set_to_none=True)
+            E.backward()
+            self.opt_phi.step()
+            self.gstep += 1
+            st = aux["stats"]
+            last_E = float(E.detach())
+            last_zncc = float(st.get("ncc_zncc", float("nan")))
+            last_kept = st.get("ncc_kept", 0) / max(st.get("ncc_textured", 0), 1)
+
+        # restore θ grads for the main loop
+        for p in f.parameters():
+            p.requires_grad_(True)
+
+        rot_deg, trans = self.cam_params.deltas()
+        return {"E": last_E, "ncc": last_zncc, "kept": last_kept,
+                "rot_deg": rot_deg, "trans": trans, "lr_scale": scale,
+                "block": self.n_blocks}
+
+
 def _save_ba_checkpoint(path: Path, f, cam_params: CameraParams,
                         opt_phi, opt_theta, cycle: int, gstep: int) -> None:
     payload = {
@@ -883,6 +1020,9 @@ def main() -> None:
                     help="do not gauge-lock camera 0 (allows global drift)")
     ap.add_argument("--opt-intrinsics", action="store_true",
                     help="also refine per-camera intrinsics K (fx,fy,cx,cy) in the φ-block")
+    ap.add_argument("--shared-intrinsics", action="store_true",
+                    help="tie intrinsics across all views — one K for a single-camera "
+                         "capture (TnT). Implies --opt-intrinsics.")
     ap.add_argument("--lr-intrinsics", type=float, default=None,
                     help="intrinsics learning rate (dimensionless delta; default from config)")
     # --- synthetic perturbation-recovery test ---
@@ -922,6 +1062,9 @@ def main() -> None:
     if args.theta_first:   ba.phi_first  = False
     if args.no_lock_first: ba.lock_first = False
     if args.opt_intrinsics: ba.opt_intrinsics = True
+    if args.shared_intrinsics:
+        ba.shared_intrinsics = True
+        ba.opt_intrinsics = True   # shared K is meaningless without refining K
     if args.lr_intrinsics is not None: ba.lr_intrinsics = args.lr_intrinsics
 
     run_dir = args.out or (args.ckpt.parent / "bundle_adjust")

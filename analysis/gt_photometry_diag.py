@@ -530,6 +530,67 @@ def _plot_paper_grid(out_path: Path, scan_id: int,
     plt.close(fig)
 
 
+def _plot_crop_distribution(out_path: Path, scene_tag: str, ref_view: int,
+                            gray_box: np.ndarray, rgb_box: np.ndarray,
+                            crop_label: str) -> None:
+    """Minimal ICLR-style ZNCC histogram for the GT points inside one crop box.
+
+    gray and rgb are the per-point aggregated GT-plane ZNCC of the points whose
+    reference-view projection falls inside the box; both come from the unchanged
+    pmvs_ncc_loss, so this is just a re-slice of the dense overlay, not a new
+    metric.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    bins = np.linspace(-0.2, 1.0, 49)
+    fig, ax = plt.subplots(figsize=(3.4, 2.5), constrained_layout=True)
+    for vals, color, name in ((gray_box, "#1f77b4", "gray"),
+                              (rgb_box, "#d62728", "RGB")):
+        v = vals[np.isfinite(vals)]
+        if v.size == 0:
+            continue
+        ax.hist(v, bins=bins, density=True, histtype="step", lw=1.8,
+                color=color, label=f"{name}  (med {np.median(v):.2f}, n={v.size:,})")
+        ax.axvline(np.median(v), color=color, lw=1.0, ls="--", alpha=0.7)
+    ax.axvline(0.0, color="k", lw=0.8, alpha=0.4)
+    ax.set_xlabel("GT-surface ZNCC")
+    ax.set_ylabel("density")
+    ax.set_xlim(-0.2, 1.0)
+    ax.legend(fontsize=7, frameon=False, loc="upper left")
+    ax.set_title(f"{scene_tag}  v{ref_view:03d}  {crop_label}".strip(), fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.savefig(out_path.with_suffix(".pdf"))
+    fig.savefig(out_path.with_suffix(".png"), dpi=240)
+    plt.close(fig)
+
+
+def _plot_crop_check(out_path: Path, scene_tag: str, ref_view: int,
+                     image: np.ndarray, box: tuple[float, float, float, float],
+                     xy_in: np.ndarray, z_in: np.ndarray) -> None:
+    """Sanity panel: draw the crop box on the ref image + the in-box points."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    x0, y0, x1, y1 = box
+    fig, ax = plt.subplots(figsize=(6, 4.5), constrained_layout=True)
+    ax.imshow(image)
+    if len(z_in):
+        ax.scatter(xy_in[:, 0], xy_in[:, 1], c=z_in, s=2.0, cmap="magma",
+                   vmin=0.0, vmax=0.85, linewidths=0)
+    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                           edgecolor="red", lw=2.0))
+    ax.set_title(f"{scene_tag}  v{ref_view:03d}  crop = ({x0:.0f},{y0:.0f})-"
+                 f"({x1:.0f},{y1:.0f})  n_in={len(z_in):,}", fontsize=9)
+    ax.set_axis_off()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def dense_image_overlays(out_dir: Path, scan_id: int, gt_norm: np.ndarray,
                          views: dict, images_t: torch.Tensor, masks: torch.Tensor,
                          K: torch.Tensor, w2c: torch.Tensor, alt: torch.Tensor,
@@ -539,7 +600,9 @@ def dense_image_overlays(out_dir: Path, scan_id: int, gt_norm: np.ndarray,
                          ncc_min: float, sample_mode: str,
                          gaussian_sigma: float, gaussian_radius: int,
                          patch_wsigma: float, patch_bilateral_gamma: float,
-                         device: str) -> list[int]:
+                         device: str,
+                         crop_box: tuple[float, float, float, float] | None = None,
+                         crop_views: tuple[int, ...] = ()) -> list[int]:
     if max_points_per_view == 0:
         return []
     if not overlay_views:
@@ -554,6 +617,12 @@ def dense_image_overlays(out_dir: Path, scan_id: int, gt_norm: np.ndarray,
     from scipy.spatial import cKDTree
     support_tree = cKDTree(gt_norm)
     grid_panels: list[dict] = []
+    # Crop: the box is defined in ONE view's pixel frame (crop_views[0]); it
+    # selects a set of 3D GT points (the rings). We then pool those points'
+    # ZNCC across EVERY processed reference view into a single distribution.
+    crop_box_view = crop_views[0] if (crop_box is not None and crop_views) else None
+    crop_records: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    ring_global: np.ndarray | None = None
     for ref_view in overlay_views:
         keep_global, uv_ref = _visible_in_view(
             all_points_t, ref_view, masks, K, w2c, H, W, chunk)
@@ -605,6 +674,23 @@ def dense_image_overlays(out_dir: Path, scan_id: int, gt_norm: np.ndarray,
         out_path = out_dir / f"dense_overlay_view{ref_view:03d}_gray_rgb.png"
         _plot_dense_overlay(out_path, scan_id, ref_view, images_np[ref_view],
                             uv_ref, g_pts, g_z, r_pts, r_z, max_draw, seed)
+        if crop_box is not None:
+            # Record this view's per-point ZNCC keyed by GLOBAL GT id so the
+            # ring points can be pooled across all views after the loop.
+            gid_g = keep_global[g_pts]
+            gid_r = keep_global[r_pts]
+            crop_records.append((gid_g, g_z, gid_r, r_z))
+            if ref_view == crop_box_view:
+                x0, y0, x1, y1 = crop_box
+                g_uv = uv_ref[g_pts]
+                in_box = ((g_uv[:, 0] >= x0) & (g_uv[:, 0] <= x1)
+                          & (g_uv[:, 1] >= y0) & (g_uv[:, 1] <= y1))
+                ring_global = gid_g[in_box]
+                _plot_crop_check(
+                    out_dir / f"crop_check_view{ref_view:03d}.png", _scene_tag(scan_id),
+                    ref_view, images_np[ref_view], crop_box, g_uv[in_box], g_z[in_box])
+                print(f"[crop] box view {ref_view:03d}: {ring_global.size:,} ring "
+                      f"GT points selected")
         common, gi, ri = np.intersect1d(g_pts, r_pts, return_indices=True)
         d_z = (g_z[gi] - r_z[ri]).astype(np.float32) if len(common) else np.empty(0, np.float32)
         grid_rng = np.random.default_rng(seed + 10_000 + ref_view)
@@ -633,6 +719,27 @@ def dense_image_overlays(out_dir: Path, scan_id: int, gt_norm: np.ndarray,
               f"{len(keep_global):,} ref pts, {len(pidx):,} pairs")
     _plot_paper_grid(out_dir / "dense_overlay_grid_gray_rgb.png",
                      scan_id, grid_panels)
+
+    if crop_box is not None:
+        if ring_global is None:
+            print("[crop] box view was not among the dense views; no ring set")
+        elif ring_global.size == 0:
+            print("[crop] no GT points fell inside the box")
+        else:
+            ring_set = ring_global
+            pooled_g, pooled_r = [], []
+            for gid_g, gz, gid_r, rz in crop_records:
+                pooled_g.append(gz[np.isin(gid_g, ring_set)])
+                pooled_r.append(rz[np.isin(gid_r, ring_set)])
+            pooled_g = np.concatenate(pooled_g) if pooled_g else np.empty(0, np.float32)
+            pooled_r = np.concatenate(pooled_r) if pooled_r else np.empty(0, np.float32)
+            _plot_crop_distribution(
+                out_dir / "crop_zncc_dist_allviews", _scene_tag(scan_id),
+                crop_box_view, pooled_g, pooled_r,
+                crop_label=f"rings, pooled over {len(crop_records)} views")
+            print(f"[crop] pooled ring ZNCC over {len(crop_records)} views: "
+                  f"gray n={pooled_g.size:,} med={np.median(pooled_g):.3f} | "
+                  f"rgb n={pooled_r.size:,} med={np.median(pooled_r):.3f}")
     return written
 
 
@@ -757,6 +864,11 @@ def main() -> None:
                     help="Extra per-view GT points for dense paper overlays; 0 disables, negative = all visible.")
     ap.add_argument("--dense-overlay-max-draw", type=int, default=80_000,
                     help="Display subsample for dense overlays; 0 = draw all.")
+    ap.add_argument("--crop-box", type=str, default=None,
+                    help="x0,y0,x1,y1 pixel box (ref-view image coords); emits a "
+                         "minimal ZNCC distribution plot for GT points inside it.")
+    ap.add_argument("--crop-views", type=parse_views, default=[],
+                    help="Views the --crop-box applies to; empty = all dense views.")
     ap.add_argument("--chunk", type=int, default=8192)
     args = ap.parse_args()
 
@@ -890,13 +1002,21 @@ def main() -> None:
         results["gray"]["pair_zncc_at_capture"],
         results["rgb"]["pair_zncc_at_capture"],
         args.overlay_views, args.n_overlays, args.overlay_max_points, args.seed)
+    crop_box = None
+    if args.crop_box:
+        vals = [float(x) for x in args.crop_box.split(",") if x.strip()]
+        if len(vals) != 4:
+            ap.error("--crop-box expects x0,y0,x1,y1")
+        crop_box = (min(vals[0], vals[2]), min(vals[1], vals[3]),
+                    max(vals[0], vals[2]), max(vals[1], vals[3]))
     dense_overlay_views = dense_image_overlays(
         args.out, args.scan_id, gt_norm, views, images, masks, K, w2c, alt,
         overlay_views, args.dense_overlay_points_per_view,
         args.dense_overlay_max_draw, args.normal_k, args.seed, args.chunk,
         H, W, args.ncc_patch, args.ncc_half_pix, args.ncc_min,
         args.sample_mode, args.gaussian_sigma, args.gaussian_radius,
-        args.ncc_patch_wsigma, args.ncc_bilateral_gamma, args.device)
+        args.ncc_patch_wsigma, args.ncc_bilateral_gamma, args.device,
+        crop_box=crop_box, crop_views=tuple(args.crop_views))
 
     summary = {
         "scene": str(args.scene),

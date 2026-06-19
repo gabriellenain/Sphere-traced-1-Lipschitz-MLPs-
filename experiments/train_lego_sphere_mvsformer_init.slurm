@@ -24,6 +24,7 @@ CARVE_OUT=${CARVE_OUT:-$ROOT/_diagnostics/mvsformer_lego_sphere/sphere_carve_aut
 INIT_SDF=${INIT_SDF:-$CARVE_OUT/sdf_sphere_mvsformer_carved.npy}
 JOB_TAG=${JOB_TAG:-lego_sphere_mvsformer_init}
 RESUME=${RESUME:-}
+STEPS=${STEPS:-200000}
 
 source /scratch/_projets_/willow/1-lip-tracer-new/.venv/bin/activate
 cd "$ROOT"
@@ -59,6 +60,24 @@ else
 fi
 
 RESUME_ARGS=()
+if [ -z "$RESUME" ] && [ "${AUTO_RESUME:-1}" != "0" ]; then
+  if [ -n "${RUN_DIR:-}" ]; then
+    CANDIDATE_RUN="$RUN_DIR"
+  else
+    CANDIDATE_RUN=$(find -L "$OUTPUTS" -maxdepth 1 -type d \
+      -name "run_*_${JOB_TAG}_*" -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr | awk 'NR==1 {print $2}')
+  fi
+  if [ -n "${CANDIDATE_RUN:-}" ]; then
+    for name in ckpt/checkpoint_latest.pt ckpt/checkpoint.pt ckpt/checkpoint_final.pt checkpoint_latest.pt checkpoint.pt checkpoint_final.pt; do
+      if [ -f "$CANDIDATE_RUN/$name" ]; then
+        RESUME="$CANDIDATE_RUN/$name"
+        echo "Auto-resuming from: $RESUME"
+        break
+      fi
+    done
+  fi
+fi
 if [ -n "$RESUME" ]; then
   if [ ! -f "$RESUME" ]; then
     echo "ERROR: missing resume checkpoint: $RESUME" >&2
@@ -84,6 +103,7 @@ echo "Scene:          $SCENE"
 echo "Depth dir:      $DEPTH_DIR"
 echo "Init SDF grid:  $INIT_SDF"
 echo "Run dir:        $RUN_DIR"
+echo "Target steps:   $STEPS"
 
 python -u -m lip_tracer.train \
   --dataset lego \
@@ -92,7 +112,7 @@ python -u -m lip_tracer.train \
   --init hull \
   --init-sdf-grid "$INIT_SDF" \
   --hull-res "$CARVE_RES" \
-  --steps 100000 \
+  --steps "$STEPS" \
   --batch 16384 \
   --eps 1e-4 \
   --down 1 \

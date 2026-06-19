@@ -79,8 +79,48 @@ def parse_args() -> argparse.Namespace:
         help="auto depth cap = max camera-center distance + bound + depth-cap-pad")
     ap.add_argument("--depth-cap-pad", type=float, default=0.25,
                     help="pad added to the auto depth cap (absolute units)")
+    ap.add_argument(
+        "--geo-consistency", action="store_true",
+        help="cross-view geometric consistency filter on MVSFormer depths before "
+             "carving: keep a pixel only if its depth reprojects consistently through "
+             "enough neighbour views. Drops the too-near textureless-panel depths "
+             "that otherwise carve real surface.")
+    ap.add_argument("--geo-n-views", type=int, default=8,
+                    help="number of nearest-camera neighbour views to check")
+    ap.add_argument("--geo-n-consistent", type=int, default=2,
+                    help="min consistent neighbours required to keep a pixel")
+    ap.add_argument("--geo-tau-pix", type=float, default=1.0,
+                    help="max reprojection error (pixels)")
+    ap.add_argument("--geo-tau-depth", type=float, default=0.01,
+                    help="max relative depth error |dz|/d")
+    ap.add_argument(
+        "--drop-seethrough", action="store_true",
+        help="drop per-view depth pixels that are local FAR outliers (depth > factor x "
+             "large-window local median). Glass (MVS sees through it, consistently, so "
+             "geo-consistency keeps it) and sky gaps inside thin structures are far-"
+             "outlier blobs against the surrounding correct surface; their votes are "
+             "what carve init holes. Mask-free.")
+    ap.add_argument("--seethrough-win", type=int, default=31,
+                    help="median window (on the downsampled map)")
+    ap.add_argument("--seethrough-factor", type=float, default=1.3,
+                    help="drop pixel if depth > factor x local median")
+    ap.add_argument("--seethrough-down", type=int, default=8,
+                    help="downsample for the local median (win x down = full-res context)")
+    ap.add_argument(
+        "--protect-sfm-radius", type=float, default=None,
+        help="voxels within this distance (world units) of a sparse-SfM point cannot "
+             "be carved by depth votes: SfM points are photometrically verified "
+             "surface, so depth votes against them are wrong. Mask-free; keep "
+             "<= --sfm-roi-dist.")
     ap.add_argument("--sfm-clip", action="store_true")
     ap.add_argument("--clip-margin-voxels", type=float, default=6.0)
+    ap.add_argument(
+        "--sfm-roi-dist", type=float, default=None,
+        help="after the AABB clip, drop voxels farther than this (world units) from "
+             "the nearest sparse-SfM point. The AABB cannot remove a blob floating in "
+             "air inside the scene's bounding box; this distance ROI does, since empty "
+             "air has no reconstructed points nearby. Keep generous so textureless "
+             "panels (sparse points) survive.")
     ap.add_argument("--open-iters", type=int, default=0,
                     help="3D binary opening iterations after depth/ROI carving")
     ap.add_argument("--close-iters", type=int, default=0,
@@ -237,6 +277,144 @@ def load_mvsformer_depths_tnt_nomask(
     }
 
 
+def drop_seethrough_pixels(
+    depths: list[np.ndarray],
+    valid: list[np.ndarray],
+    win: int = 31,
+    factor: float = 1.3,
+    down: int = 8,
+) -> list[np.ndarray]:
+    """Drop local FAR-outlier depth pixels (see-through glass, sky gaps in thin
+    structures) before carving.
+
+    The local median is computed on a ``down``-sampled map with a ``win`` window,
+    i.e. a (win*down)-pixel full-resolution context — large enough that a glass /
+    between-bars blob is the minority inside its window, so the median locks onto
+    the surrounding correct surface and the blob exceeds ``factor`` x median.
+    Smooth far surfaces (ground, walls) match their own local median and survive.
+    Conservative bias: invalid pixels are filled with the global median, which can
+    only raise the local median and suppress fewer pixels.
+    """
+    from scipy.ndimage import median_filter
+
+    out = []
+    n_drop_total = n_valid_total = 0
+    for i, (depth, v) in enumerate(zip(depths, valid)):
+        if not v.any():
+            out.append(v)
+            continue
+        d = depth.astype(np.float32, copy=True)
+        d[~v] = float(np.median(depth[v]))
+        ds = d[::down, ::down]
+        med = median_filter(ds, size=win, mode="nearest")
+        med_full = np.repeat(np.repeat(med, down, 0), down, 1)[: d.shape[0], : d.shape[1]]
+        far = v & (depth > factor * med_full)
+        out.append(v & ~far)
+        n_drop_total += int(far.sum())
+        n_valid_total += int(v.sum())
+        if i % 25 == 0:
+            print(f"  [seethrough] view {i:03d}: dropped {int(far.sum()):7d} "
+                  f"/ {int(v.sum()):8d} far-outlier px")
+    print(f"  [seethrough] total dropped {n_drop_total} / {n_valid_total} "
+          f"({100 * n_drop_total / max(n_valid_total, 1):.1f}%) "
+          f"win={win} factor={factor} down={down}")
+    return out
+
+
+def geometric_consistency_filter(
+    depths: list[np.ndarray],
+    valid: list[np.ndarray],
+    K: np.ndarray,
+    c2w: np.ndarray,
+    n_views: int = 8,
+    n_consistent: int = 2,
+    tau_pix: float = 1.0,
+    tau_depth: float = 0.01,
+) -> list[np.ndarray]:
+    """Cross-view geometric consistency check (MVSNet/COLMAP fusion style).
+
+    For each reference pixel with depth d_r: back-project to world, project into a
+    neighbour view, sample that view's depth, back-project the neighbour pixel to
+    world, reproject into the reference view, and require small reprojection error
+    (pixels) AND small relative depth error. A pixel is kept only if at least
+    ``n_consistent`` of its ``n_views`` nearest-camera neighbours agree. Wrong
+    "too-near" depths on textureless panels fail this test and are dropped, so they
+    no longer free-carve real surface; texture-consistent background depths survive.
+    """
+    V = len(depths)
+    centers = c2w[:, :3, 3].astype(np.float64)
+    out: list[np.ndarray] = []
+    total_before = total_after = 0
+    for r in range(V):
+        Hr, Wr = depths[r].shape
+        Kr = K[r].astype(np.float64)
+        Rr = c2w[r, :3, :3].astype(np.float64)
+        tr = c2w[r, :3, 3].astype(np.float64)
+        dr = depths[r].astype(np.float64)
+        vr = valid[r]
+
+        ys, xs = np.meshgrid(np.arange(Hr), np.arange(Wr), indexing="ij")
+        xs = xs.astype(np.float64); ys = ys.astype(np.float64)
+        # ref pixel + depth -> world
+        xc = (xs - Kr[0, 2]) / Kr[0, 0] * dr
+        yc = (ys - Kr[1, 2]) / Kr[1, 1] * dr
+        Xw = np.stack([xc, yc, dr], axis=-1) @ Rr.T + tr  # (Hr,Wr,3)
+
+        d2 = np.sum((centers - centers[r]) ** 2, axis=1)
+        d2[r] = np.inf
+        nbrs = np.argsort(d2)[:n_views]
+
+        cons = np.zeros((Hr, Wr), dtype=np.int32)
+        for n in nbrs:
+            Hn, Wn = depths[n].shape
+            Kn = K[n].astype(np.float64)
+            Rn = c2w[n, :3, :3].astype(np.float64)
+            tn = c2w[n, :3, 3].astype(np.float64)
+            dn = depths[n].astype(np.float64)
+            vn = valid[n]
+
+            # world -> neighbour cam  (R_n^T (Xw - t_n) == (Xw - t_n) @ R_n)
+            Xnc = (Xw - tn) @ Rn
+            zn = Xnc[..., 2]
+            front = zn > 1e-6
+            zsafe = np.where(front, zn, 1.0)
+            un = Xnc[..., 0] / zsafe * Kn[0, 0] + Kn[0, 2]
+            vn_ = Xnc[..., 1] / zsafe * Kn[1, 1] + Kn[1, 2]
+            ui = np.rint(un).astype(np.int64)
+            vi = np.rint(vn_).astype(np.int64)
+            inb = front & (ui >= 0) & (ui < Wn) & (vi >= 0) & (vi < Hn)
+            ii = np.clip(vi, 0, Hn - 1); jj = np.clip(ui, 0, Wn - 1)
+            d_n = dn[ii, jj]
+            good_n = inb & vn[ii, jj] & (d_n > 1e-6)
+
+            # neighbour pixel + sampled depth -> world -> back to ref
+            xb = (jj.astype(np.float64) - Kn[0, 2]) / Kn[0, 0] * d_n
+            yb = (ii.astype(np.float64) - Kn[1, 2]) / Kn[1, 1] * d_n
+            Xw2 = np.stack([xb, yb, d_n], axis=-1) @ Rn.T + tn
+            Xrc = (Xw2 - tr) @ Rr
+            zr2 = Xrc[..., 2]
+            frontr = zr2 > 1e-6
+            zr2s = np.where(frontr, zr2, 1.0)
+            ur2 = Xrc[..., 0] / zr2s * Kr[0, 0] + Kr[0, 2]
+            vr2 = Xrc[..., 1] / zr2s * Kr[1, 1] + Kr[1, 2]
+            reproj = np.sqrt((ur2 - xs) ** 2 + (vr2 - ys) ** 2)
+            ddepth = np.abs(zr2 - dr) / np.clip(dr, 1e-6, None)
+            cons += (good_n & frontr & (reproj < tau_pix) & (ddepth < tau_depth))
+
+        keep = vr & (cons >= n_consistent)
+        out.append(keep)
+        total_before += int(vr.sum())
+        total_after += int(keep.sum())
+        if r % 25 == 0:
+            print(f"  [geo] view {r:03d}: valid {int(vr.sum()):8d} -> "
+                  f"{int(keep.sum()):8d} ({100*keep.sum()/max(vr.sum(),1):.1f}%)")
+    print(f"  [geo] consistency filter: {total_before} -> {total_after} valid px "
+          f"({100*total_after/max(total_before,1):.1f}% kept), "
+          f"n_views={n_views} n_consistent={n_consistent} "
+          f"tau_pix={tau_pix} tau_depth={tau_depth}")
+    return out
+
+
 def clean_occupancy(
     occ: np.ndarray,
     open_iters: int = 0,
@@ -362,6 +540,25 @@ def main() -> None:
     if mvs is None:
         raise RuntimeError("failed to load MVSFormer++ depths")
 
+    if args.drop_seethrough:
+        print("\ndropping see-through / far-outlier depth pixels ...")
+        mvs["valid"] = drop_seethrough_pixels(
+            mvs["depths"], mvs["valid"],
+            win=args.seethrough_win,
+            factor=args.seethrough_factor,
+            down=args.seethrough_down,
+        )
+
+    if args.geo_consistency:
+        print("\napplying cross-view geometric consistency filter ...")
+        mvs["valid"] = geometric_consistency_filter(
+            mvs["depths"], mvs["valid"], mvs["K"], mvs["c2w"],
+            n_views=args.geo_n_views,
+            n_consistent=args.geo_n_consistent,
+            tau_pix=args.geo_tau_pix,
+            tau_depth=args.geo_tau_depth,
+        )
+
     print("\ninitializing enclosing sphere ...")
     occ = sphere_occ(args.res, args.bound, center, sphere_radius)
     n_occ0 = int(occ.sum())
@@ -392,7 +589,25 @@ def main() -> None:
         print(f"  view {vi:03d}: valid={stats['valid_depth_px']:8d} "
               f"voted_empty={stats['voxels_voted_empty']:8d}")
 
+    n_sfm_protected = 0
     remove = (votes >= args.votes_req) & occ
+    if args.protect_sfm_radius is not None:
+        print(f"\nprotecting voxels within {args.protect_sfm_radius} of SfM points ...")
+        from scipy.spatial import cKDTree
+        pts = sfm_points_in_bound(args.scene, args.bound)
+        if len(pts) == 0:
+            print("  [protect-sfm] no in-bound SfM points; skipping")
+        else:
+            tree = cKDTree(pts.astype(np.float64))
+            dist, _ = tree.query(occ_pts.astype(np.float64), k=1, workers=-1)
+            near = dist <= float(args.protect_sfm_radius)
+            protect = np.zeros_like(occ, dtype=bool)
+            nidx = occ_idx[near]
+            protect[nidx[:, 0], nidx[:, 1], nidx[:, 2]] = True
+            n_sfm_protected = int((remove & protect).sum())
+            remove &= ~protect
+            print(f"  [protect-sfm] rescued {n_sfm_protected} voted-empty voxels "
+                  f"near {len(pts)} SfM points")
     carved = occ & ~remove
     n_depth_removed = int(remove.sum())
     print(f"\nremoved by MVSFormer depth votes: {n_depth_removed} / {n_occ0} "
@@ -407,6 +622,26 @@ def main() -> None:
         carved = carved & keep
         n_clip_removed = before - int(carved.sum())
         print(f"removed by SFM ROI clip: {n_clip_removed}")
+
+    n_roi_dist_removed = 0
+    if args.sfm_roi_dist is not None:
+        print(f"\napplying SfM distance ROI (drop voxels > {args.sfm_roi_dist} "
+              f"from nearest SfM point) ...")
+        from scipy.spatial import cKDTree
+        pts = sfm_points_in_bound(args.scene, args.bound)
+        if len(pts) == 0:
+            print("  [roi-dist] no in-bound SfM points; skipping distance ROI")
+        else:
+            tree = cKDTree(pts.astype(np.float64))
+            cidx = np.argwhere(carved)
+            cpts = voxel_world_from_occ_indices(cidx, args.bound, args.res)
+            dist, _ = tree.query(cpts.astype(np.float64), k=1, workers=-1)
+            far = dist > float(args.sfm_roi_dist)
+            before = int(carved.sum())
+            drop = cidx[far]
+            carved[drop[:, 0], drop[:, 1], drop[:, 2]] = False
+            n_roi_dist_removed = before - int(carved.sum())
+            print(f"removed by SfM distance ROI: {n_roi_dist_removed}")
 
     print("\napplying voxel cleanup ...")
     carved, cleanup_info = clean_occupancy(
@@ -478,6 +713,11 @@ def main() -> None:
         "sphere_voxels": n_occ0,
         "voxels_removed_depth": n_depth_removed,
         "voxels_removed_sfm_clip": n_clip_removed,
+        "voxels_removed_sfm_roi_dist": n_roi_dist_removed,
+        "sfm_roi_dist": args.sfm_roi_dist,
+        "voxels_rescued_sfm_protect": n_sfm_protected,
+        "protect_sfm_radius": args.protect_sfm_radius,
+        "drop_seethrough": bool(args.drop_seethrough),
         "voxels_removed_component": n_component_removed,
         "voxels_final": n_final,
         "pct_removed_total": pct_total,

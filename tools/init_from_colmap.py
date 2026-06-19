@@ -26,11 +26,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from lip_tracer.model import make_model  # noqa: E402
+from lip_tracer.data import _find_epfl_strecha_urd, load_views  # noqa: E402
 
 
 # ---------- COLMAP I/O helpers ----------------------------------------------
@@ -137,6 +139,48 @@ def _write_colmap_input_model(scene: Path, model_dir: Path,
     return n
 
 
+def _write_epfl_colmap_input_model(scene: Path, model_dir: Path,
+                                   db_path: Path) -> int:
+    """Write COLMAP cameras/images from EPFL fixed cameras in normalized frame."""
+    urd = _find_epfl_strecha_urd(scene)
+    if urd is None:
+        raise FileNotFoundError(f"no EPFL *_dense/urd directory found under {scene}")
+    image_paths = sorted(p for p in urd.glob("*.png") if not p.name.startswith("._"))
+    if not image_paths:
+        raise FileNotFoundError(f"no EPFL images under {urd}")
+    views = load_views(scene, down=1)
+    c2ws = views["c2w"].numpy().astype(np.float64)
+    Ks = views["K"].numpy().astype(np.float64)
+    name_to_id = _db_image_ids(db_path)
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    with open(model_dir / "cameras.txt", "w") as fh:
+        fh.write("# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n")
+        for i, ip in enumerate(image_paths):
+            W, H = Image.open(ip).size
+            K = Ks[i]
+            fh.write(f"{i + 1} PINHOLE {W} {H} "
+                     f"{K[0,0]} {K[1,1]} {K[0,2]} {K[1,2]}\n")
+
+    n = 0
+    with open(model_dir / "images.txt", "w") as fh:
+        fh.write("# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n")
+        for i, ip in enumerate(image_paths):
+            if ip.name not in name_to_id:
+                continue
+            c2w = c2ws[i]
+            R_w2c = c2w[:3, :3].T
+            t_w2c = -R_w2c @ c2w[:3, 3]
+            qw, qx, qy, qz = _rot_to_quat(R_w2c)
+            iid = name_to_id[ip.name]
+            fh.write(f"{iid} {qw} {qx} {qy} {qz} "
+                     f"{t_w2c[0]} {t_w2c[1]} {t_w2c[2]} {i + 1} {ip.name}\n\n")
+            n += 1
+
+    (model_dir / "points3D.txt").write_text("")
+    return n
+
+
 # ---------- COLMAP pipeline -------------------------------------------------
 
 def _run(cmd: list[str]) -> None:
@@ -158,28 +202,48 @@ def run_colmap_triangulation(scene: Path, work: Path) -> Path:
         print(f"  [colmap] reusing {out_model/'points3D.bin'}")
         return out_model / "points3D.bin"
 
-    img_dir = scene / "rgb"
-    H, W = 1080, 1920  # fixed for NSVF-T&T (we don't resize before COLMAP)
-    K = np.loadtxt(scene / "intrinsics.txt", dtype=np.float64)[:3, :3]
-    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    is_epfl = _find_epfl_strecha_urd(scene) is not None
+    img_dir = _find_epfl_strecha_urd(scene) if is_epfl else scene / "rgb"
+    if img_dir is None:
+        raise FileNotFoundError(f"no image directory found for {scene}")
+    if not is_epfl:
+        H, W = 1080, 1920  # fixed for NSVF-T&T (we don't resize before COLMAP)
+        K = np.loadtxt(scene / "intrinsics.txt", dtype=np.float64)[:3, :3]
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
 
     if not db.exists():
-        _run([
-            "colmap", "feature_extractor",
-            "--database_path", str(db),
-            "--image_path", str(img_dir),
-            "--ImageReader.single_camera", "1",
-            "--ImageReader.camera_model", "PINHOLE",
-            "--ImageReader.camera_params", f"{fx},{fy},{cx},{cy}",
-        ])
-        _run([
-            "colmap", "sequential_matcher",
-            "--database_path", str(db),
-            "--SequentialMatching.overlap", "15",
-        ])
+        if is_epfl:
+            _run([
+                "colmap", "feature_extractor",
+                "--database_path", str(db),
+                "--image_path", str(img_dir),
+                "--ImageReader.camera_model", "PINHOLE",
+                "--SiftExtraction.max_image_size", "3200",
+            ])
+            _run([
+                "colmap", "exhaustive_matcher",
+                "--database_path", str(db),
+            ])
+        else:
+            _run([
+                "colmap", "feature_extractor",
+                "--database_path", str(db),
+                "--image_path", str(img_dir),
+                "--ImageReader.single_camera", "1",
+                "--ImageReader.camera_model", "PINHOLE",
+                "--ImageReader.camera_params", f"{fx},{fy},{cx},{cy}",
+            ])
+            _run([
+                "colmap", "sequential_matcher",
+                "--database_path", str(db),
+                "--SequentialMatching.overlap", "15",
+            ])
 
     input_model = work / "input_model"
-    n = _write_colmap_input_model(scene, input_model, db, W, H)
+    if is_epfl:
+        n = _write_epfl_colmap_input_model(scene, input_model, db)
+    else:
+        n = _write_colmap_input_model(scene, input_model, db, W, H)
     print(f"  [colmap] wrote {n} images.txt entries")
 
     _run([
@@ -318,12 +382,17 @@ def main() -> None:
     except Exception as e:
         print(f"  [overlay] skipped: {e}")
 
-    bbox = np.loadtxt(scene / "bbox.txt", dtype=np.float32)
-    center = 0.5 * (bbox[:3] + bbox[3:6])
-    scale  = float(np.max(0.5 * (bbox[3:6] - bbox[:3])))
-    pts_unit = (pts_world - center) / scale
-    inside = np.all(np.abs(pts_unit) < 1.1, axis=1)
-    print(f"  [pts] {inside.sum()}/{len(pts_unit)} inside ±1.1 bbox-normalised cube")
+    if _find_epfl_strecha_urd(scene) is not None:
+        pts_unit = pts_world
+        inside = np.all(np.abs(pts_unit) < 1.5, axis=1)
+        print(f"  [pts] {inside.sum()}/{len(pts_unit)} inside ±1.5 EPFL-normalised cube")
+    else:
+        bbox = np.loadtxt(scene / "bbox.txt", dtype=np.float32)
+        center = 0.5 * (bbox[:3] + bbox[3:6])
+        scale  = float(np.max(0.5 * (bbox[3:6] - bbox[:3])))
+        pts_unit = (pts_world - center) / scale
+        inside = np.all(np.abs(pts_unit) < 1.1, axis=1)
+        print(f"  [pts] {inside.sum()}/{len(pts_unit)} inside ±1.1 bbox-normalised cube")
     pts_unit = pts_unit[inside]
 
     if args.save_sfm_points:

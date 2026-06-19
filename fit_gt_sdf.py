@@ -462,6 +462,13 @@ def main() -> None:
     ap.add_argument("--lipschitz-mode", choices=["none", "uniform", "per_band"],
                     default=mc.lipschitz_mode,
                     help="rescale PE so γ is 1-Lipschitz; 'per_band' recommended for SDFs")
+    ap.add_argument("--target-scale", type=float, default=1.0,
+                    help="fit f ~= target_scale * SDF_gt (f/target_scale ~= SDF_gt). "
+                         ">1 demands |grad f|>1 from a 1-Lipschitz net -> should fail.")
+    ap.add_argument("--output-div", type=float, default=1.0,
+                    help="fit model(gamma(x))/output_div ~= SDF_gt. With raw PE this "
+                         "is the (f.gamma)/lambda 1-Lipschitz construction; set "
+                         "output_div = lambda_L = sqrt((4^L+2)/3). Target stays plain d.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--results-csv", type=Path, default=None,
                     help="append a one-line config+metrics row to this CSV")
@@ -553,6 +560,15 @@ def main() -> None:
     near_sdf = torch.from_numpy(data["near_sdf"][ok_near]).to(device)
     vol      = torch.from_numpy(data["vol"][ok_vol]).to(device)
     vol_sdf  = torch.from_numpy(data["vol_sdf"][ok_vol]).to(device)
+    # --target-scale c asks the net to fit c * SDF_gt (i.e. f/c ~= SDF_gt). The zero
+    # set is unchanged (c*0 = 0, so MC level stays 0), but the slope demand becomes
+    # |grad f| = c: a probe of whether the 1-Lipschitz net can represent a c-Lip
+    # field. c > 1 should be impossible by construction.
+    if args.target_scale != 1.0:
+        near_sdf = near_sdf * args.target_scale
+        vol_sdf  = vol_sdf  * args.target_scale
+        print(f"target-scale: fitting f ~= {args.target_scale:g} * SDF_gt "
+              f"(demanded |grad f| = {args.target_scale:g}; net is 1-Lipschitz)")
     print(f"near={len(near):,} vol={len(vol):,} device={device}")
 
     f = make_model(hidden=args.hidden, depth=args.depth, group_size=args.group_size,
@@ -621,7 +637,11 @@ def main() -> None:
         y = torch.cat([near_sdf[ni], vol_sdf[vi]], dim=0)
 
         with amp_ctx():
-            pred = f_train(x)     # train f.forward directly; f.sdf = f/K_PE used only in sphere tracing
+            # --output-div L: pred = model(gamma(x)) / L. With raw PE, model(gamma(x))
+            # is L-Lipschitz in world space, so pred is 1-Lipschitz and is fit to the
+            # plain SDF d. Tests whether a PE-normalized (output-divided) 1-Lipschitz
+            # field can represent d. Zero set {pred=0} = {model=0}, unchanged by /L.
+            pred = f_train(x) / args.output_div
             loss = F.l1_loss(pred, y)
 
         opt.zero_grad(set_to_none=True)
@@ -633,9 +653,9 @@ def main() -> None:
             with torch.no_grad():
                 ni_eval = torch.randint(0, len(near), (min(8192, len(near)),), device=device)
                 vi_eval = torch.randint(0, len(vol), (min(8192, len(vol)),), device=device)
-                pred_near = f(near[ni_eval])
+                pred_near = f(near[ni_eval]) / args.output_div
                 gt_near = near_sdf[ni_eval]
-                pred_vol = f(vol[vi_eval])
+                pred_vol = f(vol[vi_eval]) / args.output_div
                 gt_vol = vol_sdf[vi_eval]
                 near_l1 = (pred_near - gt_near).abs().mean().item()
                 vol_l1 = (pred_vol - gt_vol).abs().mean().item()
@@ -650,6 +670,20 @@ def main() -> None:
     save_ckpt(args.steps)
     print(f"saved checkpoint -> {ckpt_path}")
     save_loss_plot(history, args.out_dir / "loss.png")
+    # Final L1 metrics (in SDF units): average the last few logged evals to denoise.
+    import json as _json
+    tail = history[-5:] if len(history) >= 5 else history
+    final_metrics = {
+        "final_step": history[-1][0] if history else 0,
+        "near_l1": float(np.mean([h[2] for h in tail])),
+        "vol_l1":  float(np.mean([h[3] for h in tail])),
+        "total_l1": float(np.mean([h[1] for h in tail])),
+        "output_div": args.output_div,
+        "target_scale": args.target_scale,
+    }
+    (args.out_dir / "metrics.json").write_text(_json.dumps(final_metrics, indent=2))
+    print(f"final L1  near={final_metrics['near_l1']:.6f}  "
+          f"vol={final_metrics['vol_l1']:.6f}  total={final_metrics['total_l1']:.6f}")
     pred_mesh_path = args.out_dir / "pred_mesh.ply"
     n_verts, n_faces = save_mc_mesh(f, pred_mesh_path, args.bound, args.mc_res, device)
     if not args.sweep:

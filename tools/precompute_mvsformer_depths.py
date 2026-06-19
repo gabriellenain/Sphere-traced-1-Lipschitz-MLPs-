@@ -20,6 +20,11 @@ import numpy as np
 from PIL import Image
 from scipy.linalg import rq
 
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from lip_tracer.data import _find_epfl_strecha_urd, load_views  # noqa: E402
+
 
 MVSF_REPO = Path(os.environ.get(
     "MVSFORMER_REPO", Path.home() / "scratch" / "MVSFormerPlusPlus"))
@@ -83,6 +88,8 @@ def stage_scene(scene: Path, scan_name: str, staging: Path, n_src: int,
         _stage_blender(scene, scan_name, staging, n_src)
     elif (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
         _stage_tnt(scene, scan_name, staging, n_src)
+    elif _find_epfl_strecha_urd(scene) is not None:
+        _stage_epfl_strecha(scene, scan_name, staging, n_src)
     else:
         _stage_idr(scene, scan_name, staging, n_src)
 
@@ -229,6 +236,43 @@ def _stage_tnt(scene: Path, scan_name: str, staging: Path, n_src: int) -> None:
     (scan_dir / "pair.txt").write_text(_build_pair_txt(centers, n_src))
     (scan_dir / "view_names.txt").write_text("\n".join(view_names) + "\n")
     print(f"[stage tnt] {staged} train views → {scan_dir}", flush=True)
+
+
+def _stage_epfl_strecha(scene: Path, scan_name: str, staging: Path, n_src: int) -> None:
+    urd = _find_epfl_strecha_urd(scene)
+    if urd is None:
+        raise FileNotFoundError(f"no EPFL *_dense/urd directory found under {scene}")
+    image_paths = sorted(p for p in urd.glob("*.png") if not p.name.startswith("._"))
+    if not image_paths:
+        raise FileNotFoundError(f"no EPFL images under {urd}")
+
+    views = load_views(scene, down=1)
+    c2w_all = views["c2w"].numpy().astype(np.float64)
+    K_all = views["K"].numpy().astype(np.float64)
+
+    scan_dir = staging / scan_name
+    (scan_dir / "images").mkdir(parents=True, exist_ok=True)
+    (scan_dir / "cams").mkdir(parents=True, exist_ok=True)
+
+    centers = []
+    num_depth = 192
+    for i, ip in enumerate(image_paths):
+        c2w = c2w_all[i]
+        cam_center = c2w[:3, 3]
+        R = c2w[:3, :3].T
+        t = -R @ cam_center
+        centers.append(cam_center)
+        d_min, d_interval = _depth_range_from_cube(R, t, bound=1.5,
+                                                   num_depth=num_depth)
+        _write_cam(scan_dir / "cams" / f"{i:08d}_cam.txt", K_all[i], R, t,
+                   d_min, d_interval, num_depth)
+        Image.open(ip).convert("RGB").save(scan_dir / "images" / f"{i:08d}.jpg",
+                                           quality=95)
+
+    centers = np.stack(centers)
+    (scan_dir / "pair.txt").write_text(_build_pair_txt(centers, n_src))
+    (scan_dir / "view_names.txt").write_text("\n".join(p.name for p in image_paths) + "\n")
+    print(f"[stage epfl] {len(image_paths)} views → {scan_dir}", flush=True)
 
 
 def main() -> None:

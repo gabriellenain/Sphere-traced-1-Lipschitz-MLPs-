@@ -24,7 +24,20 @@ import imageio.v2 as imageio
 
 
 def read_points3d_full(path: Path):
-    """Return dict with xyz (N,3), err (N,), track_len (N,)."""
+    """Return dict with xyz (N,3), err (N,), track_len (N,).
+
+    Accepts either a COLMAP ``points3D.bin`` (with per-point reprojection
+    error and track length) or a plain-text ``N x 3`` xyz file already in the
+    pose/unit frame (e.g. ``sparse_sfm_points.txt``); the latter has no
+    error/track info, so those filters are disabled (err=0, track=inf).
+    """
+    if path.suffix != ".bin":
+        xyz = np.loadtxt(path, dtype=np.float32).reshape(-1, 3)
+        return {
+            "xyz":  xyz,
+            "err":  np.zeros(len(xyz), dtype=np.float32),
+            "tlen": np.full(len(xyz), 1 << 30, dtype=np.int32),
+        }
     xyz, err, tlen = [], [], []
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]

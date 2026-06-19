@@ -27,6 +27,7 @@ from .loss import (photo_loss, idr_mask_loss, mask_loss_min_sdf, dvr_mask_loss, 
 from .model import FTheta, ConvexPotentialLayer, NeuSMLP, make_model
 from .profile import StepProfiler, MemorySnapshot, dump_static_accounting
 from .sphere_tracing import trace_unrolled, trace_idr, trace_nograd, get_last_trace_stats
+from .bundle_adjustment import InLoopBundleAdjuster
 
 
 def _image_grad_ray_weights(det: dict, H_d: int, W_d: int) -> torch.Tensor:
@@ -142,6 +143,34 @@ def load_config_json(path: Path) -> Config:
         scene=Path(data.get("scene", SCENE)),
         out_dir=Path(data.get("out_dir", OUT_DIR)),
     )
+
+
+def _regen_det_rays(det: dict, c2w: torch.Tensor, K: torch.Tensor) -> None:
+    """Rebuild det['o']/['d'] (primary rays) in place from refined poses.
+
+    When in-loop BA moves the cameras, the precomputed primary rays (built once
+    from the calibrated poses) go stale: the reprojection uses the live w2c, but
+    the SOURCE rays that trace the surface would still sit at the old poses —
+    an inconsistent half-update that stops BA from reshaping geometry. We recom-
+    pute (o, d) from the stored pixel coords (det['px'], det['py'], det['vi'])
+    and the refined c2w/K, preserving fg/gt labels and the fg/bg sampling tables
+    (same pixels, so their fg membership is unchanged). Per-view to bound memory.
+    """
+    px, py, vi = det["px"], det["py"], det["vi"]      # CPU, length V*H_d*W_d
+    c2w_c, K_c = c2w.detach().cpu().float(), K.detach().cpu().float()
+    o_out = torch.empty_like(det["o"])
+    d_out = torch.empty_like(det["d"])
+    for v in vi.unique().tolist():
+        m  = vi == v
+        Kv, cw = K_c[v], c2w_c[v]
+        x = (px[m] - Kv[0, 2]) / Kv[0, 0]
+        y = (py[m] - Kv[1, 2]) / Kv[1, 1]
+        d_cam = torch.stack([x, y, torch.ones_like(x)], dim=-1)
+        dw = d_cam @ cw[:3, :3].T
+        dw = dw / dw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        d_out[m] = dw
+        o_out[m] = cw[:3, 3]
+    det["o"], det["d"] = o_out, d_out
 
 
 # ---------- initialisations ----------
@@ -698,7 +727,7 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
     H_full = views["H"]; W_full = views["W"]
     ids    = [int(round(i * (V - 1) / 2)) for i in range(3)]
     # 4th view: camera most opposite to view 0 (back of the object)
-    cam_positions = views["c2w"][:, :3, 3].numpy()  # (V, 3)
+    cam_positions = views["c2w"][:, :3, 3].cpu().numpy()  # (V, 3)
     dir0 = cam_positions[ids[0]] / (np.linalg.norm(cam_positions[ids[0]]) + 1e-6)
     dots = (cam_positions / (np.linalg.norm(cam_positions, axis=-1, keepdims=True) + 1e-6)) @ dir0
     back_id = int(np.argmin(dots))
@@ -711,8 +740,8 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
 
     imgs_phong, imgs_color, imgs_hit, crop_boxes = [], [], [], []
     for vi in ids:
-        K   = views["K"][vi].numpy()
-        c2w = views["c2w"][vi].numpy()
+        K   = views["K"][vi].cpu().numpy()
+        c2w = views["c2w"][vi].cpu().numpy()
         ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
         xs_f = (xs + 0.5) * down - 0.5; ys_f = (ys + 0.5) * down - 0.5
         d_cam = np.stack([(xs_f - K[0,2]) / K[0,0],
@@ -2453,6 +2482,12 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- data ---
+    # Controls whether load_views() zeroes the RGB background via the dataset
+    # mask. Set before any load so a truly mask-free run keeps real backgrounds.
+    from . import data as _data
+    _data.BAKE_BACKGROUND = train_cfg.bake_background
+    if not train_cfg.bake_background:
+        print("  [mask-free] keeping real photographed background (no img[~msk]=0 bake)")
     if train_cfg.use_blender:
         if view_keep is not None:
             raise NotImplementedError("view_keep not supported for Blender scenes")
@@ -2905,6 +2940,28 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 for _ in range(start_step):
                     scheduler.step()
         print(f"  [resume] continuing from step {start_step} / {train_cfg.steps}")
+
+    # --- in-loop bundle adjustment (interleaved φ-blocks) --------------------
+    # When enabled, refine poses DURING training: the main loop is the θ phase
+    # and every bundle.interval steps (after bundle.warmup_steps) we inject one
+    # φ-block, then sync the refined poses into the training tensors below.
+    inloop_ba = None
+    if train_cfg.bundle.in_loop:
+        if train_cfg.use_blender:
+            print("  [inloop-BA] disabled — Blender scenes have GT poses (nothing to refine)")
+        else:
+            inloop_ba = InLoopBundleAdjuster(f, views, train_cfg, trace_cfg, device,
+                                             images_dev=images)
+            if _resume_ckpt is not None and "inloop_ba" in _resume_ckpt:
+                inloop_ba.load_state_dict(_resume_ckpt["inloop_ba"])
+                # re-apply the refined poses the run was training against
+                c2w_all     = inloop_ba.current_c2w().to(c2w_all.dtype)
+                origins_all = c2w_all[:, :3, 3]
+                w2c_all     = torch.linalg.inv(c2w_all)
+                z_cams_all  = c2w_all[:, :3, 2]
+                views["c2w"] = c2w_all
+                _regen_det_rays(det, c2w_all, K_all)
+
     best_score        = float("inf"); best_step = -1
     best_photo_score  = float("inf")
     best_loss_score   = float("inf")
@@ -2922,12 +2979,23 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     # ─── profile: static accounting + always-on per-phase timing ─────────────
     _prof_dir = run_dir / "profile"
     dump_static_accounting(_prof_dir, f, model_cfg, train_cfg, trace_cfg)
-    prof = StepProfiler(_prof_dir, flush_every=1000, rays_per_step=train_cfg.batch)
+    prof = StepProfiler(_prof_dir, flush_every=1000, rays_per_step=train_cfg.batch,
+                        enabled=train_cfg.profile)
     mem_snap = MemorySnapshot(_prof_dir, at_step=max(start_step + 50, 200))
 
     # ------------------------------------------------------------------ loop --
     for step in range(start_step, train_cfg.steps):
         prof.step_begin()
+        # --- step-0 checkpoint: post-init weights BEFORE any optimization, so the
+        #     pre-erosion ("before") state is recoverable for hole diagnostics ---
+        if step == 0:
+            step0_out = ckpt_dir / "checkpoint_step_000000.pt"
+            torch.save({"f": f.state_dict(), "step": 0,
+                        "architecture": f.architecture, "group_size": f.group_size,
+                        "depth": f.depth, "activation": f.activation,
+                        "input_encoding": f.input_encoding,
+                        "multires": f.multires}, step0_out)
+            print(f"  [ckpt] saved step-0 (post-init) checkpoint → {step0_out.name}", flush=True)
         parts = []
         if _vsel == "arccos":
             # One reference view per step (IDR/NeuS-style): pick a single camera
@@ -3039,12 +3107,14 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 hit_bg=hit_bg if trace_cfg.bsphere_radius > 0 else None,
                 w_ncc_normal=train_cfg.w_ncc_normal,
                 ncc_topk=train_cfg.ncc_topk,
+                ncc_abs_tau=getattr(train_cfg, "ncc_abs_tau", -1.0),
                 ncc_color=train_cfg.ncc_color,
                 ncc_grad_alpha=train_cfg.ncc_grad_alpha,
                 ncc_normal_patch=train_cfg.ncc_normal_patch,
                 ncc_normal_half_pix=train_cfg.ncc_normal_half_pix,
                 ncc_patch_wsigma=_eff_wsigma,
                 ncc_patch_bilateral_gamma=_eff_bgamma,
+                ncc_world_patch=getattr(train_cfg, "ncc_world_patch", -1.0),
                 trace_cfg=trace_cfg,
                 prof=prof,
             )
@@ -3210,6 +3280,32 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         prof.step_end(step)
         mem_snap.tick(step)
 
+        # --- in-loop BA: inject a φ-block, then sync refined poses --------------
+        # The φ-block refines the cameras against the *current* geometry (θ frozen
+        # inside it); we then overwrite the pose tensors the θ-loop reads so the
+        # next steps train against the corrected poses. alt_nn (neighbour topology)
+        # is left unchanged — BA pose deltas are sub-degree, so the nearest-view
+        # sets are stable; the reprojection itself uses the refreshed w2c_all.
+        if inloop_ba is not None:
+            _ba = inloop_ba.step(f, step)
+            if _ba is not None:
+                c2w_all     = inloop_ba.current_c2w().to(c2w_all.dtype)
+                origins_all = c2w_all[:, :3, 3]
+                w2c_all     = torch.linalg.inv(c2w_all)
+                z_cams_all  = c2w_all[:, :3, 2]
+                views["c2w"] = c2w_all
+                # rebuild the precomputed PRIMARY rays so source rays move with φ
+                _regen_det_rays(det, c2w_all, K_all)
+                print(f"  [inloop-BA@{step}] block {_ba['block']} ({train_cfg.bundle.block_phi} φ-steps)  "
+                      f"E={_ba['E']:.4f} ncc={_ba['ncc']:.3f} kept={_ba['kept']:.2f}  "
+                      f"|Δφ|rot={_ba['rot_deg']:.4f}° trans={_ba['trans']:.3e}  "
+                      f"lr_scale={_ba['lr_scale']:.2f}", flush=True)
+                if use_wandb:
+                    wandb.log({"inloop_ba/E": _ba["E"], "inloop_ba/ncc": _ba["ncc"],
+                               "inloop_ba/rot_deg": _ba["rot_deg"],
+                               "inloop_ba/trans": _ba["trans"],
+                               "inloop_ba/lr_scale": _ba["lr_scale"]}, step=step)
+
         # --- periodic latest checkpoint (atomic, includes opt/scheduler for preemption) ---
         if step > 0 and step % LATEST_FREQ == 0:
             _ckpt_payload = {"f": f.state_dict(), "step": step,
@@ -3219,6 +3315,8 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                              "multires": f.multires,
                              "opt": opt.state_dict(),
                              "scheduler": scheduler.state_dict()}
+            if inloop_ba is not None:
+                _ckpt_payload["inloop_ba"] = inloop_ba.state_dict()
             tmp = LATEST_OUT.with_suffix(".pt.tmp")
             torch.save(_ckpt_payload, tmp)
             tmp.replace(LATEST_OUT)
@@ -3657,6 +3755,11 @@ if __name__ == "__main__":
                     help="use dataset masks for fg/bg sampling and photo-loss gates "
                          f"(default {_tc.use_masks}; --no-use-masks ignores them, "
                          "and overrides the value in --config)")
+    ap.add_argument("--bake-background", action=argparse.BooleanOptionalAction, default=None,
+                    help="zero the RGB background via the dataset mask at load "
+                         f"(default {_tc.bake_background}; --no-bake-background keeps the "
+                         "real photographed background → a TRULY mask-free run, no "
+                         "silhouette leak into the photo loss; overrides --config)")
     ap.add_argument("--grad-weighted-sampling", action="store_true",
                     default=_tc.grad_weighted_sampling,
                     help="sample fg rays ∝ image-gradient magnitude (fine-detail focus)")
@@ -3787,6 +3890,11 @@ if __name__ == "__main__":
                     help="PMVS patch side P (PxP sample grid)")
     ap.add_argument("--ncc-half-pix", type=float, default=_tc.ncc_half_pix,
                     help="PMVS patch half-width in reference-view pixels")
+    ap.add_argument("--ncc-world-patch", type=float, default=_tc.ncc_world_patch,
+                    help="object-fixed patch footprint in WORLD units (full grid "
+                         "span). >0 → constant metric footprint, view-independent "
+                         "(overrides --ncc-half-pix sizing). <0 → legacy per-view "
+                         "sizing. e.g. Ignatius 8mm @0.883 m/unit ≈ 0.009")
     ap.add_argument("--ncc-normal-patch", type=int, default=_tc.ncc_normal_patch,
                     help="normal-branch patch P (<0 → share --ncc-patch); the "
                          "normal-branch ZNCC leverage scales with patch extent, "
@@ -3800,6 +3908,10 @@ if __name__ == "__main__":
                     help="0: mean over all valid alt views; >0: per-point top-K "
                          "best ZNCC across the n_alt pool (robust MVS, use 3-4 "
                          "with n_alt~10)")
+    ap.add_argument("--ncc-abs-tau", type=float, default=_tc.ncc_abs_tau,
+                    help=">=0: fixed-batch NCC reward -(1/|B|)Σ H_i(z_i-tau); tau is "
+                         "an absolute keep/carve bar in the loss VALUE (not a gate; "
+                         "ncc_min ignored). <0: legacy kept-mean loss")
     ap.add_argument("--ncc-color", type=str, default=_tc.ncc_color,
                     choices=["gray", "rgb"],
                     help="ZNCC on Rec.601 luminance (gray, DTU default) or "
@@ -4055,6 +4167,12 @@ if __name__ == "__main__":
             # config's own `steps` would silently win.
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, steps=args.steps))
+        if args.down != _tc.down:
+            # Honour an explicit --down on the --config path (same pattern as --steps).
+            # Without this the config's own `down` silently wins, so --down 2 is a no-op
+            # and the full-res deterministic ray set (H*W*V) OOMs on many-view scenes.
+            run_cfg = dataclasses.replace(
+                run_cfg, train=dataclasses.replace(run_cfg.train, down=args.down))
         if args.profile:
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, profile=True))
@@ -4064,6 +4182,9 @@ if __name__ == "__main__":
         if args.use_masks is not None:
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, use_masks=args.use_masks))
+        if args.bake_background is not None:
+            run_cfg = dataclasses.replace(
+                run_cfg, train=dataclasses.replace(run_cfg.train, bake_background=args.bake_background))
         # view/sampling overrides on the --config path (same `!= default` pattern as --steps)
         if args.view_selection != _tc.view_selection:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
@@ -4074,6 +4195,12 @@ if __name__ == "__main__":
         if args.fg_fraction != _tc.fg_fraction:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, fg_fraction=args.fg_fraction))
+        if args.ncc_abs_tau != _tc.ncc_abs_tau:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, ncc_abs_tau=args.ncc_abs_tau))
+        if args.w_geo_sdf != _tc.w_geo_sdf:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, w_geo_sdf=args.w_geo_sdf))
         if args.force_fg_bg_split != _tc.force_fg_bg_split:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, force_fg_bg_split=args.force_fg_bg_split))
@@ -4125,6 +4252,7 @@ if __name__ == "__main__":
                 profile=args.profile,
                 compile=(_tc.compile if args.compile is None else args.compile),
                 use_masks=(_tc.use_masks if args.use_masks is None else args.use_masks),
+                bake_background=(_tc.bake_background if args.bake_background is None else args.bake_background),
                 grad_weighted_sampling=args.grad_weighted_sampling,
                 grad_sampling_alpha=args.grad_sampling_alpha,
                 fg_fraction=args.fg_fraction,
@@ -4137,7 +4265,9 @@ if __name__ == "__main__":
                 w_ncc=args.w_ncc, w_ncc_normal=args.w_ncc_normal,
                 ncc_patch=args.ncc_patch,
                 ncc_half_pix=args.ncc_half_pix, ncc_min=args.ncc_min,
+                ncc_world_patch=args.ncc_world_patch,
                 ncc_topk=args.ncc_topk,
+                ncc_abs_tau=args.ncc_abs_tau,
                 ncc_color=args.ncc_color,
                 ncc_grad_alpha=args.ncc_grad_alpha,
                 ncc_normal_patch=args.ncc_normal_patch,

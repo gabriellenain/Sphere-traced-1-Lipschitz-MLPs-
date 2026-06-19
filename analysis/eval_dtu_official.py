@@ -1048,16 +1048,17 @@ def _render_error_png_camview(pred: np.ndarray, gt: np.ndarray,
 
     # right column : histograms (rows 0,1) + stats text (row 2)
     BINS = 120
+    # Full distance arrays for hist + stat lines (mean == reported acc/comp).
     for ax_col, (d, color, label, mean_v) in enumerate([
-        (acc_s,  "#00c8ff", "Accuracy",     acc),
-        (comp_s, "#ff9900", "Completeness", comp),
+        (acc_dist,  "#00c8ff", "Accuracy",     acc),
+        (comp_dist, "#ff9900", "Completeness", comp),
     ]):
         ax = fig.add_subplot(gs[ax_col, 1], facecolor=BG)
         clip = min(float(d.max()), vm * 3)
         bins = np.linspace(0, clip, BINS)
         ax.hist(d[d <= clip], bins=bins, color=color, alpha=0.75, density=True)
         for v_, ls, lbl in [
-            (float(d.mean()), "--", f"mean {d.mean():.2f}"),
+            (float(mean_v), "--", f"mean {mean_v:.2f}"),
             (float(np.median(d)), ":", f"p50  {np.median(d):.2f}"),
             (float(np.percentile(d, 90)), "-.", f"p90  {np.percentile(d,90):.2f}"),
         ]:
@@ -1079,8 +1080,8 @@ def _render_error_png_camview(pred: np.ndarray, gt: np.ndarray,
     ax_txt.text(0.05, 0.95,
         f"camera view {view}\n\n"
         f"accuracy     {acc:.4f}\ncompleteness {comp:.4f}\nchamfer      {chamfer:.4f}\n\n"
-        f"acc  p50  {float(np.median(acc_s)):.3f}\nacc  p90  {float(np.percentile(acc_s,90)):.3f}\n"
-        f"comp p50  {float(np.median(comp_s)):.3f}\ncomp p90  {float(np.percentile(comp_s,90)):.3f}\n\n"
+        f"acc  p50  {float(np.median(acc_dist)):.3f}\nacc  p90  {float(np.percentile(acc_dist,90)):.3f}\n"
+        f"comp p50  {float(np.median(comp_dist)):.3f}\ncomp p90  {float(np.percentile(comp_dist,90)):.3f}\n\n"
         f"pred pts  {len(pred):,}\ngt   pts  {len(gt):,}\nvmax      {vm:.2f} mm\n"
         f"protocol  ObsMask+Plane" + hc_lines,
         transform=ax_txt.transAxes, fontsize=9, va="top", ha="left",
@@ -1173,16 +1174,19 @@ def _render_error_png(pred: np.ndarray, gt: np.ndarray,
             _dark_legend(ax, markerscale=8, loc="upper right", framealpha=0.3)
 
     BINS = 120
+    # Histogram + stat lines use the FULL distance arrays (acc_dist/comp_dist),
+    # not the subsampled scatter sets, so the mean line equals the reported
+    # acc/comp exactly. mean_v IS the reported value (mean over the same set).
     for ax_col, (d, color, label, mean_v) in enumerate([
-        (acc_s,  "#00c8ff", "Accuracy",     acc),
-        (comp_s, "#ff9900", "Completeness", comp),
+        (acc_dist,  "#00c8ff", "Accuracy",     acc),
+        (comp_dist, "#ff9900", "Completeness", comp),
     ]):
         ax = fig.add_subplot(gs[ax_col, 3], facecolor=BG)
         clip = min(float(d.max()), vm * 3)
         bins = np.linspace(0, clip, BINS)
         ax.hist(d[d <= clip], bins=bins, color=color, alpha=0.75, density=True)
         for v, ls, lbl in [
-            (float(d.mean()), "--", f"mean {d.mean():.2f}"),
+            (float(mean_v), "--", f"mean {mean_v:.2f}"),
             (float(np.median(d)), ":", f"p50  {np.median(d):.2f}"),
             (float(np.percentile(d, 90)), "-.", f"p90  {np.percentile(d,90):.2f}"),
         ]:
@@ -1203,8 +1207,8 @@ def _render_error_png(pred: np.ndarray, gt: np.ndarray,
                     f"hc pts       {n_hc:,}  (top {curv_top*100:.0f}%)")
     ax_txt.text(0.05, 0.95,
         f"accuracy     {acc:.4f}\ncompleteness {comp:.4f}\nchamfer      {chamfer:.4f}\n\n"
-        f"acc  p50  {float(np.median(acc_s)):.3f}\nacc  p90  {float(np.percentile(acc_s,90)):.3f}\n"
-        f"comp p50  {float(np.median(comp_s)):.3f}\ncomp p90  {float(np.percentile(comp_s,90)):.3f}\n\n"
+        f"acc  p50  {float(np.median(acc_dist)):.3f}\nacc  p90  {float(np.percentile(acc_dist,90)):.3f}\n"
+        f"comp p50  {float(np.median(comp_dist)):.3f}\ncomp p90  {float(np.percentile(comp_dist,90)):.3f}\n\n"
         f"pred pts  {len(pred):,}\ngt   pts  {len(gt):,}\nvmax      {vm:.2f} mm\n"
         f"protocol  ObsMask+Plane" + hc_lines,
         transform=ax_txt.transAxes, fontsize=9, va="top", ha="left",
@@ -1839,38 +1843,55 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[nθ]  skipped analytic normals: {e}", flush=True)
 
-    # NN distances — filtered EXACTLY like the official DTUeval Chamfer so the
-    # error map and τ-curve are coherent with the reported acc/comp:
-    #   accuracy     : ObsMask-filtered pred → ObsMask-only GT (gt_obs)
-    #   completeness : ObsMask+Plane GT (gt_above) → full pred
+    # ── Figure distances: the EXACT per-point distances DTUeval-python used ────
+    # Loaded from the npy that eval.py dumps, so the chamfer-error histograms
+    # reproduce the reported acc/comp by construction (same 0.2 mm-downsampled,
+    # ObsMask/plane-filtered, max_dist-capped point sets) — NOT a separate,
+    # sparser in-script KD-tree (which inflated completeness via pred sparsity).
+    md = float(np.load(out_dir / "max_dist.npy"))
+    fig_acc_pts  = np.load(out_dir / "pts_d2s.npy")
+    fig_acc_dist = np.load(out_dir / "dist_d2s.npy")
+    fig_comp_pts  = np.load(out_dir / "pts_s2d.npy")
+    fig_comp_dist = np.load(out_dir / "dist_s2d.npy")
+    # The reported means are taken over distances < max_dist; restrict the
+    # figure point sets identically so each histogram's mean == reported value.
+    _ak = fig_acc_dist < md
+    _ck = fig_comp_dist < md
+    fig_acc_pts,  fig_acc_dist  = fig_acc_pts[_ak],  fig_acc_dist[_ak]
+    fig_comp_pts, fig_comp_dist = fig_comp_pts[_ck], fig_comp_dist[_ck]
+    print(f"[fig]  official DTUeval distances: "
+          f"acc {len(fig_acc_dist):,} pts (mean {fig_acc_dist.mean():.4f}), "
+          f"comp {len(fig_comp_dist):,} pts (mean {fig_comp_dist.mean():.4f})",
+          flush=True)
+
+    _render_error_png(fig_acc_pts, fig_comp_pts, acc, comp, scan_id,
+                      out_dir / "chamfer_error.png",
+                      coverage=coverage, nc=nc, n_hc=n_hc,
+                      curv_top=args.curv_top, curv_thresh=args.curv_thresh,
+                      acc_dist=fig_acc_dist, comp_dist=fig_comp_dist, rot=rot)
+
+    if args.error_view is not None and args.scene is not None:
+        _render_error_png_camview(
+            fig_acc_pts, fig_comp_pts, acc, comp, scan_id,
+            out_dir / f"chamfer_error_view{args.error_view:03d}.png",
+            args.scene, args.error_view,
+            acc_dist=fig_acc_dist, comp_dist=fig_comp_dist,
+            coverage=coverage, nc=nc, n_hc=n_hc,
+            curv_top=args.curv_top, curv_thresh=args.curv_thresh)
+
+    _render_worst_png(fig_acc_pts, fig_comp_pts, fig_acc_dist, fig_comp_dist,
+                      acc, comp, scan_id, out_dir / "worst10_error.png", rot=rot)
+
+    # ── Per-pred-point diagnostics (worst-acc cloud + bad-point camera study) ──
+    # These need pred normals + the full pred sampling, so they keep the
+    # in-script ObsMask-filtered pred→GT distance (a per-point diagnostic, not a
+    # reported metric).
     from scipy.spatial import cKDTree
     obs, BB, Res = obs_params
     _obs_keep = _obs_inbound(pred_pts, obs, BB, Res)
     pred_obs = pred_pts[_obs_keep]
     pred_obs_normals = pred_normals[_obs_keep]
-    print(f"[pred] ObsMask filter: {len(pred_pts):,} → {len(pred_obs):,} "
-          f"pred pts (accuracy); computing NN distances (acc/comp)…",
-          flush=True)
-    acc_dist  = cKDTree(gt_obs).query(pred_obs,  k=1, workers=-1)[0].astype(np.float32)
-    comp_dist = cKDTree(pred_pts).query(gt_above, k=1, workers=-1)[0].astype(np.float32)
-
-    _render_error_png(pred_obs, gt_above, acc, comp, scan_id,
-                      out_dir / "chamfer_error.png",
-                      coverage=coverage, nc=nc, n_hc=n_hc,
-                      curv_top=args.curv_top, curv_thresh=args.curv_thresh,
-                      acc_dist=acc_dist, comp_dist=comp_dist, rot=rot)
-
-    if args.error_view is not None and args.scene is not None:
-        _render_error_png_camview(
-            pred_obs, gt_above, acc, comp, scan_id,
-            out_dir / f"chamfer_error_view{args.error_view:03d}.png",
-            args.scene, args.error_view,
-            acc_dist=acc_dist, comp_dist=comp_dist,
-            coverage=coverage, nc=nc, n_hc=n_hc,
-            curv_top=args.curv_top, curv_thresh=args.curv_thresh)
-
-    _render_worst_png(pred_obs, gt_above, acc_dist, comp_dist, acc, comp,
-                      scan_id, out_dir / "worst10_error.png", rot=rot)
+    acc_dist  = cKDTree(gt_obs).query(pred_obs, k=1, workers=-1)[0].astype(np.float32)
 
     _export_error_ply(pred_obs, acc_dist, out_dir / "worst10_acc_error.ply")
 
@@ -1886,7 +1907,7 @@ def main() -> None:
                              ana_angle_deg=ana_angle_deg, ana_nc=ana_nc,
                              rot=rot)
 
-    _render_threshold_curve_png(acc_dist, comp_dist, hc_dist,
+    _render_threshold_curve_png(fig_acc_dist, fig_comp_dist, hc_dist,
                                 args.curv_thresh, scan_id,
                                 out_dir / "threshold_curve.png")
 
@@ -2002,8 +2023,8 @@ def main() -> None:
 
     # ── summary ───────────────────────────────────────────────────────────────
     theta_for_p90 = ana_angle_deg if ana_angle_deg is not None else angle_deg
-    p90_acc   = float(np.percentile(acc_dist, 90))
-    p90_comp  = float(np.percentile(comp_dist, 90))
+    p90_acc   = float(np.percentile(fig_acc_dist, 90))
+    p90_comp  = float(np.percentile(fig_comp_dist, 90))
     p90_theta = float(np.percentile(theta_for_p90, 90))
 
     print(flush=True)

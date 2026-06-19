@@ -162,7 +162,9 @@ class BundleAdjustConfig:
     phi_first:    bool  = True     # start each cycle with the φ-block
     lr:           float = 1e-5     # φ (extrinsics) learning rate
     lr_theta:     float = 1e-5     # θ (SDF) learning rate during BA — small, refinement only
-    opt_intrinsics: bool  = False  # also refine per-camera intrinsics K (fx,fy,cx,cy) in the φ-block
+    opt_intrinsics: bool  = False  # also refine intrinsics K (fx,fy,cx,cy) in the φ-block
+    shared_intrinsics: bool = False  # tie K across all views (single-camera capture, e.g. TnT);
+                                     # per-camera otherwise (multi-rig calib, e.g. DTU)
     lr_intrinsics:  float = 1e-4   # intrinsics learning rate (dimensionless delta; see CameraParams)
     batch:        int   = 0        # rays per BA step; 0 → reuse TrainConfig.batch
     ckpt_every:   int   = 1        # save a BA checkpoint every N cycles
@@ -172,6 +174,21 @@ class BundleAdjustConfig:
                                    # SDF (|∇f|≈1) when refining θ jointly with poses;
                                    # required for a sound joint BA when the run trained
                                    # with w_eikonal=0 (else θ overfits bare photo E).
+
+    # --- in-loop (interleaved) BA -------------------------------------------
+    # Instead of a post-hoc pass on a converged θ, refine poses DURING training:
+    # the main loop is the θ phase; every `interval` steps we inject one φ-block
+    # of `block_phi` steps (θ frozen) and sync the refined poses back into the
+    # training tensors. A `warmup_steps` θ-only phase first lets the carved-init
+    # normal field sharpen so the φ-gradient (which rides on n·d) is anchored;
+    # the extrinsic LR ramps in over `lr_ramp_blocks` φ-blocks to soften the
+    # early biased-normal pull. Only meaningful for weak-pose scenes (TnT / own-
+    # COLMAP); leave off for DTU (calibration already trusted). Reuses block_phi,
+    # lr, lock_first, batch from above. Independent of `enabled` (post-hoc).
+    in_loop:        bool = False   # enable interleaved φ-blocks during training
+    warmup_steps:   int  = 10000   # θ-only steps before the first φ-block
+    interval:       int  = 2000    # θ-steps between injected φ-blocks
+    lr_ramp_blocks: int  = 2       # ramp extrinsic LR to full over the first N φ-blocks
 
 
 # ----------------------------------------------------------------- train ----
@@ -196,6 +213,10 @@ class TrainConfig:
     # mask handling / ray sampling
     use_masks: bool = True          # False: ignore loaded masks during training;
                                     # no fg/bg split, no photo-mask gate
+    bake_background: bool = True     # True: zero RGB background via the dataset mask
+                                    # at load (img[~msk]=0). False: keep the real
+                                    # photographed background → a TRULY mask-free run
+                                    # (no silhouette leaks into the photo loss).
 
     # ray sampling: uniform within fg/bg strata, OR image-gradient-weighted (fg only)
     grad_weighted_sampling: bool =  False  # True: sample fg rays ∝ image-gradient
@@ -246,6 +267,13 @@ class TrainConfig:
     w_ncc_normal: float = 0.0
     ncc_patch:   int   = 5
     ncc_half_pix: float = 2.0   # PMVS patch half-width in reference-view pixels
+    # Object-fixed patch footprint (WORLD units). >0 → size the position-branch
+    # ZNCC patch to a CONSTANT surface area `ncc_world_patch` (full grid span,
+    # not half-width), independent of the reference-view distance — so the
+    # photometric low-pass is a fixed metric scale instead of 2·half_pix·z/f,
+    # which floats with GSD. <0 → legacy per-view ncc_half_pix sizing.
+    # Convert a target detail size: world = mm / (1000·scene_metres_per_unit).
+    ncc_world_patch: float = -1.0
     # Normal-branch patch geometry, decoupled from the position branch. The
     # normal-branch ZNCC leverage scales with the patch half-extent in pixels
     # (a tangent-plane tilt only differentially reshapes the patch), so it
@@ -261,6 +289,12 @@ class TrainConfig:
                                 # ZNCC-consistent): zncc←(1-α)·zncc_I+α·zncc_∇. Sharpens
                                 # the depth minimum on fine texture (feathers). ~0.3-0.5.
     ncc_min:      float = 0.0   # PMVS photometric gate: drop pairs with ZNCC below this
+    ncc_abs_tau:  float = -1.0  # ≥0: replace the kept-mean NCC loss with the fixed-batch
+                                # reward −(1/|B|)Σ H_i(z_i−τ). τ is an ABSOLUTE keep/carve
+                                # bar inside the loss value, not a selection gate: a z<τ
+                                # hit contributes negative reward (carve incentive) instead
+                                # of being filtered; deleting a z>τ hit always costs.
+                                # ncc_min is ignored in this mode. <0: legacy loss.
     ncc_topk:     int   = 0     # 0: mean (1−ZNCC) over ALL valid alt views (legacy).
                                 # >0: per-surface-point top-K best ZNCC across the n_alt
                                 # pool (robust MVS aggregation à la PMVS/COLMAP — rejects

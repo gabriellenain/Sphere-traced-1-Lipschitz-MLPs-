@@ -885,6 +885,12 @@ def main():
                          "readable); depth = full sub-pixel partition. One trace, "
                          "bits truncated per level.")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--ba-poses", type=Path, default=None,
+                    help="a bundle_adjustment ba_final.pt: override each dataset "
+                         "view's c2w with the BA-adjusted pose "
+                         "(c2w = rodrigues(log_rot)@R_base, t = t_base+dt). Renders "
+                         "the run from the cameras BA co-optimised. Pair with "
+                         "--ckpt <ba_final.pt> to also use the BA-updated f.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # --- synthesized look-at camera (not a dataset view) ---
     # Trace + dump buffers from an arbitrary orbit camera in the model's
@@ -920,6 +926,49 @@ def main():
     else:
         views = data_mod.load_views(scene, down=args.down)
     nV = int(views["images"].shape[0])
+
+    if args.ba_poses is not None:
+        # Replace calibrated c2w with the BA-adjusted extrinsics. R_base/t_base in
+        # cam_params ARE views["c2w"]'s rotation/centre (prepare_context sets
+        # c2w_base = views["c2w"]), so this stays in the model's normalized frame
+        # and is resolution-independent (pose doesn't depend on --down).
+        from lip_tracer.bundle_adjustment import rodrigues
+        ba = torch.load(args.ba_poses, map_location="cpu", weights_only=False)
+        cp = ba["cam_params"]
+        assert cp["R_base"].shape[0] == nV, \
+            f"ba cam_params V={cp['R_base'].shape[0]} != scene V={nV}"
+        log_rot = cp["log_rot"] * cp["free_mask"]
+        dt      = cp["dt"]      * cp["free_mask"]
+        R = rodrigues(log_rot) @ cp["R_base"]              # (V,3,3)
+        t = cp["t_base"] + dt                              # (V,3)
+        c2w = torch.zeros(nV, 4, 4, dtype=views["c2w"].dtype)
+        c2w[:, :3, :3] = R.to(c2w.dtype)
+        c2w[:, :3, 3]  = t.to(c2w.dtype)
+        c2w[:,  3, 3]  = 1.0
+        d0 = (views["c2w"][:, :3, 3] - t).norm(dim=-1)
+        views["c2w"] = c2w
+        print(f"[ba-poses] overrode {nV} c2w from {args.ba_poses}  "
+              f"(mean |Δcentre|={d0.mean():.4e} max={d0.max():.4e} norm units)",
+              flush=True)
+        # If BA also refined intrinsics (opt_intrinsics), apply the SAME
+        # dimensionless delta CameraParams.intrinsics() uses so the render
+        # reflects the cameras BA actually optimised, not just the extrinsics.
+        # K_base in cam_params == views["K"]; dK is (V,4) per-camera or (1,4)
+        # shared (broadcasts either way). Absent dK → extrinsics-only (legacy).
+        if "dK" in cp:
+            Kb = views["K"].clone().float()
+            fx0, fy0 = Kb[:, 0, 0].clone(), Kb[:, 1, 1].clone()
+            dK = cp["dK"].float()
+            Kb[:, 0, 0] = fx0 * dK[:, 0].exp()
+            Kb[:, 1, 1] = fy0 * dK[:, 1].exp()
+            Kb[:, 0, 2] = Kb[:, 0, 2] + dK[:, 2] * fx0
+            Kb[:, 1, 2] = Kb[:, 1, 2] + dK[:, 3] * fy0
+            views["K"] = Kb.to(views["K"].dtype)
+            print(f"[ba-poses] also applied BA intrinsics: "
+                  f"{'shared' if dK.shape[0] == 1 else 'per-camera'}  "
+                  f"mean focal scale={dK[:, :2].exp().mean():.5f}  "
+                  f"mean |Δcx,cy|={(dK[:, 2:].abs() * torch.stack([fx0, fy0], -1)).mean():.3f}px",
+                  flush=True)
     if args.views is not None:
         view_list = list(range(nV)) if args.views.strip() == "all" else \
                     [int(s) % nV for s in args.views.split(",")]

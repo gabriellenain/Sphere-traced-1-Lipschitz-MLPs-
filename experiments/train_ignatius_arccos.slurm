@@ -46,6 +46,19 @@ SOURCE_CONFIG=$REFERENCE_RUN/config.json
 SCENE=$ROOT/data/tnt/${SCENE_NAME}
 
 STEPS=${STEPS:-600000}
+# WOBJ (optional): object-fixed ZNCC patch footprint in WORLD units. When set,
+# overrides the reference run's view-fixed ncc_half_pix sizing with a constant
+# metric footprint (--ncc-world-patch). Ignatius 8mm @0.883 m/unit ≈ 0.009.
+# Unset → identical to the reference arccos run (view-fixed half_pix=2).
+WOBJ=${WOBJ:-}
+# DOWN: image downsample factor for training (overrides config train.down).
+# Per-pixel ray precompute is O(V*H*W) on CPU; for many-view full-res scenes
+# (e.g. Courthouse: 1106 views @ 1091x1958 -> ~125 GB rays) down=1 OOMs the
+# 128 GB host. DOWN=2 cuts rays/images/GPU-flats 4x; harmless for many-view TnT.
+DOWN=${DOWN:-1}
+# BA_INLOOP defined here (before RUN_DIR) so the run dir carries a BA tag.
+BA_INLOOP=${BA_INLOOP:-0}
+BA_TAG=""; [ "$BA_INLOOP" = "1" ] && BA_TAG="_bainloop"
 TNT_SCENE_NAME=$SCENE_NAME
 TNT_EVAL=${TNT_EVAL:-$ROOT/data/tnt_gt}
 TNT_OFFICIAL_FRAME=${TNT_OFFICIAL_FRAME:-colmap-pose}
@@ -72,7 +85,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MPLCONFIGDIR=/tmp/matplotlib-1lip-arccos
 
 TS=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=$OUTPUTS/run_${TS}_${SCENE_NAME}_sphere_nomask_arccos_${MODE}_${SLURM_JOB_ID}
+RUN_DIR=$OUTPUTS/run_${TS}_${SCENE_NAME}_sphere_nomask_arccos_${MODE}${WOBJ:+_wobj${WOBJ}}${BA_TAG}_${SLURM_JOB_ID}
 DERIVED_CONFIG=$RUN_DIR/source_config_arccos.json
 LOG=$RUN_DIR/train.log
 mkdir -p "$RUN_DIR" "$OUTPUTS_HOME"
@@ -87,17 +100,39 @@ ln -sfn "$RUN_DIR" "$OUTPUTS_HOME/$(basename "$RUN_DIR")"
 # hull-init target (same mechanism as Ignatius). If unset, Ignatius keeps its
 # reference grid and any other scene carves the hull in-loop.
 INIT_SDF_GRID=${INIT_SDF_GRID:-}
-python - "$SOURCE_CONFIG" "$DERIVED_CONFIG" "$STEPS" "$SCENE_NAME" "$SCENE" "$INIT_SDF_GRID" <<'PY'
+# In-loop bundle adjustment (interleaved φ-blocks during training). Default OFF;
+# set BA_INLOOP=1 to refine poses while training (weak-pose TnT scenes only).
+# BA_WARMUP : θ-only steps before the first φ-block (let normals sharpen).
+# BA_INTERVAL: θ-steps between φ-blocks.  BA_PHI: φ-steps per block.
+# BA_LR     : extrinsic learning rate.   BA_RAMP: φ-blocks to ramp LR over.
+# (BA_INLOOP defaulted above so the run dir can carry its tag.)
+BA_WARMUP=${BA_WARMUP:-10000}
+BA_INTERVAL=${BA_INTERVAL:-2000}
+BA_PHI=${BA_PHI:-200}
+BA_LR=${BA_LR:-1e-5}
+BA_RAMP=${BA_RAMP:-2}
+python - "$SOURCE_CONFIG" "$DERIVED_CONFIG" "$STEPS" "$SCENE_NAME" "$SCENE" "$INIT_SDF_GRID" \
+    "$BA_INLOOP" "$BA_WARMUP" "$BA_INTERVAL" "$BA_PHI" "$BA_LR" "$BA_RAMP" <<'PY'
 import json, sys
 from pathlib import Path
 src, dst, steps, scene_name, scene, init_grid = (
     Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]),
     sys.argv[4], sys.argv[5], sys.argv[6])
+ba_inloop, ba_warmup, ba_interval, ba_phi, ba_lr, ba_ramp = (
+    sys.argv[7] == "1", int(sys.argv[8]), int(sys.argv[9]),
+    int(sys.argv[10]), float(sys.argv[11]), int(sys.argv[12]))
 cfg = json.loads(src.read_text())
 cfg.pop("cmd", None)
 cfg["train"]["steps"] = steps
 cfg["scene"] = scene
 cfg.setdefault("eval", {})["tnt_official_scene"] = scene_name
+if ba_inloop:
+    bundle = cfg["train"].setdefault("bundle", {})
+    bundle.update({"in_loop": True, "warmup_steps": ba_warmup,
+                   "interval": ba_interval, "block_phi": ba_phi,
+                   "lr": ba_lr, "lr_ramp_blocks": ba_ramp, "lock_first": True})
+    print(f"in-loop BA: warmup={ba_warmup} interval={ba_interval} "
+          f"block_phi={ba_phi} lr={ba_lr:g} ramp={ba_ramp}")
 if cfg.get("init", {}).get("init") != "hull":
     raise SystemExit("reference run is not hull init")
 if init_grid:
@@ -117,7 +152,10 @@ PY
 # Sampling flags differ by MODE. full = original arccos recipe (changes neighbour
 # ranking AND fg/ray sampling). minimal = arccos_nn (only neighbour ranking; all
 # sampling flags inherited from the reference config, i.e. nearest-run behaviour).
-if [ "$MODE" = "minimal" ]; then
+if [ "$MODE" = "none" ]; then
+    VIEW_FLAGS=()
+    MODE_DESC="plain sphere_nomask — NO arccos, NO init-hit, NO mask (exactly the DTU sphere_nomask recipe + carved init)"
+elif [ "$MODE" = "minimal" ]; then
     VIEW_FLAGS=(--view-selection arccos_nn)
     MODE_DESC="arccos_nn — neighbour ranking ONLY (ref-view + ray sampling = nearest baseline)"
 else
@@ -125,21 +163,34 @@ else
     MODE_DESC="arccos + init-hit + fg-fraction 0.9 (2-level uniform-cam)"
 fi
 
+# Object-fixed patch footprint (optional). Unset → reference view-fixed sizing.
+WOBJ_FLAG=()
+if [ -n "$WOBJ" ]; then WOBJ_FLAG=(--ncc-world-patch "$WOBJ"); fi
+
 echo "Reference run:     $REFERENCE_RUN"
 echo "Scene:             $SCENE_NAME ($SCENE)"
 echo "Run dir:           $RUN_DIR"
 echo "Steps (from 0):    $STEPS"
+echo "Downsample:        $DOWN"
 echo "Mode:              $MODE — $MODE_DESC"
+echo "Patch sizing:      ${WOBJ:+object-fixed --ncc-world-patch $WOBJ}${WOBJ:-view-fixed (reference ncc_half_pix)}"
 echo "Official TnT eval: $TNT_SCENE_NAME every ${TNT_OFFICIAL_FREQ} steps  res=${TNT_OFFICIAL_RES}"
+if [ "$BA_INLOOP" = "1" ]; then
+  echo "In-loop BA:        ON  warmup=${BA_WARMUP} interval=${BA_INTERVAL} block_phi=${BA_PHI} lr=${BA_LR} ramp=${BA_RAMP}"
+else
+  echo "In-loop BA:        off"
+fi
 
 python -u -m lip_tracer.train \
     --config "$DERIVED_CONFIG" \
     --run-dir "$RUN_DIR" \
+    --down "$DOWN" \
     --occ-iters 32 \
     --occ-newton-steps 0 \
     --occ-eps 1e-3 \
     --no-use-masks \
     "${VIEW_FLAGS[@]}" \
+    "${WOBJ_FLAG[@]}" \
     --tnt-eval-dir "$TNT_EVAL" \
     --tnt-official-scene "$TNT_SCENE_NAME" \
     --tnt-official-frame "$TNT_OFFICIAL_FRAME" \

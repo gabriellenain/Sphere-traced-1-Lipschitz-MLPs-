@@ -3,7 +3,9 @@
 #SBATCH --output=/scratch/_projets_/willow/1-lip-tracer-new/outputs/1lip-dtu-nomask_%j.slurm.log
 #SBATCH --error=/scratch/_projets_/willow/1-lip-tracer-new/outputs/1lip-dtu-nomask_%j.slurm.log
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
+# Sphere-trace step is host-dispatch-bound (~250 tiny sequential kernels/step);
+# 2 cores get starved by noisy node neighbours (~5K vs ~12K steps/h). Give it headroom.
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --partition=gpu
@@ -31,6 +33,11 @@ SCAN=$(basename "$SCENE")
 JOB_TAG=${JOB_TAG:-${SCAN}_sphere_nomask_init}
 SOURCE_CONFIG=${SOURCE_CONFIG:-$OUTPUTS/run_20260606_142255_scan122_sphere_nomask_init_4991521/source_config_scan122_sphere_nomask_init.json}
 NEW_INIT_SDF=${NEW_INIT_SDF:-$ROOT/_diagnostics/mvsformer_${SCAN}_sphere/sphere_carve_auto_res256_nomask_clip2_close2/sdf_sphere_mvsformer_carved.npy}
+
+# BAKE_BG=0 → truly mask-free: keep the real photographed background (no img[~msk]=0
+# bake at load). Default 1 reproduces the historic "nomask supervision, baked bg" runs.
+BAKE_BG=${BAKE_BG:-1}
+if [ "$BAKE_BG" = "0" ]; then BAKE_BG_FLAG=--no-bake-background; else BAKE_BG_FLAG=--bake-background; fi
 
 DTU_EVAL_DIR=${DTU_EVAL_DIR:-/scratch/_projets_/willow/1-lip-tracer-new/data/dtu_eval/SampleSet/MVS Data}
 DTU_OFFICIAL_FREQ=${DTU_OFFICIAL_FREQ:-10000}
@@ -99,6 +106,7 @@ python -u -m lip_tracer.train \
   --occ-newton-steps 0 \
   --occ-eps 1e-3 \
   --no-use-masks \
+  $BAKE_BG_FLAG \
   --dtu-eval-dir "$DTU_EVAL_DIR" \
   --dtu-official-freq "$DTU_OFFICIAL_FREQ" \
   --dtu-official-res "$DTU_OFFICIAL_RES" \

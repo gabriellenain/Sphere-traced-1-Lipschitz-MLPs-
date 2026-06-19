@@ -24,12 +24,21 @@ import torch
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _load_model(run_dir: Path, device: str):
+def _load_model(run_dir: Path, device: str, ckpt_name: str | None = None):
     from lip_tracer.train import load_config_json
     cfg = load_config_json(run_dir / "config.json")
-    ckpt_path = run_dir / "checkpoint_best_loss.pt"
-    if not ckpt_path.exists():
-        ckpt_path = run_dir / "checkpoint_latest.pt"
+    # checkpoints may live at run root or under ckpt/
+    cands = []
+    if ckpt_name:
+        cands = [run_dir / ckpt_name, run_dir / "ckpt" / ckpt_name]
+    else:
+        for nm in ("checkpoint_best_loss.pt", "checkpoint_final.pt",
+                   "checkpoint.pt", "checkpoint_latest.pt"):
+            cands += [run_dir / nm, run_dir / "ckpt" / nm]
+    ckpt_path = next((p for p in cands if p.exists()), None)
+    if ckpt_path is None:
+        raise FileNotFoundError(f"no checkpoint found under {run_dir} (tried {[str(c) for c in cands]})")
+    print(f"[diagnose] checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     from lip_tracer.model import make_model
     mc = cfg.model
@@ -113,6 +122,513 @@ def _ray_sdf_profiles(f, o, d, t_far: float, t_steps: int, indices, device: str)
     return np.stack(profiles), ts.cpu().numpy()  # (R, T), (T,)
 
 
+# ── ICLR hypothesis figure ────────────────────────────────────────────────────
+# Two falsifiable hypotheses for the persistent back/top holes:
+#   H1 (textureless): hole pixels sit on low-image-gradient regions of the GT.
+#   H2 (grazing / low-coverage): the surface there is seen front-facing by few
+#       training cameras.
+# We quantify each per foreground pixel and split the distribution by
+# hole vs. filled, reporting a rank-AUC (Mann-Whitney) as the effect size.
+
+def _box_mean(a: np.ndarray, win: int) -> np.ndarray:
+    """Mean over a (2*win+1) square window via an integral image (no deps)."""
+    if win <= 0:
+        return a
+    H, W = a.shape
+    ii = np.zeros((H + 1, W + 1), dtype=np.float64)
+    ii[1:, 1:] = np.cumsum(np.cumsum(a.astype(np.float64), 0), 1)
+    out = np.empty_like(a, dtype=np.float64)
+    for y in range(H):
+        y0, y1 = max(0, y - win), min(H, y + win + 1)
+        for x in range(W):
+            x0, x1 = max(0, x - win), min(W, x + win + 1)
+            s = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
+            out[y, x] = s / ((y1 - y0) * (x1 - x0))
+    return out.astype(np.float32)
+
+
+def _texture_energy(gray: np.ndarray, win: int) -> np.ndarray:
+    """Local mean gradient magnitude of a grayscale image — high=textured."""
+    gy, gx = np.gradient(gray.astype(np.float32))
+    return _box_mean(np.hypot(gx, gy), win)
+
+
+def _dense_argmin_t(f, o, d, t_far: float, steps: int, device: str, chunk: int = 8192):
+    """For every ray: t and |f| at closest approach to the zero set, plus whether
+    the SDF changes sign along the ray (a zero-crossing ⇒ a surface really exists
+    there — a 'miss' on such a ray is a tracer overshoot, not deleted geometry)."""
+    ts = torch.linspace(0.0, t_far, steps, device=device)
+    N = o.shape[0]
+    t_best = torch.zeros(N); f_best = torch.full((N,), float("inf"))
+    cross = torch.zeros(N, dtype=torch.bool)
+    with torch.no_grad():
+        for i in range(0, N, chunk):
+            o_b = o[i:i + chunk]; d_b = d[i:i + chunk]
+            B = o_b.shape[0]
+            bt = torch.zeros(B, device=device)
+            ba = torch.full((B,), float("inf"), device=device)
+            has_neg = torch.zeros(B, dtype=torch.bool, device=device)
+            has_pos = torch.zeros(B, dtype=torch.bool, device=device)
+            for s in range(steps):
+                fv = f(o_b + ts[s] * d_b)
+                a = fv.abs()
+                better = a < ba
+                ba = torch.where(better, a, ba)
+                bt = torch.where(better, torch.full_like(bt, ts[s].item()), bt)
+                has_neg |= fv < 0
+                has_pos |= fv > 0
+            t_best[i:i + chunk] = bt.cpu(); f_best[i:i + chunk] = ba.cpu()
+            cross[i:i + chunk] = (has_neg & has_pos).cpu()
+    return t_best, f_best, cross
+
+
+def _normals_at(f, pts: torch.Tensor, device: str, chunk: int = 8192) -> torch.Tensor:
+    outs = []
+    for i in range(0, pts.shape[0], chunk):
+        p = pts[i:i + chunk].to(device).detach().requires_grad_(True)
+        with torch.enable_grad():
+            g = torch.autograd.grad(f(p).sum(), p)[0].detach()
+        n = g / (g.norm(dim=-1, keepdim=True) + 1e-9)
+        outs.append(n.cpu())
+    return torch.cat(outs)
+
+
+def _angular_coverage(pts: torch.Tensor, normals: torch.Tensor,
+                      c2ws_all, Ks_all, H: int, W: int, cos_thr: float):
+    """Per point, over all cameras that see it in-frame & in-front:
+      cnt    = # cameras with view·normal > cos_thr  (front-facing coverage)
+      best   = max view·normal  (1=head-on, →0=only grazing views available)
+    `best` is the grazing-severity measure; low best ⇒ surface only ever skimmed.
+    """
+    M = pts.shape[0]
+    cnt = torch.zeros(M)
+    best = torch.full((M,), -1.0)
+    for c2w_i, K_i in zip(c2ws_all, Ks_all):
+        c2w = c2w_i if torch.is_tensor(c2w_i) else torch.tensor(c2w_i, dtype=torch.float32)
+        K = torch.tensor(K_i, dtype=torch.float32) if not torch.is_tensor(K_i) else K_i.float()
+        w2c = torch.linalg.inv(c2w)
+        R, t = w2c[:3, :3], w2c[:3, 3]
+        xc = (R @ pts.T).T + t
+        z = xc[:, 2]
+        uv = (K @ xc.T).T
+        uv = uv[:, :2] / uv[:, 2:3].clamp(min=1e-6)
+        infrust = (z > 0.01) & (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        vdir = c2w[:3, 3] - pts
+        vdir = vdir / (vdir.norm(dim=-1, keepdim=True) + 1e-9)
+        cosv = (vdir * normals).sum(-1)
+        cnt += (infrust & (cosv > cos_thr)).float()
+        best = torch.where(infrust, torch.maximum(best, cosv), best)
+    return cnt.numpy(), best.numpy()
+
+
+def _erode_mask(fg2d: np.ndarray, k: int) -> np.ndarray:
+    """Binary erosion by a (2k+1) box — interior pixels only (drops silhouette edge)."""
+    if k <= 0:
+        return fg2d
+    frac = _box_mean(fg2d.astype(np.float32), k)
+    return frac >= 1.0 - 1e-6
+
+
+def _auc(pos: np.ndarray, neg: np.ndarray) -> float:
+    """Rank AUC that `pos` scores higher than `neg` (Mann-Whitney U / n_pos n_neg)."""
+    pos = pos[np.isfinite(pos)]; neg = neg[np.isfinite(neg)]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    allv = np.concatenate([pos, neg])
+    order = allv.argsort()
+    ranks = np.empty(len(allv)); ranks[order] = np.arange(1, len(allv) + 1)
+    # average ranks for ties
+    _, inv, cnts = np.unique(allv, return_inverse=True, return_counts=True)
+    sums = np.zeros(len(cnts)); np.add.at(sums, inv, ranks)
+    ranks = (sums / cnts)[inv]
+    r_pos = ranks[:len(pos)].sum()
+    return float((r_pos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
+def _median(a):
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if len(a) else float("nan")
+
+
+def _verdict(auc):
+    return ("SUPPORTS" if auc >= 0.62 else "REFUTES" if auc <= 0.38 else "no signal")
+
+
+def _view_metrics(f, cfg, v, vi: int, steps: int, cos_thr: float, tex_win: int, device: str):
+    """All per-view hole diagnostics for one camera. Returns a dict of flat
+    (Hd*Wd) maps + scalar AUC/median summaries. Shared by single- and multi-view."""
+    c2w = v["c2w"][vi].numpy(); K = v["K"][vi].numpy()
+    H, W = v["H"], v["W"]
+    img = v["images"][vi].numpy()
+    mask = v["masks"][vi].numpy() > 0.5
+    c2ws_all = [v["c2w"][i] for i in range(v["c2w"].shape[0])]
+    Ks_all   = [v["K"][i].numpy() for i in range(v["K"].shape[0])]
+
+    o, d, Hd, Wd = _make_rays(c2w, K, H, W, 1, device)
+    fg = mask[:Hd, :Wd].reshape(-1)
+
+    hit, _, _, _ = _trace_with_diagnostics(f, o, d, cfg.trace, steps, device)
+    hit = hit.numpy()
+    hole = fg & (~hit); filled = fg & hit
+
+    fg_t = torch.from_numpy(np.where(fg)[0])
+    o_fg, d_fg = o[fg_t], d[fg_t]
+    t_proxy, _, cross_fg = _dense_argmin_t(f, o_fg, d_fg, cfg.trace.t_far, steps, device)
+    pts = (o_fg.cpu() + t_proxy.unsqueeze(-1) * d_fg.cpu())
+    normals = _normals_at(f, pts, device)
+    cam_dir = torch.tensor(c2w[:3, 3], dtype=torch.float32) - pts
+    normals[(cam_dir * normals).sum(-1) < 0] *= -1
+    inc_fg = (-(d_fg.cpu() * normals).sum(-1)).clamp(-1, 1).numpy()
+    cov_fg, graze_fg = _angular_coverage(pts, normals, c2ws_all, Ks_all, H, W, cos_thr)
+
+    tex = _texture_energy(img[:Hd, :Wd].mean(-1), tex_win).reshape(-1)
+    cov = np.full(Hd * Wd, np.nan); cov[fg] = cov_fg
+    graze = np.full(Hd * Wd, np.nan); graze[fg] = graze_fg
+    inc = np.full(Hd * Wd, np.nan); inc[fg] = inc_fg
+    cross = np.zeros(Hd * Wd, dtype=bool); cross[fg] = cross_fg.numpy()
+
+    interior = _erode_mask(fg.reshape(Hd, Wd), tex_win + 2).reshape(-1)
+    hole_in = hole & interior; filled_in = filled & interior
+
+    return dict(
+        vi=vi, Hd=Hd, Wd=Wd, img=img[:Hd, :Wd], fg=fg,
+        hole_in=hole_in, filled_in=filled_in,
+        tex=tex, inc=inc, graze=graze, cov=cov, cross=cross,
+        auc_tex=_auc(-tex[hole_in], -tex[filled_in]),
+        auc_grz=_auc(-graze[hole_in], -graze[filled_in]),
+        auc_inc=_auc(-inc[hole_in], -inc[filled_in]),
+        auc_cov=_auc(-cov[hole_in], -cov[filled_in]),
+        cross_hole_frac=(float(cross[hole_in].mean()) if hole_in.sum() else float("nan")),
+        med_tex_h=_median(tex[hole_in]), med_tex_f=_median(tex[filled_in]),
+        med_inc_h=_median(inc[hole_in]), med_inc_f=_median(inc[filled_in]),
+    )
+
+
+def _plot_columns(cfg, run_dir, mets, col_titles, out, suptitle):
+    """Tile per-column hole diagnostics (rows: GT+holes / render-grazing / verdict).
+    Columns may be different views OR the same view at different checkpoints."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(mets)
+    plt.rcParams.update({"font.size": 8, "axes.titlesize": 8, "font.family": "sans-serif"})
+    fig, ax = plt.subplots(3, n, figsize=(3.3 * n, 9.4), facecolor="white", squeeze=False)
+    for j, (m, ctitle) in enumerate(zip(mets, col_titles)):
+        Hd, Wd = m["Hd"], m["Wd"]
+        holec = m["hole_in"].reshape(Hd, Wd).astype(float)
+        fg_img = m["fg"].reshape(Hd, Wd)
+
+        a = ax[0, j]
+        a.imshow(m["img"])
+        a.imshow(np.dstack([np.ones_like(holec), np.zeros_like(holec), np.zeros_like(holec), holec * 0.6]))
+        a.set_title(f"{ctitle}\n{m['hole_in'].sum():,} hole px"); a.axis("off")
+
+        a = ax[1, j]
+        incmap = np.where(fg_img, m["inc"].reshape(Hd, Wd), np.nan)
+        im = a.imshow(incmap, cmap="magma", vmin=0, vmax=1)
+        a.contour(holec, levels=[0.5], colors="cyan", linewidths=0.6)
+        fig.colorbar(im, ax=a, fraction=0.046, pad=0.02)
+        a.set_title("render incidence -d·n (0=grazing)"); a.axis("off")
+
+        a = ax[2, j]; a.axis("off")
+        txt = (
+            f"interior holes: {m['hole_in'].sum():,}\n"
+            f"surface exists: {m['cross_hole_frac']:.0%} of holes\n"
+            f"  (zero-crossing along ray)\n\n"
+            f"H1 textureless   AUC {m['auc_tex']:.2f}\n"
+            f"   [{_verdict(m['auc_tex'])}]  tex h/f "
+            f"{m['med_tex_h']:.3f}/{m['med_tex_f']:.3f}\n"
+            f"H2 cam-grazing   AUC {m['auc_grz']:.2f}\n"
+            f"   [{_verdict(m['auc_grz'])}]\n"
+            f"H2 cam-coverage  AUC {m['auc_cov']:.2f}\n"
+            f"H2 render-graze  AUC {m['auc_inc']:.2f}\n"
+            f"   [{_verdict(m['auc_inc'])}]  inc h/f "
+            f"{m['med_inc_h']:.2f}/{m['med_inc_f']:.2f}"
+        )
+        a.text(0.02, 0.98, txt, transform=a.transAxes, va="top", ha="left",
+               family="monospace", fontsize=7.5, linespacing=1.45)
+
+    fig.suptitle(suptitle, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out, dpi=200, facecolor="white")
+    plt.close(fig)
+    print(f"[iclr] saved → {out}")
+
+
+def iclr_multiview(run_dir: Path, views, down: int, steps: int,
+                   cos_thr: float, tex_win: int, out: Path, device: str,
+                   ckpt_name: str | None):
+    """Compact figure: one column per view at a single checkpoint."""
+    from lip_tracer.data import load_views
+    f, cfg = _load_model(run_dir, device, ckpt_name)
+    print(f"[iclr] loading views (down={down}) …")
+    v = load_views(cfg.scene, down=down)
+    nview = v["c2w"].shape[0]
+    views = [min(int(x), nview - 1) for x in views]
+    mets = []
+    for vi in views:
+        print(f"[iclr] view {vi} …")
+        mets.append(_view_metrics(f, cfg, v, vi, steps, cos_thr, tex_win, device))
+    suptitle = (
+        f"Back/top holes across views — {run_dir.name}\n"
+        f"input_enc={cfg.model.input_encoding}  lip_mode={cfg.model.lipschitz_mode}  "
+        f"w_eikonal={cfg.train.w_eikonal}   ·   interior-only, AUC>0.62 supports / <0.38 refutes")
+    _plot_columns(cfg, run_dir, mets, [f"view {m['vi']}" for m in mets], out, suptitle)
+    for m in mets:
+        print(f"[iclr] v{m['vi']:>3}: holes={m['hole_in'].sum():>6,}  surf_exists={m['cross_hole_frac']:.0%}  "
+              f"tex={m['auc_tex']:.2f} camgrz={m['auc_grz']:.2f} cov={m['auc_cov']:.2f} rendergrz={m['auc_inc']:.2f}")
+
+
+def iclr_compare_ckpts(run_dir: Path, ckpts, view: int, down: int, steps: int,
+                       cos_thr: float, tex_win: int, out: Path, device: str):
+    """Same view at several checkpoints — does 'surface exists' start high
+    (tracer overshoot) and collapse (geometry deleted) over training?"""
+    from lip_tracer.data import load_views
+    v = None; mets = []; labels = []
+    for ck in ckpts:
+        f, cfg = _load_model(run_dir, device, ck)
+        if v is None:
+            print(f"[iclr] loading views (down={down}) …")
+            v = load_views(cfg.scene, down=down)
+            view = min(view, v["c2w"].shape[0] - 1)
+        print(f"[iclr] {ck} @ view {view} …")
+        mets.append(_view_metrics(f, cfg, v, view, steps, cos_thr, tex_win, device))
+        labels.append(ck.replace("checkpoint_", "").replace(".pt", ""))
+    suptitle = (
+        f"Hole evolution over training — {run_dir.name}  (view {view})\n"
+        f"input_enc={cfg.model.input_encoding}  lip_mode={cfg.model.lipschitz_mode}  "
+        f"w_eikonal={cfg.train.w_eikonal}   ·   surface-exists ↓ ⇒ geometry being deleted")
+    _plot_columns(cfg, run_dir, mets, labels, out, suptitle)
+    for ck, m in zip(labels, mets):
+        print(f"[iclr] {ck:>10}: holes={m['hole_in'].sum():>6,}  surf_exists={m['cross_hole_frac']:.0%}  "
+              f"tex={m['auc_tex']:.2f} camgrz={m['auc_grz']:.2f} cov={m['auc_cov']:.2f} rendergrz={m['auc_inc']:.2f}")
+
+
+def iclr_lost_zncc(run_dir: Path, before_ckpt: str, after_ckpt: str, view: int,
+                   down: int, steps: int, topk: int, out: Path, device: str):
+    """For one view: M_lost = H_before · (1 − H_after) (pixels eroded between the
+    two checkpoints). At the BEFORE surface, compute raw top-k ZNCC (ncc_min=0)
+    and colour each lost pixel by how matchable it WAS before it died:
+        red z≤0 · orange 0<z≤.05 · yellow .05<z≤.1 · green z>.1
+    Green-dominant ⇒ matchable surface was deleted anyway (free-lunch pathology).
+    Red-dominant   ⇒ unmatchable surface correctly removed."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from lip_tracer.data import load_views, precompute_alt_cameras
+    from lip_tracer.loss import pmvs_ncc_loss
+
+    fb, cfg = _load_model(run_dir, device, before_ckpt)
+    fa, _   = _load_model(run_dir, device, after_ckpt)
+    tc = cfg.train
+    print(f"[lost] loading views (down={down}) …")
+    v = load_views(cfg.scene, down=down)
+    vi = min(view, v["c2w"].shape[0] - 1)
+    H, W = v["H"], v["W"]
+    c2w = v["c2w"][vi].numpy(); K = v["K"][vi].numpy()
+    img = v["images"][vi].numpy()
+    mask = v["masks"][vi].numpy() > 0.5 if "masks" in v else np.ones((H, W), bool)
+
+    images = v["images"].to(device).float()
+    if images.max() > 1.5:
+        images = images / 255.0
+    K_all = v["K"].to(device).float()
+    w2c_all = torch.linalg.inv(v["c2w"]).to(device).float()
+    alt_nn = precompute_alt_cameras(v, tc.n_alt)              # (V, n_alt)
+
+    o, d, Hd, Wd = _make_rays(c2w, K, H, W, 1, device)
+    print("[lost] tracing before/after …")
+    hb, tb, _, _ = _trace_with_diagnostics(fb, o, d, cfg.trace, steps, device)
+    ha, _,  _, _ = _trace_with_diagnostics(fa, o, d, cfg.trace, steps, device)
+    fg = torch.from_numpy(mask[:Hd, :Wd].reshape(-1))
+    lost = hb & (~ha) & fg                                    # M_lost = H_b(1-H_a)
+    print(f"[lost] H_before={int(hb.sum()):,}  H_after={int(ha.sum()):,}  lost={int(lost.sum()):,}")
+
+    lost_idx = torch.where(lost)[0]
+    x_lost = (o[lost_idx].cpu() + tb[lost_idx].unsqueeze(-1) * d[lost_idx].cpu())
+    n_lost = _normals_at(fb, x_lost, device)
+    B = x_lost.shape[0]
+
+    # raw top-k ZNCC at the BEFORE surface across the n_alt nearest views (no rejection)
+    alt = alt_nn[vi].tolist()
+    zstack = torch.full((len(alt), B), float("nan"))
+    x_d = x_lost.to(device); n_d = n_lost.to(device)
+    for ai, b in enumerate(alt):
+        va = torch.full((B,), vi, dtype=torch.long, device=device)
+        vb = torch.full((B,), int(b), dtype=torch.long, device=device)
+        _, _, _, zf = pmvs_ncc_loss(
+            images, x_d, n_d, va, vb, K_all, w2c_all, H, W,
+            patch=tc.ncc_patch, half_pix=tc.ncc_half_pix, sample_mode=tc.sample_mode,
+            gaussian_sigma=tc.gaussian_sigma, gaussian_radius=tc.gaussian_radius,
+            ncc_min=-2.0, return_full=True, ncc_color=tc.ncc_color)
+        zstack[ai] = zf.detach().cpu()
+    # top-k over valid views per point
+    zs = zstack.clone(); zs[torch.isnan(zs)] = -float("inf")
+    zs_sorted, _ = zs.sort(dim=0, descending=True)
+    kk = max(1, min(topk, len(alt)))
+    topv = zs_sorted[:kk]                                     # (kk, B)
+    valid = torch.isfinite(topv)
+    z = torch.where(valid.any(0),
+                    (topv * valid).sum(0) / valid.sum(0).clamp(min=1),
+                    torch.full((B,), float("nan")))
+    z = z.numpy()
+
+    has_z = np.isfinite(z)
+    zc = z[has_z]
+    frac_gt0  = float((zc > 0.0).mean())   if len(zc) else float("nan")
+    frac_gt05 = float((zc > 0.05).mean())  if len(zc) else float("nan")
+    frac_gt1  = float((zc > 0.10).mean())  if len(zc) else float("nan")
+    mean_z    = float(zc.mean())           if len(zc) else float("nan")
+
+    # category per lost pixel: 0 red ≤0, 1 orange, 2 yellow, 3 green, -1 gray(no view)
+    cat = np.full(B, -1, np.int64)
+    cat[has_z & (z <= 0)]                    = 0
+    cat[has_z & (z > 0)   & (z <= 0.05)]     = 1
+    cat[has_z & (z > 0.05) & (z <= 0.10)]    = 2
+    cat[has_z & (z > 0.10)]                  = 3
+    colors = {0: (0.90, 0.10, 0.10), 1: (1.00, 0.55, 0.0),
+              2: (0.95, 0.90, 0.15), 3: (0.20, 0.80, 0.20), -1: (0.5, 0.5, 0.5)}
+
+    overlay = np.zeros((Hd * Wd, 4), np.float32)
+    li = lost_idx.numpy()
+    for c, rgb in colors.items():
+        sel = li[cat == c]
+        overlay[sel, :3] = rgb; overlay[sel, 3] = 0.9
+    overlay = overlay.reshape(Hd, Wd, 4)
+
+    plt.rcParams.update({"font.family": "sans-serif"})
+    fig, ax = plt.subplots(1, 1, figsize=(8.5, 6.2), facecolor="white")
+    ax.imshow(img[:Hd, :Wd]); ax.imshow(overlay); ax.axis("off")
+    import matplotlib.patches as mpatches
+    leg = [mpatches.Patch(color=colors[3], label="z>0.1 (matchable)"),
+           mpatches.Patch(color=colors[2], label="0.05<z≤0.1"),
+           mpatches.Patch(color=colors[1], label="0<z≤0.05"),
+           mpatches.Patch(color=colors[0], label="z≤0 (unmatchable)"),
+           mpatches.Patch(color=colors[-1], label="no valid view")]
+    ax.legend(handles=leg, loc="lower right", fontsize=7, framealpha=0.85)
+    ax.set_title(
+        f"Eroded surface, coloured by ZNCC BEFORE deletion — view {vi}\n"
+        f"{before_ckpt.replace('checkpoint_','').replace('.pt','')} → "
+        f"{after_ckpt.replace('checkpoint_','').replace('.pt','')}   "
+        f"lost={B:,} px (top-{kk} ZNCC, ncc_min=0)\n"
+        f"frac z>0 = {frac_gt0:.2f}   z>0.05 = {frac_gt05:.2f}   "
+        f"z>0.1 = {frac_gt1:.2f}   mean_z = {mean_z:.3f}",
+        fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out, dpi=200, facecolor="white")
+    plt.close(fig)
+    print(f"[lost] saved → {out}")
+    print(f"[lost] frac_lost z>0={frac_gt0:.3f}  z>0.05={frac_gt05:.3f}  "
+          f"z>0.1={frac_gt1:.3f}  mean_z_lost={mean_z:.3f}  (n={len(zc):,}/{B:,})")
+
+
+def iclr_figure(run_dir: Path, view: int, down: int, steps: int,
+                cos_thr: float, tex_win: int, out: Path, device: str,
+                ckpt_name: str | None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from lip_tracer.data import load_views
+
+    f, cfg = _load_model(run_dir, device, ckpt_name)
+    print(f"[iclr] loading views (down={down}) …")
+    v = load_views(cfg.scene, down=down)
+    vi = min(view, v["c2w"].shape[0] - 1)
+    m = _view_metrics(f, cfg, v, vi, steps, cos_thr, tex_win, device)
+    Hd, Wd = m["Hd"], m["Wd"]
+    img = m["img"]; fg = m["fg"]
+    hole_in = m["hole_in"]; filled_in = m["filled_in"]
+    tex, inc, graze, cov, cross = m["tex"], m["inc"], m["graze"], m["cov"], m["cross"]
+    interior = (_erode_mask(fg.reshape(Hd, Wd), tex_win + 2).reshape(-1))
+    tex_hole, tex_fill = tex[hole_in], tex[filled_in]
+    inc_hole, inc_fill = inc[hole_in], inc[filled_in]
+    grz_hole, grz_fill = graze[hole_in], graze[filled_in]
+    cov_hole, cov_fill = cov[hole_in], cov[filled_in]
+    auc_tex, auc_grz, auc_inc, auc_cov = m["auc_tex"], m["auc_grz"], m["auc_inc"], m["auc_cov"]
+    cross_hole_frac = m["cross_hole_frac"]
+    med = _median
+    verdict = _verdict
+
+    # ── plot: 2 rows × 3 ────────────────────────────────────────────────────────
+    plt.rcParams.update({"font.size": 8, "axes.titlesize": 8, "font.family": "sans-serif"})
+    fig, ax = plt.subplots(2, 3, figsize=(12, 7.4), facecolor="white")
+    hole_img = (hole_in).reshape(Hd, Wd)
+    fg_img = fg.reshape(Hd, Wd)
+    holec = hole_img.astype(float)
+
+    # (0,0) GT + hole overlay (interior holes only — what the test scores)
+    a = ax[0, 0]
+    a.imshow(img[:Hd, :Wd]); a.imshow(np.dstack([np.ones_like(holec), np.zeros_like(holec),
+              np.zeros_like(holec), holec * 0.6]))
+    a.set_title(f"GT view {vi} — interior holes (red)\n"
+                f"{hole_in.sum():,} hole / {filled_in.sum():,} filled px"); a.axis("off")
+
+    # (0,1) texture map
+    a = ax[0, 1]
+    texmap = np.where(fg_img, tex.reshape(Hd, Wd), np.nan)
+    im = a.imshow(texmap, cmap="viridis", vmax=np.nanpercentile(texmap, 98))
+    a.contour(holec, levels=[0.5], colors="red", linewidths=0.7)
+    fig.colorbar(im, ax=a, fraction=0.046, pad=0.02)
+    a.set_title("H1  GT texture energy (|∇I|)\nred contour = holes"); a.axis("off")
+
+    # (0,2) render-ray grazing-incidence map (the tracer-overshoot test)
+    a = ax[0, 2]
+    incmap = np.where(fg_img, inc.reshape(Hd, Wd), np.nan)
+    im = a.imshow(incmap, cmap="magma", vmin=0, vmax=1)
+    a.contour(holec, levels=[0.5], colors="cyan", linewidths=0.7)
+    fig.colorbar(im, ax=a, fraction=0.046, pad=0.02)
+    a.set_title("H2  render-ray incidence -d·n (0=grazing)\ncyan contour = holes"); a.axis("off")
+
+    # (1,0) texture distribution
+    a = ax[1, 0]
+    bmax = max(np.nanpercentile(tex[interior & fg], 99), 1e-3)
+    bins = np.linspace(0, bmax, 50)
+    a.hist(tex_fill, bins=bins, density=True, color="#2c7fb8", alpha=0.7, label=f"filled (med {med(tex_fill):.3f})")
+    a.hist(tex_hole, bins=bins, density=True, color="#d7301f", alpha=0.7, label=f"hole (med {med(tex_hole):.3f})")
+    a.set_xlabel("texture energy |∇I|  (interior px)"); a.set_ylabel("density")
+    a.set_title(f"H1 textureless: {verdict(auc_tex)}\nAUC(low-tex→hole) = {auc_tex:.3f}")
+    a.legend(frameon=False, fontsize=7)
+
+    # (1,1) render-ray incidence distribution — the real discriminator
+    a = ax[1, 1]
+    gbins = np.linspace(0, 1, 40)
+    a.hist(inc_fill[np.isfinite(inc_fill)], bins=gbins, density=True, color="#2c7fb8", alpha=0.7,
+           label=f"filled (med {med(inc_fill):.2f})")
+    a.hist(inc_hole[np.isfinite(inc_hole)], bins=gbins, density=True, color="#d7301f", alpha=0.7,
+           label=f"hole (med {med(inc_hole):.2f})")
+    a.set_xlabel("render-ray incidence -d·n  (low=grazing)"); a.set_ylabel("density")
+    a.set_title(f"H2 render grazing: {verdict(auc_inc)}\nAUC(grazing→hole) = {auc_inc:.3f}  "
+                f"[cam-graze {auc_grz:.2f}, cov {auc_cov:.2f}]")
+    a.legend(frameon=False, fontsize=7)
+
+    # (1,2) is the surface actually there? zero-crossing fraction
+    a = ax[1, 2]
+    fr_h = cross[hole_in].mean() if hole_in.sum() else 0.0
+    fr_f = cross[filled_in].mean() if filled_in.sum() else 0.0
+    a.bar([0, 1], [fr_f, fr_h], color=["#2c7fb8", "#d7301f"], width=0.6)
+    a.set_xticks([0, 1]); a.set_xticklabels(["filled", "hole"])
+    a.set_ylim(0, 1.05); a.set_ylabel("fraction of rays with a zero-crossing")
+    for x, fr in [(0, fr_f), (1, fr_h)]:
+        a.text(x, fr + 0.02, f"{fr:.0%}", ha="center", fontsize=9, fontweight="bold")
+    a.set_title(f"Surface EXISTS along {fr_h:.0%} of hole rays\n→ holes are tracer overshoots, not deleted geometry")
+
+    fig.suptitle(
+        f"What actually makes the back/top holes?  {run_dir.name}  (view {vi}, {Hd}×{Wd})\n"
+        f"input_enc={cfg.model.input_encoding}  lip_mode={cfg.model.lipschitz_mode}  "
+        f"w_eikonal={cfg.train.w_eikonal}   ·   interior-only test",
+        fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out, dpi=200, facecolor="white")
+    plt.close(fig)
+    print(f"[iclr] saved → {out}")
+    print(f"[iclr] H1 texture       AUC={auc_tex:.3f} [{verdict(auc_tex)}]  hole={med(tex_hole):.4f} vs filled={med(tex_fill):.4f}")
+    print(f"[iclr] H2 cam-grazing   AUC={auc_grz:.3f} [{verdict(auc_grz)}]  hole={med(grz_hole):.3f} vs filled={med(grz_fill):.3f}")
+    print(f"[iclr] H2 cam-coverage  AUC={auc_cov:.3f}  hole={med(cov_hole):.1f} vs filled={med(cov_fill):.1f}")
+    print(f"[iclr] H2 render-grazing AUC={auc_inc:.3f} [{verdict(auc_inc)}]  hole={med(inc_hole):.3f} vs filled={med(inc_fill):.3f}")
+    print(f"[iclr] surface exists along {cross_hole_frac:.0%} of hole rays (zero-crossing)")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def _color_variance_at_holes(
@@ -191,10 +707,47 @@ def main():
                     help="how many other cameras to use for colour-consistency check at hole pixels")
     ap.add_argument("--out",     type=Path,  default=None)
     ap.add_argument("--device",  type=str,   default="auto")
+    ap.add_argument("--ckpt",    type=str,   default=None, help="checkpoint filename (searched at run root and ckpt/)")
+    ap.add_argument("--iclr",    action="store_true",
+                    help="minimal ICLR figure: prove holes are textureless (H1) + low-coverage/grazing (H2)")
+    ap.add_argument("--views",   type=str, default=None,
+                    help="ICLR multi-view: comma-separated view ids, e.g. '120,200,242,250'")
+    ap.add_argument("--ckpts",   type=str, default=None,
+                    help="ICLR checkpoint compare (one --view): comma-separated ckpt filenames, "
+                         "e.g. 'checkpoint_step_010000.pt,checkpoint_final.pt'")
+    ap.add_argument("--before",  type=str, default=None,
+                    help="ICLR lost-ZNCC: 'before erosion' ckpt filename (pairs with --after)")
+    ap.add_argument("--after",   type=str, default="checkpoint_final.pt",
+                    help="ICLR lost-ZNCC: 'after erosion' ckpt filename")
+    ap.add_argument("--topk",    type=int, default=4, help="ICLR lost-ZNCC: top-k views for ZNCC")
+    ap.add_argument("--steps",      type=int,   default=192, help="ICLR: dense samples / trace iters proxy")
+    ap.add_argument("--cov-cos",    type=float, default=0.3, help="ICLR: front-facing cos threshold for coverage")
+    ap.add_argument("--tex-win",    type=int,   default=2,   help="ICLR: half-window for texture box-mean")
     args = ap.parse_args()
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     out = args.out or (args.run_dir / "diagnose_holes.png")
+
+    if args.iclr:
+        if args.before:
+            out = args.out or (args.run_dir / "holes_lost_zncc.png")
+            iclr_lost_zncc(args.run_dir, args.before, args.after, args.view,
+                           args.down, args.steps, args.topk, out, device)
+        elif args.ckpts:
+            cklist = [x.strip() for x in args.ckpts.split(",") if x.strip()]
+            out = args.out or (args.run_dir / "holes_iclr_ckpts.png")
+            iclr_compare_ckpts(args.run_dir, cklist, args.view, args.down, args.steps,
+                               args.cov_cos, args.tex_win, out, device)
+        elif args.views:
+            vlist = [int(x) for x in args.views.split(",") if x.strip() != ""]
+            out = args.out or (args.run_dir / "holes_iclr_views.png")
+            iclr_multiview(args.run_dir, vlist, args.down, args.steps,
+                           args.cov_cos, args.tex_win, out, device, args.ckpt)
+        else:
+            out = args.out or (args.run_dir / "holes_iclr.png")
+            iclr_figure(args.run_dir, args.view, args.down, args.steps,
+                        args.cov_cos, args.tex_win, out, device, args.ckpt)
+        return
 
     print(f"[diagnose] loading model from {args.run_dir} …")
     f, cfg = _load_model(args.run_dir, device)

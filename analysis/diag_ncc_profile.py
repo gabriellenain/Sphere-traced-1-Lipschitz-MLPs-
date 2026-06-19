@@ -39,8 +39,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from lip_tracer.model import make_model
+from lip_tracer import data as _data
 from lip_tracer.data import load_views, precompute_alt_cameras
-from lip_tracer.sphere_tracing import trace_nograd, TraceConfig
+from lip_tracer.sphere_tracing import trace_nograd, trace_idr, TraceConfig
 from lip_tracer.loss import pmvs_ncc_loss
 
 
@@ -126,6 +127,44 @@ def greedy_pick(score, valid, k, min_dist, H, W, largest):
     return picks
 
 
+def make_validpatch_figure(zr, zb, inside, ncc_min, out_dir, view, step,
+                           labels=("on-object", "background"), suffix=""):
+    """ICLR figure: spatial distribution + budget of KEPT NCC patches under
+    mask-baked-black bg vs real bg (true mask-free), split by `inside` (H,W bool).
+    zr/zb = (H,W) per-pixel ZNCC (NaN where patch invalid/untextured). `inside`
+    is the object region — GT mask, or a mask-free COLMAP ROI. A 'kept' patch =
+    finite ZNCC > ncc_min."""
+    lin, lout = labels
+    keptb = np.isfinite(zb) & (zb > ncc_min)
+    keptr = np.isfinite(zr) & (zr > ncc_min)
+    cnt = lambda k: (int((k & inside).sum()), int((k & ~inside).sum()))
+    (bi, bo), (ri, ro) = cnt(keptb), cnt(keptr)
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5.2))
+    for a, (k, t, ci, co) in zip(ax[:2],
+            [(keptb, "with masked bg (baked-black)", bi, bo),
+             (keptr, "true mask-free (real bg)",     ri, ro)]):
+        rgb = np.ones((*k.shape, 3))
+        rgb[k & inside]  = [0.13, 0.55, 0.13]   # green: kept patch inside region
+        rgb[k & ~inside] = [0.85, 0.10, 0.10]   # red:   kept patch outside region
+        a.imshow(rgb)
+        a.contour(inside.astype(float), levels=[0.5], colors="k", linewidths=.6)
+        a.set_title(f"{t}\n{ci:,} {lin}   {co:,} {lout}", fontsize=10)
+        a.axis("off")
+    x = np.arange(2)
+    ax[2].bar(x - .18, [bi, ri], .36, label=lin,  color="#2a8a2a")
+    ax[2].bar(x + .18, [bo, ro], .36, label=lout, color="#d22222")
+    ax[2].set_xticks(x); ax[2].set_xticklabels(["masked bg", "real bg"])
+    ax[2].set_ylabel("# kept NCC patches"); ax[2].set_title("kept-patch budget")
+    ax[2].legend(frameon=False)
+    fig.suptitle(f"Distribution of valid (kept) NCC patches — view {view}, step {step}  "
+                 f"({lout} patches: {bo:,} -> {ro:,})")
+    fig.tight_layout()
+    p = out_dir / f"validpatch_dist{suffix}_v{view}_s{step}.png"
+    fig.savefig(p, dpi=130)
+    print(f"[validpatch{suffix}] {lin} {bi:,}->{ri:,}  {lout} {bo:,}->{ro:,}  -> {p}")
+    return p
+
+
 # ------------------------------------------------------------------- main ----
 def main():
     ap = argparse.ArgumentParser()
@@ -143,13 +182,65 @@ def main():
     ap.add_argument("--min-dist", type=int, default=20, help="px spacing of picks")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--replot-from", type=Path, default=None,
+                    help="skip trace; load a saved ncc_bg_ablation_*.npz and (re)emit "
+                         "the valid-patch distribution figure on CPU (no GPU needed).")
+    ap.add_argument("--roi-validpatch", action="store_true",
+                    help="redo validpatch figure with a MASK-FREE split: COLMAP sparse "
+                         "points -> loose union-of-balls 3D ROI; a hit is 'inside' if its "
+                         "3D position is within --roi-dilate of the cloud. Needs --replot-from "
+                         "for the ZNCC maps (re-traces only for the 3D hit positions).")
+    ap.add_argument("--roi-dilate", type=float, default=-1.0,
+                    help="ROI ball radius in world units (loose). <0 => auto = 6x median "
+                         "nearest-neighbour spacing of the COLMAP cloud.")
+    ap.add_argument("--roi-min-views", type=int, default=0,
+                    help="clean the COLMAP cloud before building the ROI: keep only points "
+                         "seen IN-FRAME by >= this many cameras (mask-free, no mask gating). "
+                         "0 = no cleaning. Kills stray low-track floaters.")
+    ap.add_argument("--grad-conflict", action="store_true",
+                    help="ICLR (b): θ-gradient conflict between object-hit and background-hit "
+                         "NCC patches. Traces with trace_idr (differentiable), backprops the "
+                         "NCC loss for each subset separately, reports cos(g_obj,g_extra) and "
+                         "||g_extra||/||g_obj||.")
+    ap.add_argument("--gc-n", type=int, default=30000,
+                    help="max hits sampled per subset for --grad-conflict")
+    ap.add_argument("--object-mask-dir", type=str, default="",
+                    help="subdir of the scene to use as the OBJECT mask for the validpatch "
+                         "split (e.g. mask_statue for TnT, where load_views' default mask/ is "
+                         "only not-sky). Empty = use the loaded mask. Files matched in sorted "
+                         "order to match load_views indexing.")
+    ap.add_argument("--bg-ablation", action="store_true",
+                    help="ICLR figure: one frozen ckpt, per-pixel mean ZNCC computed "
+                         "twice (real bg vs mask-baked-black bg) so the two image sets "
+                         "differ ONLY outside the mask (the pedestal). Dumps "
+                         "ncc_bg_ablation_*.png/.npz and the silhouette-band ΔZNCC.")
     args = ap.parse_args()
+
+    # The baked-vs-real contrast must come from images that differ ONLY outside
+    # the mask, so for the ablation we always load the REAL background and bake
+    # the black version ourselves below (load_views must not pre-bake).
+    if args.bg_ablation or args.grad_conflict:
+        _data.BAKE_BACKGROUND = False
 
     dev = args.device
     cfg = json.loads((args.run_dir / "config.json").read_text())
     mcfg, tcfg = cfg["model"], cfg["train"]
     out_dir = args.out or (args.run_dir / "diag")
     out_dir.mkdir(exist_ok=True, parents=True)
+
+    # --- fast path: replot the valid-patch figure from a saved npz (no GPU) --
+    if args.replot_from is not None and not args.roi_validpatch:
+        from PIL import Image
+        d = np.load(args.replot_from, allow_pickle=True)
+        zr, zb = d["zncc_real"], d["zncc_baked"]
+        view, step = int(d["view"]), int(d["step"])
+        H, W = zr.shape
+        m = np.array(Image.open(Path(cfg["scene"]) / "mask" / f"{view:03d}.png").convert("L"))
+        if m.shape != (H, W):
+            m = np.array(Image.fromarray(m).resize((W, H)))
+        make_validpatch_figure(zr, zb, m > 127, tcfg.get("ncc_min", 0.0),
+                               out_dir, view, step)
+        return
 
     # --- model + checkpoint (exact run config) ------------------------------
     f = make_model(**mcfg).to(dev).eval()
@@ -199,13 +290,14 @@ def main():
     print(f"[ncc] patch={P} half_pix={half_pix} bilateral_gamma={eff_bgamma:.4f} "
           f"sample={smode} sigma={eff_sigma:.3f}")
 
-    def ncc(x3d, nrm, vi_b):
+    def ncc(x3d, nrm, vi_b, imgs=None):
         """Per-point ZNCC of ref view vs one alt (NaN where patch out-of-frame)."""
+        imgs = images if imgs is None else imgs
         B = x3d.shape[0]
         va = torch.full((B,), args.view, device=dev, dtype=torch.long)
         vb = torch.full((B,), vi_b, device=dev, dtype=torch.long)
         _, _, _, zf = pmvs_ncc_loss(
-            images, x3d, nrm, va, vb, K_all, w2c_all, H, W,
+            imgs, x3d, nrm, va, vb, K_all, w2c_all, H, W,
             P, half_pix, smode, eff_sigma, g_rad, ncc_min,
             return_full=True, ncc_color=ncc_clr,
             patch_bilateral_gamma=eff_bgamma)
@@ -223,8 +315,245 @@ def main():
                            .reshape(-1, 3)).float().to(dev)
     d_t = torch.from_numpy(d_w.reshape(-1, 3)).float().to(dev)
 
+    # ===== ICLR (b): θ-gradient conflict, object-hit vs background-hit NCC ====
+    # Are the ~570k extra background patches noise/conflict in PARAMETER space?
+    # Trace differentiably (trace_idr, the surface point training uses), then
+    # backprop the NCC loss for each subset separately and compare the param
+    # gradients: cos(g_obj,g_extra) (alignment) and ||g_extra||/||g_obj|| (who
+    # dominates the update). fg/bg split uses the GT mask only to LABEL points.
+    if args.grad_conflict:
+        assert masks is not None, "--grad-conflict needs masks to label object vs background"
+        params = [p for p in f.parameters() if p.requires_grad]
+        with torch.no_grad():
+            _, _, hit0 = trace_chunked(f, o_t, d_t, trace_cfg)
+        fg_flat = masks[args.view].reshape(-1).bool().to(dev)
+        obj_idx = torch.where(hit0 & fg_flat)[0]
+        bg_idx  = torch.where(hit0 & ~fg_flat)[0]
+        g = torch.Generator(device=dev).manual_seed(0)
+        sub = lambda ix: ix[torch.randperm(ix.numel(), generator=g, device=dev)[:args.gc_n]]
+        obj_idx, bg_idx = sub(obj_idx), sub(bg_idx)
+        print(f"[grad-conflict] object hits={obj_idx.numel()}  background hits={bg_idx.numel()}")
+
+        import dataclasses as _dc
+        tc_idr = _dc.replace(trace_cfg, sdf_min_beta=0.0)   # compacted trace_idr rejects sdf_min_beta>0
+        sel = torch.cat([obj_idx, bg_idx])
+        x_th, _, hsel, _, n_raw, _, _ = trace_idr(f, o_t[sel], d_t[sel], tc_idr,
+                                                  collect_eik=False, diff_normal=False)
+        n_th = n_raw / n_raw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        no = obj_idx.numel()
+
+        def ncc_loss(x, n):
+            """Differentiable mean NCC loss (1-ZNCC over kept) summed across alts."""
+            tot = x.new_zeros(()); nk = 0
+            va = torch.full((x.shape[0],), args.view, device=dev, dtype=torch.long)
+            for a in alts:
+                vb = torch.full((x.shape[0],), a, device=dev, dtype=torch.long)
+                zncc, keep, _ = pmvs_ncc_loss(
+                    images, x, n, va, vb, K_all, w2c_all, H, W,
+                    P, half_pix, smode, eff_sigma, g_rad, ncc_min,
+                    ncc_color=ncc_clr, patch_bilateral_gamma=eff_bgamma)
+                if zncc.numel() and keep.any():
+                    tot = tot + (1.0 - zncc[keep]).sum(); nk += int(keep.sum())
+            return tot / max(nk, 1), nk
+
+        L_obj, nk_o = ncc_loss(x_th[:no], n_th[:no])
+        L_bg,  nk_b = ncc_loss(x_th[no:], n_th[no:])
+        z = lambda gi, p: gi if gi is not None else torch.zeros_like(p)
+        go_l = [z(gi, p) for gi, p in zip(torch.autograd.grad(L_obj, params, retain_graph=True, allow_unused=True), params)]
+        gb_l = [z(gi, p) for gi, p in zip(torch.autograd.grad(L_bg,  params, allow_unused=True), params)]
+        g_obj = torch.cat([g.reshape(-1) for g in go_l]); g_bg = torch.cat([g.reshape(-1) for g in gb_l])
+        no_, nb_ = g_obj.norm().item(), g_bg.norm().item()
+        ratio = nb_ / max(no_, 1e-12)
+        cos_global = float((g_obj @ g_bg) / max(no_ * nb_, 1e-12))
+        # per-tensor cosine (robust to one dominant param, e.g. the SDF output scale)
+        ct, wt = [], []
+        for go, gb in zip(go_l, gb_l):
+            a, b = go.norm().item(), gb.norm().item()
+            if a > 1e-9 and b > 1e-9:
+                ct.append(float((go.flatten() @ gb.flatten()) / (a * b))); wt.append(a * b)
+        ct, wt = np.array(ct), np.array(wt)
+        cos_med  = float(np.median(ct)) if ct.size else float("nan")
+        cos_wmean = float((ct * wt).sum() / wt.sum()) if ct.size else float("nan")
+        frac_neg = float((ct < -0.2).mean()) if ct.size else float("nan")
+        verdict = ("ALIGNED" if cos_wmean > 0.2 else
+                   "ORTHOGONAL (independent)" if abs(cos_wmean) <= 0.2 else "CONFLICTING")
+        print(f"[grad-conflict] kept patches: obj={nk_o} bg={nk_b}  hits {no}/{no}")
+        print(f"[grad-conflict] ||g_obj||={no_:.3e} ||g_extra||={nb_:.3e} ratio={ratio:.2f}")
+        print(f"[grad-conflict] cos: global={cos_global:+.3f} (scale-dominated)  "
+              f"per-tensor median={cos_med:+.3f} normw-mean={cos_wmean:+.3f}  "
+              f"frac<-0.2={frac_neg:.2f}  -> {verdict}")
+
+        fig, ax = plt.subplots(1, 3, figsize=(16, 4.6))
+        ax[0].bar([0, 1], [no_, nb_], color=["#2a8a2a", "#d22222"])
+        ax[0].set_xticks([0, 1]); ax[0].set_xticklabels(["object\npatches", "background\npatches"])
+        ax[0].set_ylabel("||∂L_NCC/∂θ||  (per-patch mean)")
+        ax[0].set_title(f"gradient norm  (||extra||/||obj||={ratio:.2f}×)")
+        ax[1].hist(ct, bins=24, range=(-1, 1), color="#666", weights=wt)
+        ax[1].axvline(cos_wmean, color="r", lw=2, label=f"norm-wt mean={cos_wmean:+.2f}")
+        ax[1].axvline(0, color="k", lw=.6)
+        ax[1].set_xlabel("cos(g_obj, g_extra)  per parameter tensor")
+        ax[1].set_ylabel("Σ‖g‖ weight"); ax[1].set_title("per-tensor gradient alignment")
+        ax[1].legend(fontsize=9)
+        ax[2].axis("off")
+        ax[2].text(0.5, 0.7, f"per-tensor median\ncos = {cos_med:+.3f}", ha="center",
+                   fontsize=16, transform=ax[2].transAxes)
+        ax[2].text(0.5, 0.4, f"global cos = {cos_global:+.3f}\n(saturated by SDF output scale)",
+                   ha="center", fontsize=10, color="#777", transform=ax[2].transAxes)
+        ax[2].text(0.5, 0.15, verdict, ha="center", fontsize=13, color="#444",
+                   transform=ax[2].transAxes)
+        fig.suptitle(f"NCC θ-gradient conflict — view {args.view}, step {step}  "
+                     f"(obj n={nk_o}, bg n={nk_b})")
+        fig.tight_layout()
+        p = out_dir / f"grad_conflict_v{args.view}_s{step}.png"
+        fig.savefig(p, dpi=130); print(f"[done] -> {p}")
+        np.savez(out_dir / f"grad_conflict_v{args.view}_s{step}.npz",
+                 cos_global=cos_global, cos_median=cos_med, cos_wmean=cos_wmean,
+                 frac_neg=frac_neg, ratio=ratio, g_obj_norm=no_, g_bg_norm=nb_,
+                 cos_per_tensor=ct, weight_per_tensor=wt,
+                 nk_obj=nk_o, nk_bg=nk_b, view=args.view, step=step)
+        return
+    # =========================================================================
+
     x_hit, t_hit, hit = trace_chunked(f, o_t, d_t, trace_cfg)
     nrm = grad_normals(f, x_hit)                              # (HW,3)
+
+    # ===== mask-free ROI variant of the valid-patch figure ===================
+    # Split kept patches by whether their 3D hit lies inside a loose COLMAP-cloud
+    # ROI (union of balls), instead of the GT mask. Shows whether a mask-free
+    # object region rejects the background pedestal patches the mask did.
+    if args.roi_validpatch:
+        assert args.replot_from is not None, "--roi-validpatch needs --replot-from <npz> for ZNCC maps"
+        from scipy.spatial import cKDTree
+        from lip_tracer.data import load_colmap_points
+        d = np.load(args.replot_from, allow_pickle=True)
+        zr, zb = d["zncc_real"], d["zncc_baked"]
+        view, step = int(d["view"]), int(d["step"])
+        pts_t = load_colmap_points(Path(cfg["scene"]))[:, :3].float()
+        if args.roi_min_views > 0:
+            # mask-free in-frame visibility count (drop the mask gating of
+            # data.colmap_visibility_counts): how many cameras see each point.
+            c2w_v = views["c2w"].float(); w2c_v = torch.linalg.inv(c2w_v)
+            Rv, tv = w2c_v[:, :3, :3], w2c_v[:, :3, 3]; Kv = views["K"].float()
+            cnt = torch.zeros(len(pts_t), dtype=torch.long)
+            for i in range(0, len(pts_t), 8192):
+                p   = pts_t[i:i + 8192]
+                xc  = torch.einsum("vij,nj->vni", Rv, p) + tv[:, None, :]
+                uvh = torch.einsum("vij,vnj->vni", Kv, xc)
+                uv  = uvh[..., :2] / uvh[..., 2:3].clamp_min(1e-6)
+                inb = ((uv[..., 0] >= 0) & (uv[..., 0] < W) & (uv[..., 1] >= 0)
+                       & (uv[..., 1] < H) & (xc[..., 2] > 1e-4))
+                cnt[i:i + 8192] = inb.sum(0)
+            keep = cnt >= args.roi_min_views
+            print(f"[roi] min_views={args.roi_min_views}: kept {int(keep.sum())}/{len(pts_t)} colmap pts")
+            pts_t = pts_t[keep]
+        pts = pts_t.numpy().astype(np.float32)
+        tree = cKDTree(pts)
+        tau = args.roi_dilate
+        if tau < 0:                                          # auto: 6x median NN spacing
+            nn, _ = tree.query(pts[np.random.default_rng(0).choice(len(pts), min(4000, len(pts)), replace=False)], k=2)
+            tau = 6.0 * float(np.median(nn[:, 1]))
+        xh = x_hit.detach().cpu().numpy().astype(np.float32)
+        dist, _ = tree.query(xh, k=1)
+        inside = (dist < tau).reshape(H, W) & hit.cpu().numpy().reshape(H, W)
+        print(f"[roi] COLMAP pts={len(pts)}  ball radius tau={tau:.4f}  "
+              f"hits inside ROI={int(inside.sum())}")
+        roi_suffix = ("_colmaproi"
+                      + (f"_mv{args.roi_min_views}" if args.roi_min_views > 0 else "")
+                      + (f"_d{args.roi_dilate:g}" if args.roi_dilate > 0 else ""))
+        make_validpatch_figure(zr, zb, inside, tcfg.get("ncc_min", 0.0), out_dir,
+                               view, step, labels=("inside ROI", "outside ROI"),
+                               suffix=roi_suffix)
+        return
+    # =========================================================================
+
+    # ===== ICLR background ablation ========================================
+    # One frozen ckpt (geometry fixed). Compute per-pixel mean ZNCC over the
+    # alt views TWICE: with the real photographed background, and with the
+    # mask-baked-black background. The two image sets are identical inside the
+    # mask, so any ZNCC change is purely the pedestal/surround re-entering the
+    # P*P patch footprint. Prediction: a degradation band hugging the
+    # silhouette (where patches straddle object<->pedestal), interior unchanged.
+    if args.bg_ablation:
+        assert masks is not None, "--bg-ablation needs object masks to define the baked bg"
+        mask_bool   = masks.bool()                            # (V,H,W)
+        images_real = images                                  # loaded BAKE_BACKGROUND=False
+        images_baked = images.clone(); images_baked[~mask_bool] = 0.0
+
+        hit_idx = torch.where(hit)[0]
+        xh, nh  = x_hit[hit_idx], nrm[hit_idx]
+
+        def mean_zncc_over_alts(imgs, chunk=65536):
+            acc = torch.full((hit_idx.shape[0], len(alts)), float("nan"), device=dev)
+            for j, a in enumerate(alts):
+                parts = [ncc(xh[i:i + chunk], nh[i:i + chunk], a, imgs)
+                         for i in range(0, xh.shape[0], chunk)]
+                acc[:, j] = torch.cat(parts)
+            return acc.nanmean(dim=1)                          # (Nhit,)
+
+        z_real, z_baked = mean_zncc_over_alts(images_real), mean_zncc_over_alts(images_baked)
+
+        def scatter(v):
+            full = torch.full((H * W,), float("nan"), device=dev); full[hit_idx] = v
+            return full.reshape(H, W).cpu().numpy()
+        zr, zb = scatter(z_real), scatter(z_baked)
+        zd = zb - zr                                           # masked - real: >0 => bg costs ZNCC
+
+        fg_v = mask_bool[args.view].cpu().numpy().astype(float)
+        if args.object_mask_dir:
+            # override the validpatch split with a dedicated object mask (e.g.
+            # mask_statue on TnT); sorted-glob to match load_views ordering.
+            from PIL import Image as _Im
+            _mps = sorted(p for p in (Path(cfg["scene"]) / args.object_mask_dir).glob("*.png")
+                          if not p.name.startswith("._"))
+            _om = np.array(_Im.open(_mps[args.view]).convert("L"))
+            if _om.shape != (H, W):
+                _om = np.array(_Im.fromarray(_om).resize((W, H)))
+            fg_v = (_om > 127).astype(float)
+            print(f"[bg-ablation] validpatch split uses object mask {args.object_mask_dir}/"
+                  f"{_mps[args.view].name} (coverage {fg_v.mean():.3f})")
+        fig, ax = plt.subplots(1, 4, figsize=(22, 6))
+        ax[0].imshow(images_real[args.view].cpu().numpy()); ax[0].set_title(f"view {args.view} (real bg)")
+        for k, (img, ttl) in enumerate([(zb, "ZNCC  baked-black bg (with-mask)"),
+                                        (zr, "ZNCC  real bg (true mask-free)")]):
+            im = ax[k + 1].imshow(img, cmap="viridis", vmin=-1, vmax=1)
+            ax[k + 1].set_title(ttl); plt.colorbar(im, ax=ax[k + 1], fraction=.046)
+        im = ax[3].imshow(zd, cmap="RdBu_r", vmin=-1, vmax=1)
+        ax[3].set_title("Δ ZNCC  (masked − real)\nred = background degrades the match")
+        plt.colorbar(im, ax=ax[3], fraction=.046)
+        ax[3].contour(fg_v, levels=[0.5], colors="k", linewidths=0.8)   # silhouette
+        for a in ax:
+            a.axis("off")
+        fig.suptitle(f"Background ablation — frozen ckpt step {step}; images differ "
+                     f"ONLY outside the mask (pedestal)")
+        fig.tight_layout()
+        outp = out_dir / f"ncc_bg_ablation_v{args.view}_s{step}.png"
+        fig.savefig(outp, dpi=120)
+        np.savez(out_dir / f"ncc_bg_ablation_v{args.view}_s{step}.npz",
+                 zncc_real=zr, zncc_baked=zb, zncc_diff=zd, view=args.view, step=step)
+        make_validpatch_figure(zr, zb, fg_v > 0.5, ncc_min, out_dir, args.view, step)
+        try:
+            from scipy import ndimage
+            fgb  = fg_v > 0.5
+            band = (ndimage.binary_dilation(fgb, iterations=8)
+                    & ~ndimage.binary_erosion(fgb, iterations=8) & np.isfinite(zd))
+            intr = ndimage.binary_erosion(fgb, iterations=12) & np.isfinite(zd)
+            bmean, imean = np.nanmean(zd[band]), np.nanmean(zd[intr])
+            # Sign-aware verdict. Δ=masked-real: POSITIVE band => real bg LOWERS
+            # ZNCC at the silhouette (straddle hypothesis). NEGATIVE/~0 => the bg
+            # does NOT corrupt the foreground match (refutes it).
+            if bmean > 0.05:
+                verdict = "real bg LOWERS boundary ZNCC => straddle plausible"
+            elif abs(bmean) < 0.03:
+                verdict = "band~0 => bg does NOT corrupt foreground NCC (straddle REFUTED)"
+            else:
+                verdict = "band negative => real bg slightly HELPS boundary (textured pedestal correlates)"
+            print(f"[bg-ablation] ΔZNCC=masked-real  silhouette-band mean={bmean:+.3f}  "
+                  f"interior mean={imean:+.3f}  -> {verdict}")
+        except Exception as e:
+            print(f"[bg-ablation] band stats skipped ({e})")
+        print(f"[done] -> {outp}")
+        return
+    # =======================================================================
 
     nmap = nrm.reshape(H, W, 3)
     # roughness = 1 - cos(n, locally-averaged n)  (normal high-pass)

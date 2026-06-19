@@ -33,8 +33,34 @@ TNT_OFFICIAL_FREQ=${TNT_OFFICIAL_FREQ:-10000}
 TNT_OFFICIAL_RES=${TNT_OFFICIAL_RES:-512}
 TNT_OFFICIAL_N_SAMPLES=${TNT_OFFICIAL_N_SAMPLES:-2000000}
 
+# Optional env knobs (defaults preserve the original clean relaunch exactly):
+#   NOMASK=1        -> --no-use-masks --init-hit-sampling (mask-free training,
+#                      fg = rays hitting the init SDF, like the *_sphere_nomask runs)
+#   NCC_ABS_TAU=0.2 -> --ncc-abs-tau: fixed-batch NCC reward -(1/|B|)ΣH_i(z_i-τ)
+#                      instead of the kept-mean (1-z) loss (erosion diagnostic)
+#   W_GEO_SDF=1.0   -> --w-geo-sdf: Geo-Neus sparse SDF anchor mean|f(x_sfm)|
+#                      (hit-independent on-surface anchor; fights init collapse).
+#                      Needs scene/sparse_sfm_points.txt (symlinked from data/tnt/Truck).
+NOMASK=${NOMASK:-0}
+NCC_ABS_TAU=${NCC_ABS_TAU:-}
+W_GEO_SDF=${W_GEO_SDF:-}
+EXTRA_FLAGS=()
+TAG=""
+if [ "$NOMASK" = "1" ]; then
+  EXTRA_FLAGS+=(--no-use-masks --init-hit-sampling)
+  TAG="${TAG}_nomask"
+fi
+if [ -n "$NCC_ABS_TAU" ]; then
+  EXTRA_FLAGS+=(--ncc-abs-tau "$NCC_ABS_TAU")
+  TAG="${TAG}_abstau${NCC_ABS_TAU}"
+fi
+if [ -n "$W_GEO_SDF" ]; then
+  EXTRA_FLAGS+=(--w-geo-sdf "$W_GEO_SDF")
+  TAG="${TAG}_geosdf${W_GEO_SDF}"
+fi
+
 TS=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=$OUTPUTS/run_${TS}_truck_gsam_mvsformer_carved_init_${SLURM_JOB_ID}
+RUN_DIR=$OUTPUTS/run_${TS}_truck_gsam_mvsformer_carved_init${TAG}_${SLURM_JOB_ID}
 DERIVED_CONFIG=$RUN_DIR/source_config_truck_gsam_mvsformer_carved_init.json
 LOG=$RUN_DIR/train.log
 
@@ -103,4 +129,5 @@ python -u -m lip_tracer.train \
     --tnt-official-freq "$TNT_OFFICIAL_FREQ" \
     --tnt-official-res "$TNT_OFFICIAL_RES" \
     --tnt-official-n-samples "$TNT_OFFICIAL_N_SAMPLES" \
+    ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     --wandb 2>&1 | tee "$LOG"

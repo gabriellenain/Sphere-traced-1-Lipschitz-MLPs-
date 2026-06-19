@@ -120,6 +120,7 @@ def pmvs_ncc_loss(
     ncc_grad_alpha: float = 0.0,
     patch_wsigma: float = 0.0,
     patch_bilateral_gamma: float = 0.0,
+    world_patch: float = -1.0,
     dbg: dict | None = None,
 ) -> tuple[Tensor, Tensor, int] | tuple[Tensor, Tensor, int, Tensor]:
     """PMVS-style ZNCC: NCC on a 3D oriented patch projected into two views.
@@ -163,7 +164,14 @@ def pmvs_ncc_loss(
     xc_a  = torch.einsum('bij,bj->bi', R_a, x3d) + t_a                        # (B, 3)
     z_ref = xc_a[:, 2].clamp(min=1e-3)                                         # (B,)
     f_x   = K_all[vi_a, 0, 0]                                                  # (B,)
-    step_3d = ((2.0 * half_pix / max(P - 1, 1)) * z_ref / f_x).detach()        # (B,) — patch scale fixed, gradient only through center
+    if world_patch > 0.0:
+        # Object-fixed: constant world footprint (full grid span = world_patch),
+        # view-independent. Footprint no longer floats with the reference
+        # distance; far/low-GSD views whose patch goes sub-pixel collapse to a
+        # near-constant patch and are dropped by the texture gate (std>1e-4).
+        step_3d = x3d.new_full((z_ref.shape[0],), world_patch / max(P - 1, 1)).detach()  # (B,)
+    else:
+        step_3d = ((2.0 * half_pix / max(P - 1, 1)) * z_ref / f_x).detach()    # (B,) — patch scale fixed, gradient only through center
 
     # 3. P×P grid of 3D points on the tangent plane
     offs = torch.linspace(-(P - 1) / 2, (P - 1) / 2, P, device=x3d.device)
@@ -330,12 +338,14 @@ def photo_loss(
     hit_bg: Tensor | None = None,
     w_ncc_normal: float = 0.0,
     ncc_topk: int = 0,
+    ncc_abs_tau: float = -1.0,
     ncc_normal_patch: int = -1,
     ncc_normal_half_pix: float = -1.0,
     ncc_color: str = "gray",
     ncc_grad_alpha: float = 0.0,
     ncc_patch_wsigma: float = 0.0,
     ncc_patch_bilateral_gamma: float = 0.0,
+    ncc_world_patch: float = -1.0,
     trace_cfg=None,
     prof=None,
 ) -> tuple[Tensor, dict]:
@@ -520,6 +530,7 @@ def photo_loss(
                     ncc_grad_alpha=ncc_grad_alpha,
                     patch_wsigma=ncc_patch_wsigma,
                     patch_bilateral_gamma=ncc_patch_bilateral_gamma,
+                    world_patch=ncc_world_patch,
                     dbg=_dbg,
                 )
                 if _dbg and "zncc_I" in _dbg:
@@ -533,6 +544,19 @@ def photo_loss(
                 if use_topk:
                     zpos_cols.append(_scatter_col(
                         zf[0], mask.nonzero(as_tuple=True)[0]))
+                elif ncc_abs_tau >= 0.0:
+                    # Fixed-batch hinge reward:  L = −(1/|B|) Σ_i H_i·[z_i − τ]_+.
+                    # With τ=ncc_min the gradient flows through exactly the same
+                    # pairs as the legacy keep-gate (z>τ); the ONLY change vs the
+                    # kept-mean is the θ-independent denominator |B| (sampled batch).
+                    # Deleting a z>τ hit therefore always costs its (z−τ)+ — the
+                    # below-survivor-mean culling incentive is gone; z≤τ pairs are
+                    # neutral (no gradient, deletion-neutral), matching ncc_min.
+                    if zncc.numel() > 0:
+                        ncc_term = -(zncc - ncc_abs_tau).clamp(min=0).sum() / B
+                        loss_terms.append(w_ncc * ncc_term)
+                        ncc_vals.append(ncc_term.detach())
+                        ncc_pos_terms.append(ncc_term)
                 elif keep.any():
                     ncc_term = (1.0 - zncc[keep]).mean()
                     loss_terms.append(w_ncc * ncc_term)

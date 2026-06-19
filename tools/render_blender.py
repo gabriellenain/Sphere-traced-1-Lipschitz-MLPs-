@@ -187,6 +187,10 @@ def render_view(mesh_path, scene_dir, view_idx, out_path, res_x, res_y,
     exposure = 1.5
     bt.blenderInit(res_x, res_y, numSamples, exposure)
 
+    if os.environ.get("BLENDER_FORCE_CPU") == "1":
+        bpy.context.scene.cycles.device = "CPU"
+        print("[cpu] BLENDER_FORCE_CPU=1 -> Cycles device = CPU", flush=True)
+
     # ------ read mesh ------
     bpy.ops.wm.ply_import(filepath=mesh_path) if hasattr(bpy.ops.wm, "ply_import") \
         else bpy.ops.import_mesh.ply(filepath=mesh_path)

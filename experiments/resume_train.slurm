@@ -34,6 +34,7 @@ OCC_ITERS=${OCC_ITERS:-32}
 OCC_NEWTON_STEPS=${OCC_NEWTON_STEPS:-0}
 OCC_EPS=${OCC_EPS:-1e-3}
 USE_MASKS=${USE_MASKS:-0}              # 0 -> --no-use-masks
+COMPILE=${COMPILE:-1}                  # 0 -> --no-compile (eager; avoids inductor recompile/CUDA wedges)
 
 # Official DTU Chamfer (DTUeval-python), reuses the run's periodic eval cadence.
 # Leave DTU_EVAL_DIR empty to keep DTU eval off (the train.py resume path resets
@@ -71,9 +72,16 @@ source /scratch/_projets_/willow/1-lip-tracer-new/.venv/bin/activate
 cd "$ROOT"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MPLCONFIGDIR=/tmp/matplotlib-1lip-resume
+# Use in-process dladdr symbolization instead of spawning addr2line, which parses
+# hundreds of MB of DWARF from libtorch_*.so off NFS on first use and stalls the
+# training thread for minutes whenever PyTorch builds a C++ traceback.
+export TORCH_SYMBOLIZE_MODE=dladdr
 
 MASK_ARG=(--no-use-masks)
 [ "$USE_MASKS" = "1" ] && MASK_ARG=(--use-masks)
+
+COMPILE_ARG=()
+[ "$COMPILE" = "0" ] && COMPILE_ARG=(--no-compile)
 
 WARM_ARG=()
 [ "$LR_WARM_RESTART" = "1" ] && WARM_ARG=(--lr-warm-restart)
@@ -107,6 +115,7 @@ python -u -m lip_tracer.train \
     --occ-newton-steps "$OCC_NEWTON_STEPS" \
     --occ-eps "$OCC_EPS" \
     "${MASK_ARG[@]}" \
+    ${COMPILE_ARG[@]+"${COMPILE_ARG[@]}"} \
     ${WARM_ARG[@]+"${WARM_ARG[@]}"} \
     ${TNT_ARGS[@]+"${TNT_ARGS[@]}"} \
     ${DTU_ARGS[@]+"${DTU_ARGS[@]}"} \

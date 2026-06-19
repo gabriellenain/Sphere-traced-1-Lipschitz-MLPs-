@@ -22,12 +22,31 @@ import matplotlib.pyplot as plt
 GT_MESH = Path("data/gt_meshes/happy_buddha_norm.ply")
 SWEEP = Path("outputs/buddha_sweep")
 
-CONFIGS = [
-    ("no-PE  W256 D16", "none_W256_D16_1M", 1_000_000),
-    ("PE L=6 per-band  W256 D16", "pe6_per_band_W256_D16_1M", 1_000_000),
-    ("PE L=6 uniform  W256 D16", "pe6_uniform_W256_D16_1M", 1_000_000),
-    ("PE L=6  W256 D16", "pe_W256_D16", 50_000),
-]
+PRESETS = {
+    # original 4-panel band-comparison figure
+    "default": [
+        ("no-PE  W256 D16", "none_W256_D16_1M", 1_000_000),
+        ("PE L=6 per-band  W256 D16", "pe6_per_band_W256_D16_1M", 1_000_000),
+        ("PE L=6 uniform  W256 D16", "pe6_uniform_W256_D16_1M", 1_000_000),
+        ("PE L=6  W256 D16", "pe_W256_D16", 50_000),
+    ],
+    # 3-panel: best no-PE vs best PE vs the output-div regularised PE run
+    "outputdiv": [
+        ("no-PE  W256 D16", "none_W256_D16_1M", 1_000_000),
+        ("PE L=6  W256 D16", "pe_W256_D16", 50_000),
+        ("PE L=6 + output-div  W256 D16",
+         "pe6_outputdiv_lambda_W256_D16_300k", 300_000),
+    ],
+    # 5-panel: original 4 + the output-div regularised PE run
+    "all5": [
+        ("no-PE  W256 D16", "none_W256_D16_1M", 1_000_000),
+        ("PE L=6 per-band  W256 D16", "pe6_per_band_W256_D16_1M", 1_000_000),
+        ("PE L=6 uniform  W256 D16", "pe6_uniform_W256_D16_1M", 1_000_000),
+        ("PE L=6  W256 D16", "pe_W256_D16", 50_000),
+        ("PE L=6 + output-div  W256 D16",
+         "pe6_outputdiv_lambda_W256_D16_300k", 300_000),
+    ],
+}
 
 
 def render_shaded(mesh: trimesh.Trimesh, res: int, az: float, el: float,
@@ -80,13 +99,21 @@ def chamfer_largest(gt_pts: np.ndarray, gt_tree: cKDTree,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--res", type=int, default=900)
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="default")
+    ap.add_argument("--res", type=int, default=1100)
     ap.add_argument("--az", type=float, default=35.0)
     ap.add_argument("--el", type=float, default=15.0)
     ap.add_argument("--n-points", type=int, default=100_000)
-    ap.add_argument("--out", type=Path,
-                    default=Path("figs/buddha_pe6_compare_W256_D16_1M.png"))
+    ap.add_argument("--full", action="store_true",
+                    help="render the WHOLE mesh (floaters included) and Chamfer "
+                         "the full mesh, instead of the largest connected component")
+    ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
+    configs = PRESETS[args.preset]
+    if args.out is None:
+        tag = "" if args.preset == "default" else f"_{args.preset}"
+        args.out = Path(f"figs/buddha_pe6_compare_W256_D16_1M{tag}"
+                        + ("_floaters" if args.full else "") + ".png")
 
     gt = trimesh.load(GT_MESH, process=False)
     bound = gt.bounds.copy()
@@ -94,32 +121,39 @@ def main() -> None:
     gt_tree = cKDTree(gt_pts)
 
     cells = []
-    for label, sub, steps in CONFIGS:
+    for label, sub, steps in configs:
         mp = SWEEP / sub / "pred_mesh.ply"
         m = trimesh.load(mp, process=False)
         main = largest_component(m)
         kept = 100.0 * len(main.faces) / max(len(m.faces), 1)
+        # Chamfer is ALWAYS on the largest component (the honest, floater-free
+        # number); --full only renders the whole mesh so the floaters are visible.
         cd = chamfer_largest(gt_pts, gt_tree, main, args.n_points)
-        img = render_shaded(main, args.res, args.az, args.el, bound)
+        img = render_shaded(m if args.full else main, args.res, args.az, args.el, bound)
         cells.append((label, img, cd, kept, steps))
         print(f"  {label:<28}  steps={steps:>9,}  chamfer={cd:.5f}  kept={kept:.1f}%")
 
     best = min(c[2] for c in cells)
     n = len(cells)
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "savefig.facecolor": "white",
+        "figure.facecolor": "white",
+    })
     fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 4.2))
     for ax, (label, img, cd, kept, steps) in zip(axes, cells):
-        ax.imshow(img)
+        ax.imshow(img, interpolation="lanczos")
         ax.set_xticks([]); ax.set_yticks([])
         for s in ax.spines.values():
             s.set_visible(False)
         is_best = cd == best
         title = f"{label}\n{steps:,} steps   chamfer {cd:.5f}"
-        ax.set_title(title, fontsize=10,
+        ax.set_title(title, fontsize=11.5,
                      color="#1a7a1a" if is_best else "#1a1a1a",
                      fontweight="bold" if is_best else "normal")
     fig.tight_layout()
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.out, dpi=170, bbox_inches="tight")
+    fig.savefig(args.out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"saved {args.out}")
 

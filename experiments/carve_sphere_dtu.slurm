@@ -41,6 +41,14 @@ VOTES=${VOTES:-3}
 MARGIN=${MARGIN:-3}
 CLIP_MARGIN=${CLIP_MARGIN:-2}
 CLOSE=${CLOSE:-2}
+# SfM AABB clip needs sparse_sfm_points.txt; set SFM_CLIP=0 for SfM-less scenes
+# (e.g. MVMannequin) where center=origin + largest-component does the trimming.
+SFM_CLIP=${SFM_CLIP:-1}
+LARGEST_COMPONENT=${LARGEST_COMPONENT:-0}
+SPHERE_RADIUS=${SPHERE_RADIUS:-auto}
+EXTRA=()
+[ "$SFM_CLIP" = "1" ] && EXTRA+=(--sfm-clip --clip-margin-voxels "$CLIP_MARGIN")
+[ "$LARGEST_COMPONENT" = "1" ] && EXTRA+=(--largest-component)
 
 if [ ! -d "$DEPTH_DIR" ]; then
   echo "ERROR: missing MVSFormer depth dir: $DEPTH_DIR" >&2
@@ -62,8 +70,8 @@ python -u tools/carve_sphere_with_mvsformer_truck.py \
   --conf-thr "$CONF" \
   --votes-req "$VOTES" \
   --margin-voxels "$MARGIN" \
-  --sfm-clip \
-  --clip-margin-voxels "$CLIP_MARGIN" \
-  --close-iters "$CLOSE"
+  --sphere-radius "$SPHERE_RADIUS" \
+  --close-iters "$CLOSE" \
+  ${EXTRA[@]+"${EXTRA[@]}"}
 
 echo "Carved init SDF: $OUT_DIR/sdf_sphere_mvsformer_carved.npy"

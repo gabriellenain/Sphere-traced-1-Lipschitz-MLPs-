@@ -11,6 +11,13 @@ from torch import Tensor
 from .config import SCENE, BLENDER_SCENE
 
 
+# Module-level toggle for whether the dataset mask is baked into the RGB
+# background at load time (img[~msk] = 0). Default True preserves historic
+# behaviour; train.py sets it from TrainConfig.bake_background so a truly
+# mask-free run keeps the real photographed background. See _load_dtu_views.
+BAKE_BACKGROUND = True
+
+
 # ---------- SFM / DTU ----------
 
 def load_colmap_points(scene: Path = SCENE) -> Tensor:
@@ -161,7 +168,8 @@ def _load_dtu_views(scene: Path, down: int = 1) -> dict:
         if msk.ndim == 3:
             msk = msk[..., 0]
         msk = msk > 127
-        img[~msk] = 0.0
+        if BAKE_BACKGROUND:
+            img[~msk] = 0.0
         if down > 1:
             H0, W0 = img.shape[:2]
             H1, W1 = H0 // down, W0 // down
@@ -284,6 +292,106 @@ def _load_tnt_views(scene: Path, down: int = 1) -> dict:
     }
 
 
+def _find_epfl_strecha_urd(scene: Path) -> Path | None:
+    """Find EPFL/Strecha dense MVS image directory (scene/*_dense/urd)."""
+    direct = scene / "urd"
+    if direct.is_dir():
+        return direct
+    matches = sorted(p for p in scene.glob("*_dense/urd") if p.is_dir())
+    if matches:
+        return matches[0]
+    return None
+
+
+def _read_epfl_strecha_camera(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    rows = [
+        [float(x) for x in line.split()]
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    if len(rows) < 9:
+        raise ValueError(f"malformed EPFL camera file: {path}")
+    K = np.asarray(rows[:3], dtype=np.float32)
+    # EPFL's .camera stores cam-to-world rotation rows, camera centre, then W H.
+    R_c2w = np.asarray(rows[4:7], dtype=np.float32)
+    C = np.asarray(rows[7], dtype=np.float32)
+    W, H = int(rows[8][0]), int(rows[8][1])
+    return K, R_c2w, C, W, H
+
+
+def _load_epfl_strecha_views(scene: Path, down: int = 1) -> dict:
+    """Load EPFL/Strecha dense MVS scenes (Fountain-P11, Herz-Jesu-P8).
+
+    Layout: <scene>/*_dense/urd/0000.png with sidecars
+    0000.png.camera and 0000.png.bounding. Camera centres are normalized by the
+    aggregate EPFL bounding box so the object fits the unit cube, matching the
+    convention used by the TnT loader.
+    """
+    import imageio.v2 as imageio
+    from PIL import Image as _PIL
+
+    urd = _find_epfl_strecha_urd(scene)
+    if urd is None:
+        raise FileNotFoundError(f"no EPFL *_dense/urd directory found under {scene}")
+    img_paths = sorted(p for p in urd.glob("*.png") if not p.name.startswith("._"))
+    if not img_paths:
+        raise FileNotFoundError(f"no EPFL images found under {urd}")
+
+    boxes = []
+    for ip in img_paths:
+        bp = ip.with_name(ip.name + ".bounding")
+        if not bp.exists():
+            raise FileNotFoundError(f"missing EPFL bounding sidecar: {bp}")
+        box = np.loadtxt(bp, dtype=np.float32).reshape(2, 3)
+        boxes.append(box)
+    lo = np.min(np.stack([np.minimum(b[0], b[1]) for b in boxes]), axis=0)
+    hi = np.max(np.stack([np.maximum(b[0], b[1]) for b in boxes]), axis=0)
+    center = 0.5 * (lo + hi)
+    scale = float(np.max(0.5 * (hi - lo)))
+    if scale <= 0:
+        raise ValueError(f"invalid EPFL aggregate bounding box for {scene}: {lo} {hi}")
+
+    imgs, c2ws, Ks, masks = [], [], [], []
+    for ip in img_paths:
+        cp = ip.with_name(ip.name + ".camera")
+        if not cp.exists():
+            raise FileNotFoundError(f"missing EPFL camera sidecar: {cp}")
+        K, R_c2w, C, cam_W, cam_H = _read_epfl_strecha_camera(cp)
+        img = imageio.imread(ip)
+        if img.ndim == 2:
+            img = np.repeat(img[..., None], 3, axis=-1)
+        img = img[..., :3].astype(np.float32) / 255.0
+        H0, W0 = img.shape[:2]
+        if (W0, H0) != (cam_W, cam_H):
+            print(f"  [epfl] warning: {ip.name} image is {W0}x{H0}, camera says {cam_W}x{cam_H}")
+        if down > 1:
+            H1, W1 = H0 // down, W0 // down
+            img = np.array(_PIL.fromarray((img * 255).astype(np.uint8)).resize(
+                (W1, H1), _PIL.BILINEAR)).astype(np.float32) / 255.0
+            K = K.copy()
+            K[0] /= down
+            K[1] /= down
+
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = R_c2w
+        c2w[:3, 3] = (C - center) / scale
+        H, W = img.shape[:2]
+        imgs.append(img)
+        c2ws.append(c2w)
+        Ks.append(K)
+        masks.append(np.ones((H, W), dtype=bool))
+
+    print(f"  epfl_strecha[{scene.name}]: {len(imgs)} views {imgs[0].shape[0]}x{imgs[0].shape[1]}  "
+          f"bbox_scale={scale:.3f}  (down={down})")
+    return {
+        "images": torch.from_numpy(np.stack(imgs)),
+        "masks":  torch.from_numpy(np.stack(masks)),
+        "c2w":    torch.from_numpy(np.stack(c2ws)),
+        "K":      torch.from_numpy(np.stack(Ks)),
+        "H": imgs[0].shape[0], "W": imgs[0].shape[1],
+    }
+
+
 def load_view_keep(path) -> list[int]:
     """Read a newline/whitespace-separated list of view indices to keep."""
     txt = Path(path).read_text()
@@ -312,6 +420,8 @@ def load_views(scene: Path = SCENE, down: int = 1,
 def _load_views_dispatch(scene: Path = SCENE, down: int = 1) -> dict:
     if (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
         return _load_tnt_views(scene, down=down)
+    if _find_epfl_strecha_urd(scene) is not None:
+        return _load_epfl_strecha_views(scene, down=down)
     if not (scene / "meta_data.json").exists() or (scene / "image").exists():
         return _load_dtu_views(scene, down=down)
     meta = json.loads((scene / "meta_data.json").read_text())
@@ -320,7 +430,8 @@ def _load_views_dispatch(scene: Path = SCENE, down: int = 1) -> dict:
     for fr in meta["frames"]:
         img = imageio.imread(scene / fr["rgb_path"])[..., :3].astype(np.float32) / 255.0
         msk = imageio.imread(scene / fr["foreground_mask"])[..., 0] > 127
-        img[~msk] = 0.0   # zero background — photo loss sees constant 0 there
+        if BAKE_BACKGROUND:
+            img[~msk] = 0.0   # zero background — photo loss sees constant 0 there
         imgs.append(img)
         c2ws.append(np.asarray(fr["camtoworld"], dtype=np.float32))
         Ks.append(np.asarray(fr["intrinsics"], dtype=np.float32)[:3, :3])

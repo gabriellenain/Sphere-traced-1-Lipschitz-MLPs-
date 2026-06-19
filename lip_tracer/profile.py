@@ -11,6 +11,7 @@ so this is cheap enough to leave on for the full 300k-step run.
 from __future__ import annotations
 
 import csv
+import contextlib
 import pickle
 import time
 from collections import defaultdict
@@ -109,8 +110,10 @@ class StepProfiler:
             prof.end_step(step)
     """
 
-    def __init__(self, out_dir: Path, flush_every: int = 1000, rays_per_step: int = 0):
+    def __init__(self, out_dir: Path, flush_every: int = 1000, rays_per_step: int = 0,
+                 enabled: bool = True):
         self.out_dir = Path(out_dir); self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.enabled = enabled
         self.flush_every = flush_every
         self.rays_per_step = rays_per_step
         self.cuda = torch.cuda.is_available()
@@ -123,18 +126,26 @@ class StepProfiler:
         self._iters_hist: list[int] = []     # per-step avg trace iters
 
     def step_begin(self):
+        if not self.enabled:
+            return
         self._wall_t0 = time.time()
 
     def step_end(self, step: int):
+        if not self.enabled:
+            return
         if self._wall_t0 is not None:
             self._step_wall.append(time.time() - self._wall_t0)
         if self.flush_every and (step + 1) % self.flush_every == 0:
             self._flush(step + 1)
 
     def record_trace_iters(self, mean_iters: float):
+        if not self.enabled:
+            return
         self._iters_hist.append(float(mean_iters))
 
     def timed(self, name: str) -> "_PhaseCtx":
+        if not self.enabled:
+            return contextlib.nullcontext()
         return _PhaseCtx(self, name)
 
     def _add(self, name: str, t_ms: float, peak_mb: float):

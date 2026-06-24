@@ -58,10 +58,33 @@ def parse_args() -> argparse.Namespace:
                          "even for TnT scenes (needs sparse_sfm_points.txt). Off by "
                          "default for TnT open scenes; on for object-centric TnT "
                          "(e.g. Truck) where the COLMAP cloud bounds the object.")
+    ap.add_argument(
+        "--geo-consistency", action="store_true",
+        help="cross-view geometric consistency filter on the depths before "
+             "carving: keep a pixel only if its depth reprojects consistently "
+             "through enough neighbour views. Drops the view-dependent depths on "
+             "smooth/textureless surfaces (e.g. the skull cranium top) that fail "
+             "multi-view agreement and otherwise carve real surface. Robust, "
+             "mask-free; same filter as the sphere carve.")
+    ap.add_argument("--geo-n-views", type=int, default=8,
+                    help="number of nearest-camera neighbour views to check")
+    ap.add_argument("--geo-n-consistent", type=int, default=2,
+                    help="min consistent neighbours required to keep a pixel")
+    ap.add_argument("--geo-tau-pix", type=float, default=1.0,
+                    help="max reprojection error (pixels)")
+    ap.add_argument("--geo-tau-depth", type=float, default=0.01,
+                    help="max relative depth error |dz|/d")
     ap.add_argument("--chunk-size", type=int, default=500_000)
+    ap.add_argument("--device", type=str, default="cpu",
+                    help="'cpu' (NumPy depth-vote loop) or 'cuda' (torch). The "
+                         "per-view projection+scatter is the carve bottleneck; on "
+                         "open/unmasked scenes (large hulls) 'cuda' is far faster.")
     ap.add_argument("--good-views", type=Path, default=None,
                     help="file of view indices to keep; drops noisy-mask views "
                          "from BOTH the percentile visual hull and the depth carve")
+    ap.add_argument("--depth-label", type=str, default="MVSFormer++",
+                    help="name of the depth source, used in plot titles, console "
+                         "messages, and output filename tag (e.g. 'ACMMP')")
     return ap.parse_args()
 
 
@@ -119,6 +142,74 @@ def depth_vote_view(
         "valid_depth_px": valid_depth_px,
         "voxels_voted_empty": n_voted,
     }
+
+
+def depth_vote_all_torch(
+    occ_idx: np.ndarray,
+    occ_pts: np.ndarray,
+    depths: list,
+    valids: list,
+    Ks: np.ndarray,
+    c2ws: np.ndarray,
+    res: int,
+    margin: float,
+    device: str,
+    chunk: int = 16_000_000,
+) -> tuple[np.ndarray, list]:
+    """GPU port of the per-view depth_vote_view loop.
+
+    Identical semantics to depth_vote_view (project every occupied voxel, vote a
+    voxel empty when it sits >margin in front of a valid depth), but the occ_pts
+    cloud is projected on the GPU and the empty votes accumulated with index_add_.
+    Points are processed in chunks so peak GPU memory stays bounded (a res1024
+    sphere init is ~10^8 voxels). Returns (votes[res,res,res] uint16, per_view)."""
+    import torch
+    dev = torch.device(device)
+    N = len(occ_pts)
+    pts = torch.as_tensor(occ_pts, dtype=torch.float32, device=dev)        # (N,3)
+    oidx = torch.as_tensor(occ_idx, dtype=torch.long, device=dev)          # (N,3) zyx
+    flat = (oidx[:, 0] * res + oidx[:, 1]) * res + oidx[:, 2]              # (N,)
+    votes = torch.zeros(res * res * res, dtype=torch.int32, device=dev)
+    per_view = []
+    for vi in range(len(depths)):
+        d = torch.as_tensor(np.asarray(depths[vi], dtype=np.float32), device=dev)
+        vmask = torch.as_tensor(np.asarray(valids[vi], dtype=bool), device=dev)
+        h, w = d.shape
+        c2w = c2ws[vi]
+        R = torch.as_tensor(c2w[:3, :3], dtype=torch.float32, device=dev)
+        c = torch.as_tensor(c2w[:3, 3], dtype=torch.float32, device=dev)
+        K = torch.as_tensor(Ks[vi], dtype=torch.float32, device=dev)
+        n_empty = 0
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            cam = (pts[s:e] - c) @ R
+            z = cam[:, 2]
+            front = z > 1e-5
+            zsafe = torch.where(front, z, torch.ones_like(z))
+            u = cam[:, 0] / zsafe * K[0, 0] + K[0, 2]
+            v = cam[:, 1] / zsafe * K[1, 1] + K[1, 2]
+            ui = torch.round(u).long()
+            vj = torch.round(v).long()
+            inb = front & (ui >= 0) & (ui < w) & (vj >= 0) & (vj < h)
+            ui_c = ui.clamp_(0, w - 1)
+            vj_c = vj.clamp_(0, h - 1)
+            dval = d[vj_c, ui_c]
+            good = vmask[vj_c, ui_c]
+            empty = inb & good & (z < (dval - margin))
+            ne = int(empty.sum().item())
+            if ne:
+                votes.index_add_(0, flat[s:e][empty],
+                                 torch.ones(ne, dtype=torch.int32, device=dev))
+                n_empty += ne
+        per_view.append({
+            "view": int(vi),
+            "valid_depth_px": int(vmask.sum().item()),
+            "voxels_voted_empty": n_empty,
+        })
+        print(f"  view {vi:02d}: valid={per_view[-1]['valid_depth_px']:8d} "
+              f"voted_empty={n_empty:8d}", flush=True)
+    votes_np = votes.cpu().numpy().reshape(res, res, res).astype(np.uint16)
+    return votes_np, per_view
 
 
 def resize_mask(mask: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
@@ -195,7 +286,7 @@ def load_mvsformer_depths_any(scene: Path, depth_dir: Path,
 def save_compare_render(out_path: Path, verts_h: np.ndarray, faces_h: np.ndarray,
                         verts_c: np.ndarray, faces_c: np.ndarray, views_hi: dict,
                         pct_removed: float, scene_label: str,
-                        hull_label: str) -> None:
+                        hull_label: str, depth_label: str = "MVSFormer++") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -214,14 +305,14 @@ def save_compare_render(out_path: Path, verts_h: np.ndarray, faces_h: np.ndarray
     for row, vi in enumerate(ref_views):
         for col, (img, label) in enumerate([
             (imgs_h[row], hull_label),
-            (imgs_c[row], "VH carved by MVSFormer++"),
+            (imgs_c[row], f"VH carved by {depth_label}"),
         ]):
             axes[row, col].imshow(np.clip(img, 0, 1))
             axes[row, col].axis("off")
             if row == 0:
                 axes[row, col].set_title(label, fontsize=11)
         axes[row, 0].set_ylabel(f"view {vi}", fontsize=10)
-    fig.suptitle(f"{scene_label} visual hull carved by MVSFormer++ depths "
+    fig.suptitle(f"{scene_label} visual hull carved by {depth_label} depths "
                  f"({pct_removed:.1f}% voxels removed)",
                  fontsize=12)
     fig.tight_layout()
@@ -248,7 +339,7 @@ def main() -> None:
 
     print(f"scene={args.scene}")
     print(f"res={args.res} bound={args.bound} voxel={voxel:.6f}")
-    print(f"MVSFormer conf_thr={args.conf_thr} margin={margin:.6f} votes_req={args.votes_req}")
+    print(f"{args.depth_label} conf_thr={args.conf_thr} margin={margin:.6f} votes_req={args.votes_req}")
 
     keep = None
     if args.good_views is not None:
@@ -290,11 +381,32 @@ def main() -> None:
         mvs["c2w"] = mvs["c2w"][sel]
         print(f"  depth carve uses {len(sel)} good views")
 
+    if args.geo_consistency:
+        print(f"\napplying cross-view geometric consistency filter (device={args.device}) ...")
+        # Lazy import to avoid a circular import: the sphere tool imports from
+        # this module at top level.
+        from carve_sphere_with_mvsformer_truck import (
+            geometric_consistency_filter,
+            geometric_consistency_filter_torch,
+        )
+        geo_fn = (geometric_consistency_filter_torch if args.device != "cpu"
+                  else geometric_consistency_filter)
+        geo_kw = {"device": args.device} if args.device != "cpu" else {}
+        mvs["valid"] = geo_fn(
+            mvs["depths"], mvs["valid"], mvs["K"], mvs["c2w"],
+            n_views=args.geo_n_views,
+            n_consistent=args.geo_n_consistent,
+            tau_pix=args.geo_tau_pix,
+            tau_depth=args.geo_tau_depth,
+            **geo_kw,
+        )
+
     print("\ncarving visual hull ...")
     occ = carve(scene=args.scene, res=args.res, bound=args.bound,
                 roi_bounds=roi_bounds, border_aware=not is_tnt,
                 vh_percentile=args.vh_percentile,
-                vh_min_views=args.vh_min_views, view_keep=keep)
+                vh_min_views=args.vh_min_views, view_keep=keep,
+                device=args.device)
     # carve() applies roi_bounds only on the DTU/border-aware path; the TnT
     # percentile path ignores it. When --sfm-clip forces SFM on for a TnT scene,
     # apply the ROI to the hull here so the hull (and everything downstream) is
@@ -319,29 +431,35 @@ def main() -> None:
     print("\nMVSFormer depth-space free carving ...")
     occ_idx = np.argwhere(occ)
     occ_pts = voxel_world_from_occ_indices(occ_idx, args.bound, args.res)
-    votes = np.zeros_like(occ, dtype=np.uint16)
-    per_view = []
-    for vi, (depth_t, valid_t) in enumerate(zip(mvs["depths"], mvs["valid"])):
-        stats = depth_vote_view(
-            vi,
-            np.asarray(depth_t, dtype=np.float32),
-            np.asarray(valid_t, dtype=bool),
-            mvs["K"][vi],
-            mvs["c2w"][vi],
-            occ_idx,
-            occ_pts,
-            votes,
-            margin,
-            args.chunk_size,
-        )
-        per_view.append(stats)
-        print(f"  view {vi:02d}: valid={stats['valid_depth_px']:8d} "
-              f"voted_empty={stats['voxels_voted_empty']:8d}")
+    print(f"  device={args.device}  occupied voxels to vote: {len(occ_pts)}")
+    if args.device != "cpu":
+        votes, per_view = depth_vote_all_torch(
+            occ_idx, occ_pts, mvs["depths"], mvs["valid"],
+            mvs["K"], mvs["c2w"], args.res, margin, args.device)
+    else:
+        votes = np.zeros_like(occ, dtype=np.uint16)
+        per_view = []
+        for vi, (depth_t, valid_t) in enumerate(zip(mvs["depths"], mvs["valid"])):
+            stats = depth_vote_view(
+                vi,
+                np.asarray(depth_t, dtype=np.float32),
+                np.asarray(valid_t, dtype=bool),
+                mvs["K"][vi],
+                mvs["c2w"][vi],
+                occ_idx,
+                occ_pts,
+                votes,
+                margin,
+                args.chunk_size,
+            )
+            per_view.append(stats)
+            print(f"  view {vi:02d}: valid={stats['valid_depth_px']:8d} "
+                  f"voted_empty={stats['voxels_voted_empty']:8d}")
 
     remove = (votes >= args.votes_req) & occ
     carved = occ & ~remove
     n_depth_removed = int(remove.sum())
-    print(f"\nremoved by MVSFormer depth votes: {n_depth_removed} / {n_occ0} "
+    print(f"\nremoved by {args.depth_label} depth votes: {n_depth_removed} / {n_occ0} "
           f"({100*n_depth_removed/max(n_occ0,1):.2f}%)")
 
     clip_info = None
@@ -371,7 +489,7 @@ def main() -> None:
     views_hi = load_views(args.scene, down=1)
     save_compare_render(args.out_dir / "vh_mvsformer_carve_compare.png",
                         verts_h, faces_h, verts_c, faces_c, views_hi, pct_total,
-                        args.scene.name, hull_label)
+                        args.scene.name, hull_label, args.depth_label)
 
     summary = {
         "scene": str(args.scene),

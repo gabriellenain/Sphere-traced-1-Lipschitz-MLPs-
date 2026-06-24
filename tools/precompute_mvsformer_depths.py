@@ -62,7 +62,11 @@ def _write_cam(path: Path, K: np.ndarray, R: np.ndarray, t: np.ndarray,
     lines += [" ".join(f"{v:.10f}" for v in row) for row in E]
     lines += ["", "intrinsic"]
     lines += [" ".join(f"{v:.10f}" for v in row) for row in K]
-    lines += ["", f"{depth_min:.6f} {depth_interval:.6f} {num_depth}", ""]
+    # Canonical 4-token MVSNet depth line: "min interval num max". MVSFormer++'s
+    # parser only reads the first two tokens, but ACMMP's ReadCamera requires the
+    # 4th (depth_max) — a 3-token line leaves it 0 and degenerates the search.
+    depth_max = depth_min + depth_interval * num_depth
+    lines += ["", f"{depth_min:.6f} {depth_interval:.6f} {num_depth} {depth_max:.6f}", ""]
     path.write_text("\n".join(lines))
 
 
@@ -83,9 +87,11 @@ def _build_pair_txt(centers: np.ndarray, n_src: int) -> str:
 
 
 def stage_scene(scene: Path, scan_name: str, staging: Path, n_src: int,
-                blender: bool = False) -> None:
+                blender: bool = False, down: int = 1) -> None:
     if blender:
         _stage_blender(scene, scan_name, staging, n_src)
+    elif (scene / "dslr_calibration_undistorted" / "cameras.txt").exists():
+        _stage_eth3d(scene, scan_name, staging, n_src, down=down)
     elif (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
         _stage_tnt(scene, scan_name, staging, n_src)
     elif _find_epfl_strecha_urd(scene) is not None:
@@ -180,6 +186,30 @@ def _normalise_tnt_center_scale(scene: Path) -> tuple[np.ndarray, float]:
     return center, scale
 
 
+def _depth_range_from_sfm(R: np.ndarray, t: np.ndarray, pts: np.ndarray,
+                          num_depth: int,
+                          lo_pct: float = 2.0, hi_pct: float = 98.0,
+                          lo_mul: float = 0.8, hi_mul: float = 1.2,
+                          min_pts: int = 50) -> tuple[float, float] | None:
+    """Per-view depth range bracketing the sparse SfM surface seen by this view.
+
+    Projects the sparse cloud into the camera and takes a padded percentile band
+    of the in-front depths. Returns None when too few points project (caller then
+    falls back to the origin-cube heuristic). This is robust for off-origin scenes
+    where the camera sits inside a fixed origin-centred cube, whose near plane can
+    otherwise land *behind* the true surface and clip it out of the hypothesis
+    range (see fountain-P11: surface ~0.35 but cube d_min up to 1.84).
+    """
+    z = (R @ pts.T + t.reshape(3, 1))[2]
+    z = z[z > 1e-4]
+    if z.size < min_pts:
+        return None
+    z_lo, z_hi = np.percentile(z, [lo_pct, hi_pct])
+    d_min = max(0.05, lo_mul * float(z_lo))
+    d_max = max(d_min + 1e-3, hi_mul * float(z_hi))
+    return d_min, (d_max - d_min) / num_depth
+
+
 def _depth_range_from_cube(R: np.ndarray, t: np.ndarray, bound: float,
                            num_depth: int) -> tuple[float, float]:
     corners = np.array([[x, y, z]
@@ -250,6 +280,10 @@ def _stage_epfl_strecha(scene: Path, scan_name: str, staging: Path, n_src: int) 
     c2w_all = views["c2w"].numpy().astype(np.float64)
     K_all = views["K"].numpy().astype(np.float64)
 
+    sfm_path = scene / "sparse_sfm_points.txt"
+    sfm_pts = (np.loadtxt(sfm_path)[:, :3].astype(np.float64)
+               if sfm_path.is_file() else None)
+
     scan_dir = staging / scan_name
     (scan_dir / "images").mkdir(parents=True, exist_ok=True)
     (scan_dir / "cams").mkdir(parents=True, exist_ok=True)
@@ -262,8 +296,17 @@ def _stage_epfl_strecha(scene: Path, scan_name: str, staging: Path, n_src: int) 
         R = c2w[:3, :3].T
         t = -R @ cam_center
         centers.append(cam_center)
-        d_min, d_interval = _depth_range_from_cube(R, t, bound=1.5,
-                                                   num_depth=num_depth)
+        rng = (_depth_range_from_sfm(R, t, sfm_pts, num_depth)
+               if sfm_pts is not None else None)
+        if rng is None:
+            rng = _depth_range_from_cube(R, t, bound=1.5, num_depth=num_depth)
+            src = "cube"
+        else:
+            src = "sfm"
+        d_min, d_interval = rng
+        print(f"  [stage epfl] view {i:02d}: depth range "
+              f"{d_min:.3f}..{d_min + d_interval * num_depth:.3f} ({src})",
+              flush=True)
         _write_cam(scan_dir / "cams" / f"{i:08d}_cam.txt", K_all[i], R, t,
                    d_min, d_interval, num_depth)
         Image.open(ip).convert("RGB").save(scan_dir / "images" / f"{i:08d}.jpg",
@@ -273,6 +316,122 @@ def _stage_epfl_strecha(scene: Path, scan_name: str, staging: Path, n_src: int) 
     (scan_dir / "pair.txt").write_text(_build_pair_txt(centers, n_src))
     (scan_dir / "view_names.txt").write_text("\n".join(p.name for p in image_paths) + "\n")
     print(f"[stage epfl] {len(image_paths)} views → {scan_dir}", flush=True)
+
+
+def _quat_to_rot(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """COLMAP quaternion (w,x,y,z) -> world-to-camera rotation matrix."""
+    n = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),     2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw),     1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw),     2 * (qy * qz + qx * qw),     1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def _read_colmap_points3d(path: Path) -> np.ndarray | None:
+    """Parse COLMAP points3D.txt -> (N,3) XYZ. Returns None if absent/empty."""
+    if not path.is_file():
+        return None
+    pts = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            tok = line.split()
+            # POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]
+            pts.append((float(tok[1]), float(tok[2]), float(tok[3])))
+    return np.asarray(pts, dtype=np.float64) if pts else None
+
+
+def _stage_eth3d(scene: Path, scan_name: str, staging: Path, n_src: int,
+                 down: int = 1) -> None:
+    """Stage an ETH3D high-res DSLR scene (COLMAP-undistorted) into MVSNet format.
+
+    ETH3D ships a COLMAP text reconstruction under dslr_calibration_undistorted/
+    (PINHOLE cameras, world-to-cam q/t) plus undistorted JPGs. Unlike DTU/TnT we
+    keep the native *metric* COLMAP frame — that is the frame the ETH3D laser-scan
+    GT lives in, so ACMMP's emitted cam-z depths fuse straight into world-metric
+    points for the official multi-view-evaluation. Per-view depth ranges come from
+    the sparse SfM cloud (origin-cube fallback is meaningless off-origin here).
+
+    `down` integer-downsamples images and intrinsics (ETH3D DSLR is ~24 MP; ACMMP
+    at full res is impractical, so the slurm job passes down=2).
+    """
+    calib = scene / "dslr_calibration_undistorted"
+    img_root = scene / "images"   # NAME in images.txt is dslr_images_undistorted/<f>.JPG
+
+    # cameras.txt: CAMERA_ID MODEL W H fx fy cx cy  (PINHOLE)
+    cams: dict[int, np.ndarray] = {}
+    for line in (calib / "cameras.txt").read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        t = line.split()
+        cid, model = int(t[0]), t[1]
+        if model != "PINHOLE":
+            raise ValueError(f"{scene.name}: expected PINHOLE camera, got {model}")
+        fx, fy, cx, cy = map(float, t[4:8])
+        cams[cid] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]], dtype=np.float64)
+
+    # images.txt: two lines per image; first has pose, second the 2D points.
+    raw = (calib / "images.txt").read_text().splitlines()
+    entries = []  # (name, cam_id, R, t)
+    expect_pose = True
+    for line in raw:
+        if line.startswith("#") or not line.strip():
+            continue
+        if expect_pose:
+            t = line.split()
+            qw, qx, qy, qz = map(float, t[1:5])
+            tx, ty, tz = map(float, t[5:8])
+            cam_id, name = int(t[8]), t[9]
+            R = _quat_to_rot(qw, qx, qy, qz)
+            entries.append((name, cam_id, R, np.array([tx, ty, tz], dtype=np.float64)))
+            expect_pose = False
+        else:
+            expect_pose = True  # skip the POINTS2D line
+    entries.sort(key=lambda e: e[0])  # deterministic by image name
+
+    sfm_pts = _read_colmap_points3d(calib / "points3D.txt")
+
+    scan_dir = staging / scan_name
+    (scan_dir / "images").mkdir(parents=True, exist_ok=True)
+    (scan_dir / "cams").mkdir(parents=True, exist_ok=True)
+
+    centers, view_names = [], []
+    num_depth = 192
+    for i, (name, cam_id, R, t) in enumerate(entries):
+        ip = img_root / name
+        if not ip.exists():
+            print(f"  [stage eth3d] WARN missing image {ip}", flush=True)
+            continue
+        K = cams[cam_id].copy()
+        if down > 1:
+            K[0, :] /= down
+            K[1, :] /= down
+        cam_center = -R.T @ t
+        centers.append(cam_center)
+
+        rng = (_depth_range_from_sfm(R, t, sfm_pts, num_depth)
+               if sfm_pts is not None else None)
+        if rng is None:
+            rng = _depth_range_from_cube(R, t, bound=1.5, num_depth=num_depth)
+        d_min, d_interval = rng
+        _write_cam(scan_dir / "cams" / f"{i:08d}_cam.txt", K, R, t,
+                   d_min, d_interval, num_depth)
+
+        im = Image.open(ip).convert("RGB")
+        if down > 1:
+            im = im.resize((im.width // down, im.height // down), Image.BILINEAR)
+        im.save(scan_dir / "images" / f"{i:08d}.jpg", quality=95)
+        view_names.append(name)
+
+    if not centers:
+        raise FileNotFoundError(f"no ETH3D images staged for {scene}")
+    centers = np.stack(centers)
+    (scan_dir / "pair.txt").write_text(_build_pair_txt(centers, n_src))
+    (scan_dir / "view_names.txt").write_text("\n".join(view_names) + "\n")
+    print(f"[stage eth3d] {len(view_names)} views (down={down}) → {scan_dir}", flush=True)
 
 
 def main() -> None:
@@ -295,6 +454,13 @@ def main() -> None:
     ap.add_argument("--keep-staging", action="store_true")
     ap.add_argument("--blender", action="store_true",
                     help="parse transforms_train.json instead of cameras.npz")
+    ap.add_argument("--down", type=int, default=1,
+                    help="integer image/intrinsic downsample factor (ETH3D staging "
+                         "only; DSLR frames are ~24 MP so ACMMP uses down=2).")
+    ap.add_argument("--stage-only", action="store_true",
+                    help="only write the MVSNet-format staging (images/cams/pair.txt) "
+                         "and exit, without running MVSFormer++. Lets non-learning MVS "
+                         "(e.g. ACMMP) reuse the exact same camera staging.")
     args = ap.parse_args()
 
     scan_name = args.scan_name or args.scene.name
@@ -303,7 +469,12 @@ def main() -> None:
     staging.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    stage_scene(args.scene, scan_name, staging, args.n_src, blender=args.blender)
+    stage_scene(args.scene, scan_name, staging, args.n_src, blender=args.blender,
+                down=args.down)
+
+    if args.stage_only:
+        print(f"[stage-only] MVSNet input staged at {staging / scan_name}", flush=True)
+        return
 
     # Patch DINOv2 backbone path in config so the MVSFormer++ loader finds it.
     cfg_local = staging / "config.json"

@@ -24,6 +24,7 @@ from lip_tracer.visual_hull import keep_largest_component
 from carve_visual_hull_with_mvsformer_scan24 import (
     _read_pfm,
     depth_vote_view,
+    depth_vote_all_torch,
     save_sdf_grid,
     voxel_world_from_occ_indices,
 )
@@ -62,6 +63,26 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="use sparse_sfm_points.txt AABB center when --sphere-center is absent",
     )
+    ap.add_argument(
+        "--method", choices=["carve", "tsdf"], default="carve",
+        help="occupancy estimator. 'carve' = hard depth-vote space carving from a "
+             "solid sphere (default). 'tsdf' = confidence-weighted, front-truncated "
+             "signed fusion: per-voxel weighted mean of clamped (d_meas - z)/trunc "
+             "over all confident views, occupied where the mean is negative. Soft and "
+             "noise-robust (wrong low-confidence depths are out-weighted, not "
+             "hole-punching); no enclosing sphere needed.")
+    ap.add_argument("--tsdf-trunc-voxels", type=float, default=4.0,
+                    help="TSDF truncation distance in voxels (front ramp width)")
+    ap.add_argument("--tsdf-shell", action="store_true",
+                    help="keep only a thin SURFACE shell (voxels within +-trunc of the "
+                         "measured depth) instead of filling everything behind the "
+                         "surface solid. REQUIRED for open/interior scenes (ETH3D): "
+                         "cameras cluster centrally, so 'fill behind' degenerates into a "
+                         "solid frustum/bowtie. The shell is the actual observed surface.")
+    ap.add_argument("--tsdf-shell-lo", type=float, default=-0.95,
+                    help="shell mode: drop voxels with mean signed value <= this "
+                         "(deep-interior, far behind the surface). -0.95 ~= one trunc "
+                         "band behind the surface.")
     ap.add_argument("--conf-thr", type=float, default=0.5)
     ap.add_argument(
         "--use-depth-mask",
@@ -114,6 +135,10 @@ def parse_args() -> argparse.Namespace:
              "<= --sfm-roi-dist.")
     ap.add_argument("--sfm-clip", action="store_true")
     ap.add_argument("--clip-margin-voxels", type=float, default=6.0)
+    ap.add_argument("--depth-label", type=str, default="MVSFormer++",
+                    help="name of the depth source, used in the compare-plot title, "
+                         "carved-panel label, and console messages (e.g. 'ACMMP'). "
+                         "Output filenames are left unchanged for downstream tooling.")
     ap.add_argument(
         "--sfm-roi-dist", type=float, default=None,
         help="after the AABB clip, drop voxels farther than this (world units) from "
@@ -128,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fill-holes", action="store_true",
                     help="fill enclosed holes in the voxel occupancy")
     ap.add_argument("--chunk-size", type=int, default=500_000)
+    ap.add_argument("--device", type=str, default="cpu",
+                    help="'cpu' (NumPy depth-vote loop) or 'cuda' (torch). The "
+                         "per-view projection+scatter is the carve bottleneck.")
     ap.add_argument(
         "--largest-component",
         action=argparse.BooleanOptionalAction,
@@ -219,6 +247,14 @@ def load_mvsformer_depths_tnt_nomask(
         return None
 
     views = load_blender_views(scene, split="train", down=1) if blender else load_views(scene, down=1)
+    # ETH3D: ACMMP depths are metric cam-z; load_views normalized the cameras by
+    # `scale` (eth3d_norm.json). Divide depths by the same scale so back-projected
+    # points land in the normalized [-bound,bound] carve grid.
+    norm_path = scene / "eth3d_norm.json"
+    depth_norm_scale = (json.loads(norm_path.read_text())["scale"]
+                        if norm_path.exists() else 1.0)
+    if depth_norm_scale != 1.0:
+        print(f"  [geomvs] ETH3D normalized: dividing metric depths by scale={depth_norm_scale:.4f}")
     c2w = views["c2w"].numpy().astype(np.float32)
     K0 = views["K"].numpy().astype(np.float32)
     H0, W0 = int(views["H"]), int(views["W"])
@@ -236,13 +272,16 @@ def load_mvsformer_depths_tnt_nomask(
     if use_depth_mask:
         from carve_visual_hull_with_mvsformer_scan24 import resize_mask
 
-    depths, valid, Ks = [], [], []
+    depths, valid, Ks, confs = [], [], [], []
     n_capped = 0
     for i, pfm in enumerate(pfm_files):
         depth = np.asarray(_read_pfm(pfm), dtype=np.float32)
+        if depth_norm_scale != 1.0:
+            depth = depth / np.float32(depth_norm_scale)
         conf = np.load(scan_root / "confidence" / f"{pfm.stem}.npy")
         if conf.dtype == np.uint8:
             conf = conf.astype(np.float32) / 255.0
+        conf = conf.astype(np.float32)
         H, W = depth.shape
         K = K0[i].copy()
         K[0, :] *= W / float(W0)
@@ -256,6 +295,7 @@ def load_mvsformer_depths_tnt_nomask(
             good &= resize_mask(masks[i], (H, W))
         depths.append(depth)
         valid.append(good)
+        confs.append(conf)
         Ks.append(K)
         if i % 25 == 0:
             pct = 100 * good.mean()
@@ -270,6 +310,7 @@ def load_mvsformer_depths_tnt_nomask(
     return {
         "depths": depths,
         "valid": valid,
+        "conf": confs,
         "K": np.stack(Ks),
         "c2w": c2w[:len(depths)],
         "H": depths[0].shape[0],
@@ -415,6 +456,151 @@ def geometric_consistency_filter(
     return out
 
 
+def geometric_consistency_filter_torch(
+    depths: list[np.ndarray],
+    valid: list[np.ndarray],
+    K: np.ndarray,
+    c2w: np.ndarray,
+    n_views: int = 8,
+    n_consistent: int = 2,
+    tau_pix: float = 1.0,
+    tau_depth: float = 0.01,
+    device: str = "cuda",
+) -> list[np.ndarray]:
+    """GPU port of geometric_consistency_filter (identical semantics)."""
+    import torch
+
+    dev = torch.device(device)
+    V = len(depths)
+    centers = c2w[:, :3, 3].astype(np.float64)
+    dt = [torch.as_tensor(np.asarray(d, np.float32), device=dev) for d in depths]
+    vt = [torch.as_tensor(np.asarray(v, np.bool_), device=dev) for v in valid]
+    Kt = [torch.as_tensor(K[i].astype(np.float32), device=dev) for i in range(V)]
+    Rt = [torch.as_tensor(c2w[i, :3, :3].astype(np.float32), device=dev) for i in range(V)]
+    tt = [torch.as_tensor(c2w[i, :3, 3].astype(np.float32), device=dev) for i in range(V)]
+
+    out, total_b, total_a = [], 0, 0
+    for r in range(V):
+        Hr, Wr = dt[r].shape
+        Kr, Rr, tr, dr, vr = Kt[r], Rt[r], tt[r], dt[r], vt[r]
+        ys, xs = torch.meshgrid(torch.arange(Hr, device=dev, dtype=torch.float32),
+                                torch.arange(Wr, device=dev, dtype=torch.float32),
+                                indexing="ij")
+        xc = (xs - Kr[0, 2]) / Kr[0, 0] * dr
+        yc = (ys - Kr[1, 2]) / Kr[1, 1] * dr
+        Xw = torch.stack([xc, yc, dr], -1) @ Rr.T + tr           # (Hr,Wr,3)
+
+        d2 = ((centers - centers[r]) ** 2).sum(1); d2[r] = np.inf
+        nbrs = np.argsort(d2)[:n_views]
+        cons = torch.zeros((Hr, Wr), dtype=torch.int32, device=dev)
+        for n in nbrs:
+            Hn, Wn = dt[n].shape
+            Kn, Rn, tn, dn, vn = Kt[n], Rt[n], tt[n], dt[n], vt[n]
+            Xnc = (Xw - tn) @ Rn
+            zn = Xnc[..., 2]; front = zn > 1e-6
+            zsafe = torch.where(front, zn, torch.ones_like(zn))
+            un = Xnc[..., 0] / zsafe * Kn[0, 0] + Kn[0, 2]
+            vv = Xnc[..., 1] / zsafe * Kn[1, 1] + Kn[1, 2]
+            ui = torch.round(un).long(); vi = torch.round(vv).long()
+            inb = front & (ui >= 0) & (ui < Wn) & (vi >= 0) & (vi < Hn)
+            ii = vi.clamp(0, Hn - 1); jj = ui.clamp(0, Wn - 1)
+            d_n = dn[ii, jj]
+            good_n = inb & vn[ii, jj] & (d_n > 1e-6)
+            xb = (jj.float() - Kn[0, 2]) / Kn[0, 0] * d_n
+            yb = (ii.float() - Kn[1, 2]) / Kn[1, 1] * d_n
+            Xw2 = torch.stack([xb, yb, d_n], -1) @ Rn.T + tn
+            Xrc = (Xw2 - tr) @ Rr
+            zr2 = Xrc[..., 2]; frontr = zr2 > 1e-6
+            zr2s = torch.where(frontr, zr2, torch.ones_like(zr2))
+            ur2 = Xrc[..., 0] / zr2s * Kr[0, 0] + Kr[0, 2]
+            vr2 = Xrc[..., 1] / zr2s * Kr[1, 1] + Kr[1, 2]
+            reproj = torch.sqrt((ur2 - xs) ** 2 + (vr2 - ys) ** 2)
+            ddepth = torch.abs(zr2 - dr) / dr.clamp(min=1e-6)
+            cons += (good_n & frontr & (reproj < tau_pix) & (ddepth < tau_depth)).int()
+        keep = vr & (cons >= n_consistent)
+        out.append(keep.cpu().numpy())
+        total_b += int(vr.sum()); total_a += int(keep.sum())
+    print(f"  [geo-gpu] consistency filter: {total_b} -> {total_a} valid px "
+          f"({100*total_a/max(total_b,1):.1f}% kept), n_views={n_views} "
+          f"n_consistent={n_consistent} tau_pix={tau_pix} tau_depth={tau_depth}")
+    return out
+
+
+def fuse_tsdf_occupancy_torch(
+    mvs: dict, res: int, bound: float, trunc: float, device: str = "cuda",
+    shell: bool = False, shell_lo: float = -0.95,
+    chunk: int = 16_000_000,
+) -> tuple[np.ndarray, dict]:
+    """GPU port of fuse_tsdf_occupancy (identical semantics).
+
+    Chunked over voxels so peak GPU memory stays bounded: the full-grid
+    accumulators (Wsum, Vsum) are kept once, but each view projects the voxel
+    cloud a chunk at a time, so a res^3 = 512^3 grid fits on a ~10 GB GPU."""
+    import torch
+
+    dev = torch.device(device)
+    lin = torch.linspace(-bound, bound, res, device=dev)
+    ZZ, YY, XX = torch.meshgrid(lin, lin, lin, indexing="ij")
+    pts = torch.stack([XX.reshape(-1), YY.reshape(-1), ZZ.reshape(-1)], 1)  # (N,3)
+    del ZZ, YY, XX
+    N = pts.shape[0]
+    Wsum = torch.zeros(N, device=dev)
+    Vsum = torch.zeros(N, device=dev)
+
+    depths, valids, confs = mvs["depths"], mvs["valid"], mvs["conf"]
+    Ks, c2ws = mvs["K"], mvs["c2w"]
+    V = len(depths)
+    for vi in range(V):
+        depth = torch.as_tensor(np.asarray(depths[vi], np.float32), device=dev)
+        valid = torch.as_tensor(np.asarray(valids[vi], np.bool_), device=dev)
+        conf = torch.as_tensor(np.asarray(confs[vi], np.float32), device=dev) * valid
+        h, w = depth.shape
+        K = torch.as_tensor(Ks[vi].astype(np.float32), device=dev)
+        R = torch.as_tensor(c2ws[vi][:3, :3].astype(np.float32), device=dev)
+        c = torch.as_tensor(c2ws[vi][:3, 3].astype(np.float32), device=dev)
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            cam = (pts[s:e] - c) @ R
+            z = cam[:, 2]; front = z > 1e-5
+            zsafe = torch.where(front, z, torch.ones_like(z))
+            u = cam[:, 0] / zsafe * K[0, 0] + K[0, 2]
+            v = cam[:, 1] / zsafe * K[1, 1] + K[1, 2]
+            ui = torch.round(u).long(); vj = torch.round(v).long()
+            inb = front & (ui >= 0) & (ui < w) & (vj >= 0) & (vj < h)
+            if not bool(inb.any()):
+                continue
+            uii, vjj = ui[inb], vj[inb]
+            wgt = conf[vjj, uii]
+            d = depth[vjj, uii]
+            obs = wgt > 0
+            if not bool(obs.any()):
+                continue
+            sample = torch.clamp((d - z[inb]) / trunc, -1.0, 1.0)
+            sel = (torch.arange(e - s, device=dev)[inb] + s)[obs]
+            Wsum.index_add_(0, sel, wgt[obs])
+            Vsum.index_add_(0, sel, wgt[obs] * sample[obs])
+
+    observed = Wsum > 0
+    tsdf = torch.ones(N, device=dev)
+    tsdf[observed] = Vsum[observed] / Wsum[observed]
+    if shell:
+        occ_t = observed & (tsdf < 0.0) & (tsdf > shell_lo)
+    else:
+        occ_t = tsdf < 0.0
+    occ = occ_t.reshape(res, res, res).cpu().numpy()
+    info = {
+        "trunc": float(trunc),
+        "shell": bool(shell),
+        "observed_voxels": int(observed.sum().item()),
+        "occupied_voxels": int(occ.sum()),
+        "total_voxels": int(N),
+    }
+    print(f"  [tsdf-gpu] observed {info['observed_voxels']}/{N} "
+          f"({100*info['observed_voxels']/N:.1f}%), occupied {info['occupied_voxels']} "
+          f"({100*info['occupied_voxels']/N:.2f}%)")
+    return occ, info
+
+
 def clean_occupancy(
     occ: np.ndarray,
     open_iters: int = 0,
@@ -454,6 +640,8 @@ def save_sphere_compare_render(
     pct_removed: float,
     carved_label: str = "sphere carved by MVSFormer++",
     title_suffix: str = "",
+    depth_label: str = "MVSFormer++",
+    scene_label: str = "scene",
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -481,7 +669,7 @@ def save_sphere_compare_render(
                 axes[row, col].set_title(label, fontsize=11)
         axes[row, 0].set_ylabel(f"view {vi}", fontsize=10)
     fig.suptitle(
-        f"Truck sphere init carved by MVSFormer++ depths "
+        f"{scene_label} sphere init carved by {depth_label} depths "
         f"{title_suffix}({pct_removed:.1f}% voxels removed)",
         fontsize=12,
     )
@@ -489,6 +677,104 @@ def save_sphere_compare_render(
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
+
+
+def _tsdf_to_occ(tsdf, observed, shell, shell_lo):
+    """tsdf<0 = solid-behind fill; shell = thin band -shell_lo<tsdf<0 (surface only)."""
+    if shell:
+        return observed & (tsdf < 0.0) & (tsdf > shell_lo)
+    return tsdf < 0.0
+
+
+def fuse_tsdf_occupancy(
+    mvs: dict,
+    res: int,
+    bound: float,
+    trunc: float,
+    chunk_size: int,
+    shell: bool = False,
+    shell_lo: float = -0.95,
+) -> tuple[np.ndarray, dict]:
+    """Confidence-weighted, front-truncated signed fusion -> solid occupancy.
+
+    For every grid voxel p and every confident view, the signed sample is
+    ``s = clip((d_meas - z_voxel) / trunc, -1, +1)`` where ``z_voxel`` is the
+    voxel's camera-space depth and ``d_meas`` the measured depth at its pixel.
+    Front of surface (z < d) -> positive (outside); behind (z > d) -> negative
+    (inside); the ramp is metric within +-trunc. There is NO back-truncation
+    skip, so occluded interior voxels accumulate -1 and the object fills solid.
+    Samples are averaged with per-pixel confidence as weight, so a single
+    low-confidence wrong depth (textureless wall / sky) is out-weighted by the
+    good views instead of hole-punching. A voxel is occupied where the
+    confidence-weighted mean signed value is < 0; unobserved voxels (no view)
+    default to outside.
+
+    Returns (occupancy[z,y,x] bool, info).
+    """
+    lin = np.linspace(-bound, bound, res, dtype=np.float32)
+    # grid axes are (z, y, x) to match sphere_occ / save_sdf_grid
+    ZZ, YY, XX = np.meshgrid(lin, lin, lin, indexing="ij")
+    pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=1)  # world xyz
+    del ZZ, YY, XX
+    N = pts.shape[0]
+    Wsum = np.zeros(N, dtype=np.float32)   # sum of confidence weights
+    Vsum = np.zeros(N, dtype=np.float32)   # sum of weight * signed sample
+
+    depths, valids, confs = mvs["depths"], mvs["valid"], mvs["conf"]
+    Ks, c2ws = mvs["K"], mvs["c2w"]
+    V = len(depths)
+    for vi in range(V):
+        depth = np.asarray(depths[vi], dtype=np.float32)
+        valid = np.asarray(valids[vi], dtype=bool)
+        conf = np.asarray(confs[vi], dtype=np.float32) * valid  # weight 0 where invalid
+        h, w = depth.shape
+        K = Ks[vi].astype(np.float64)
+        R = c2ws[vi][:3, :3].astype(np.float64)
+        c = c2ws[vi][:3, 3].astype(np.float64)
+        n_upd = 0
+        for s in range(0, N, chunk_size):
+            e = min(s + chunk_size, N)
+            cam = (pts[s:e].astype(np.float64) - c[None]) @ R
+            z = cam[:, 2]
+            front = z > 1e-5
+            zsafe = np.where(front, z, 1.0)
+            u = cam[:, 0] / zsafe * K[0, 0] + K[0, 2]
+            v = cam[:, 1] / zsafe * K[1, 1] + K[1, 2]
+            ui = np.rint(u).astype(np.int64)
+            vj = np.rint(v).astype(np.int64)
+            inb = front & (ui >= 0) & (ui < w) & (vj >= 0) & (vj < h)
+            if not inb.any():
+                continue
+            uii, vjj = ui[inb], vj[inb]
+            wgt = conf[vjj, uii]
+            d = depth[vjj, uii].astype(np.float64)
+            obs = wgt > 0
+            if not obs.any():
+                continue
+            sample = np.clip((d - z[inb]) / trunc, -1.0, 1.0).astype(np.float32)
+            # scatter-add into the flat accumulators (global voxel indices = s + local)
+            sel = s + np.flatnonzero(inb)[obs]
+            np.add.at(Wsum, sel, wgt[obs])
+            np.add.at(Vsum, sel, wgt[obs] * sample[obs])
+            n_upd += int(obs.sum())
+        if vi % 25 == 0:
+            print(f"  [tsdf] view {vi:03d}: updated {n_upd} voxel-samples")
+
+    observed = Wsum > 0
+    tsdf = np.full(N, 1.0, dtype=np.float32)        # unobserved -> outside
+    tsdf[observed] = Vsum[observed] / Wsum[observed]
+    occ = _tsdf_to_occ(tsdf, observed, shell, shell_lo).reshape(res, res, res)
+    info = {
+        "trunc": float(trunc),
+        "shell": bool(shell),
+        "observed_voxels": int(observed.sum()),
+        "occupied_voxels": int(occ.sum()),
+        "total_voxels": int(N),
+    }
+    print(f"  [tsdf] observed {info['observed_voxels']}/{N} voxels "
+          f"({100*info['observed_voxels']/N:.1f}%), occupied {info['occupied_voxels']} "
+          f"({100*info['occupied_voxels']/N:.2f}%)")
+    return occ, info
 
 
 def main() -> None:
@@ -521,11 +807,11 @@ def main() -> None:
     print(f"res={args.res} bound={args.bound} voxel={voxel:.6f}")
     print(f"sphere center={np.round(center, 6).tolist()} radius={sphere_radius:.6f} "
           f"({radius_info['mode']})")
-    print(f"MVSFormer conf_thr={args.conf_thr} margin={margin:.6f} votes_req={args.votes_req}")
+    print(f"{args.depth_label} conf_thr={args.conf_thr} margin={margin:.6f} votes_req={args.votes_req}")
     if args.sfm_clip:
         print(f"SfM ROI clip margin={clip_margin:.6f} ({args.clip_margin_voxels:g} voxels)")
 
-    print("\nloading MVSFormer++ depths ...")
+    print(f"\nloading {args.depth_label} depths ...")
     mvs = load_mvsformer_depths_tnt_nomask(
         args.scene,
         args.depth_dir,
@@ -550,13 +836,17 @@ def main() -> None:
         )
 
     if args.geo_consistency:
-        print("\napplying cross-view geometric consistency filter ...")
-        mvs["valid"] = geometric_consistency_filter(
+        print(f"\napplying cross-view geometric consistency filter (device={args.device}) ...")
+        geo_fn = (geometric_consistency_filter_torch if args.device != "cpu"
+                  else geometric_consistency_filter)
+        geo_kw = {"device": args.device} if args.device != "cpu" else {}
+        mvs["valid"] = geo_fn(
             mvs["depths"], mvs["valid"], mvs["K"], mvs["c2w"],
             n_views=args.geo_n_views,
             n_consistent=args.geo_n_consistent,
             tau_pix=args.geo_tau_pix,
             tau_depth=args.geo_tau_depth,
+            **geo_kw,
         )
 
     print("\ninitializing enclosing sphere ...")
@@ -567,56 +857,78 @@ def main() -> None:
     save_ply(verts_s, faces_s, args.out_dir / "sphere_init.ply")
     save_sdf_grid(occ, args.bound, args.out_dir / "sdf_sphere_init.npy")
 
-    print("\nMVSFormer depth-space free carving ...")
-    occ_idx = np.argwhere(occ)
-    occ_pts = voxel_world_from_occ_indices(occ_idx, args.bound, args.res)
-    votes = np.zeros_like(occ, dtype=np.uint16)
     per_view = []
-    for vi, (depth_t, valid_t) in enumerate(zip(mvs["depths"], mvs["valid"])):
-        stats = depth_vote_view(
-            vi,
-            np.asarray(depth_t, dtype=np.float32),
-            np.asarray(valid_t, dtype=bool),
-            mvs["K"][vi],
-            mvs["c2w"][vi],
-            occ_idx,
-            occ_pts,
-            votes,
-            margin,
-            args.chunk_size,
-        )
-        per_view.append(stats)
-        print(f"  view {vi:03d}: valid={stats['valid_depth_px']:8d} "
-              f"voted_empty={stats['voxels_voted_empty']:8d}")
-
     n_sfm_protected = 0
-    remove = (votes >= args.votes_req) & occ
-    if args.protect_sfm_radius is not None:
-        print(f"\nprotecting voxels within {args.protect_sfm_radius} of SfM points ...")
-        from scipy.spatial import cKDTree
-        pts = sfm_points_in_bound(args.scene, args.bound)
-        if len(pts) == 0:
-            print("  [protect-sfm] no in-bound SfM points; skipping")
+    if args.method == "tsdf":
+        tsdf_info = None
+        print("\nconfidence-weighted TSDF fusion ...")
+        trunc = args.tsdf_trunc_voxels * voxel
+        print(f"  trunc = {trunc:.6f} ({args.tsdf_trunc_voxels:g} voxels)  device={args.device}")
+        if args.device != "cpu":
+            carved, tsdf_info = fuse_tsdf_occupancy_torch(
+                mvs, args.res, args.bound, trunc, args.device,
+                shell=args.tsdf_shell, shell_lo=args.tsdf_shell_lo)
         else:
-            tree = cKDTree(pts.astype(np.float64))
-            dist, _ = tree.query(occ_pts.astype(np.float64), k=1, workers=-1)
-            near = dist <= float(args.protect_sfm_radius)
-            protect = np.zeros_like(occ, dtype=bool)
-            nidx = occ_idx[near]
-            protect[nidx[:, 0], nidx[:, 1], nidx[:, 2]] = True
-            n_sfm_protected = int((remove & protect).sum())
-            remove &= ~protect
-            print(f"  [protect-sfm] rescued {n_sfm_protected} voted-empty voxels "
-                  f"near {len(pts)} SfM points")
-    carved = occ & ~remove
-    n_depth_removed = int(remove.sum())
-    print(f"\nremoved by MVSFormer depth votes: {n_depth_removed} / {n_occ0} "
-          f"({100 * n_depth_removed / max(n_occ0, 1):.2f}%)")
+            carved, tsdf_info = fuse_tsdf_occupancy(
+                mvs, args.res, args.bound, trunc, args.chunk_size,
+                shell=args.tsdf_shell, shell_lo=args.tsdf_shell_lo)
+        n_depth_removed = n_occ0 - int(carved.sum())
+    else:
+        tsdf_info = None
+        print(f"\n{args.depth_label} depth-space free carving ...")
+        occ_idx = np.argwhere(occ)
+        occ_pts = voxel_world_from_occ_indices(occ_idx, args.bound, args.res)
+        print(f"  device={args.device}  occupied voxels to vote: {len(occ_pts)}")
+        if args.device != "cpu":
+            votes, per_view = depth_vote_all_torch(
+                occ_idx, occ_pts, mvs["depths"], mvs["valid"],
+                mvs["K"], mvs["c2w"], args.res, margin, args.device)
+        else:
+            votes = np.zeros_like(occ, dtype=np.uint16)
+            for vi, (depth_t, valid_t) in enumerate(zip(mvs["depths"], mvs["valid"])):
+                stats = depth_vote_view(
+                    vi,
+                    np.asarray(depth_t, dtype=np.float32),
+                    np.asarray(valid_t, dtype=bool),
+                    mvs["K"][vi],
+                    mvs["c2w"][vi],
+                    occ_idx,
+                    occ_pts,
+                    votes,
+                    margin,
+                    args.chunk_size,
+                )
+                per_view.append(stats)
+                print(f"  view {vi:03d}: valid={stats['valid_depth_px']:8d} "
+                      f"voted_empty={stats['voxels_voted_empty']:8d}")
+
+        remove = (votes >= args.votes_req) & occ
+        if args.protect_sfm_radius is not None:
+            print(f"\nprotecting voxels within {args.protect_sfm_radius} of SfM points ...")
+            from scipy.spatial import cKDTree
+            pts = sfm_points_in_bound(args.scene, args.bound)
+            if len(pts) == 0:
+                print("  [protect-sfm] no in-bound SfM points; skipping")
+            else:
+                tree = cKDTree(pts.astype(np.float64))
+                dist, _ = tree.query(occ_pts.astype(np.float64), k=1, workers=-1)
+                near = dist <= float(args.protect_sfm_radius)
+                protect = np.zeros_like(occ, dtype=bool)
+                nidx = occ_idx[near]
+                protect[nidx[:, 0], nidx[:, 1], nidx[:, 2]] = True
+                n_sfm_protected = int((remove & protect).sum())
+                remove &= ~protect
+                print(f"  [protect-sfm] rescued {n_sfm_protected} voted-empty voxels "
+                      f"near {len(pts)} SfM points")
+        carved = occ & ~remove
+        n_depth_removed = int(remove.sum())
+        print(f"\nremoved by {args.depth_label} depth votes: {n_depth_removed} / {n_occ0} "
+              f"({100 * n_depth_removed / max(n_occ0, 1):.2f}%)")
 
     n_clip_removed = 0
     clip_info = None
     if args.sfm_clip:
-        print("\napplying sparse-SfM AABB clip after MVSFormer carving ...")
+        print(f"\napplying sparse-SfM AABB clip after {args.depth_label} carving ...")
         keep, clip_info = sfm_aabb_clip_mask(args.scene, carved, args.bound, clip_margin)
         before = int(carved.sum())
         carved = carved & keep
@@ -681,13 +993,17 @@ def main() -> None:
         faces_c,
         views_hi,
         pct_total,
-        "sphere carved by MVSFormer++ + SFM ROI" if args.sfm_clip else "sphere carved by MVSFormer++",
+        f"sphere carved by {args.depth_label} + SFM ROI" if args.sfm_clip else f"sphere carved by {args.depth_label}",
         "+ SFM ROI " if args.sfm_clip else "",
+        depth_label=args.depth_label,
+        scene_label=args.scene.name,
     )
 
     summary = {
         "scene": str(args.scene),
         "depth_dir": str(args.depth_dir),
+        "method": args.method,
+        "tsdf_info": tsdf_info,
         "settings": {
             "res": args.res,
             "bound": args.bound,

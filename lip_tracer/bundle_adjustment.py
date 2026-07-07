@@ -54,7 +54,7 @@ from torch import nn, Tensor
 
 from .config import Config, TrainConfig, TraceConfig
 from .loss import (photo_loss, eikonal_loss, idr_mask_loss, mask_loss_min_sdf,
-                   dvr_mask_loss, behind_hit_loss)
+                   dvr_mask_loss, behind_hit_loss, radial_distort)
 from .sphere_tracing import trace_idr, trace_unrolled
 
 
@@ -133,10 +133,18 @@ class CameraParams(nn.Module):
     one physical intrinsic is estimated from all views jointly, so a noisy view
     cannot warp its own focal. Use per-camera dK only for true multi-rig
     calibrations (e.g. DTU). Shared dK leaves the *per-camera* extrinsics free.
+
+    A shared radial distortion (k1, k2) is refined when `opt_distortion` — always
+    a single (2,) vector for the whole capture (one physical lens), regardless of
+    `shared_intrinsics`. Both start at 0, so the model reduces to pinhole exactly.
+    Distortion is applied on *normalised* image coords at every 3D→pixel reprojection
+    (`distort`) and inverted with a few fixed-point steps when a pixel is back-
+    projected into a ray (`undistort`). Only meaningful when the input frames are
+    NOT already undistorted (true raw single-camera captures, e.g. TnT).
     """
     def __init__(self, c2w_base: Tensor, lock_first: bool = True,
                  K_base: Tensor | None = None, opt_intrinsics: bool = False,
-                 shared_intrinsics: bool = False):
+                 shared_intrinsics: bool = False, opt_distortion: bool = False):
         super().__init__()
         V = c2w_base.shape[0]
         self.register_buffer("R_base", c2w_base[:, :3, :3].contiguous().float())
@@ -158,6 +166,36 @@ class CameraParams(nn.Module):
                 self.dK = nn.Parameter(torch.zeros(nK, 4))  # s_fx, s_fy, r_cx, r_cy
         else:
             self.register_buffer("K_base", torch.empty(0))
+
+        # Shared radial distortion (k1, k2) — one lens for the whole capture.
+        self.opt_distortion = opt_distortion
+        if opt_distortion:
+            self.dist = nn.Parameter(torch.zeros(2))   # k1, k2 (start at pinhole)
+
+    def distort(self, xn: Tensor) -> Tensor:
+        """Forward radial distortion of normalised coords (..., 2) (identity if off)."""
+        if not self.opt_distortion:
+            return xn
+        return radial_distort(xn, self.dist[0], self.dist[1])
+
+    def undistort(self, xn_d: Tensor, iters: int = 5) -> Tensor:
+        """Invert `distort` by fixed-point iteration: xn = xn_d / (1 + k1 r² + k2 r⁴).
+
+        For the small distortions seen in real captures this converges in a few
+        steps; differentiable in (k1, k2) so the ray-build side stays consistent
+        with the reprojection side under one shared distortion model."""
+        if not self.opt_distortion:
+            return xn_d
+        k1, k2 = self.dist[0], self.dist[1]
+        xn = xn_d
+        for _ in range(iters):
+            r2 = (xn * xn).sum(-1, keepdim=True)
+            xn = xn_d / (1.0 + k1 * r2 + k2 * r2 * r2)
+        return xn
+
+    def distortion_params(self) -> list[nn.Parameter]:
+        """The learnable distortion parameters (empty when opt_distortion is off)."""
+        return [self.dist] if self.opt_distortion else []
 
     def intrinsics(self) -> Tensor:
         """Live per-camera intrinsics K (V, 3, 3) from the base + learned delta."""
@@ -200,15 +238,22 @@ class CameraParams(nn.Module):
 
 
 def rays_from_pixels(c2w: Tensor, K: Tensor, px: Tensor, py: Tensor,
-                     vi: Tensor) -> tuple[Tensor, Tensor]:
+                     vi: Tensor, undistort=None) -> tuple[Tensor, Tensor]:
     """Rebuild (o, d) for a batch of rays from current camera params.
 
     c2w: (V, 4, 4)   K: (V, 3, 3)   px, py: (B,) float pixel coords   vi: (B,) long
     Returns o: (B, 3), d: (B, 3) unit-norm — both differentiable wrt c2w (hence φ).
+
+    `(px - cx)/fx` are the *distorted* normalised coords; with a distortion model
+    `undistort` maps them back to the true (pinhole) ray direction so the source
+    (ray-build) and target (reproject) sides use one consistent camera.
     """
     Kb = K[vi]; cw = c2w[vi]                                # (B, 3, 3), (B, 4, 4)
     x = (px - Kb[:, 0, 2]) / Kb[:, 0, 0]
     y = (py - Kb[:, 1, 2]) / Kb[:, 1, 1]
+    if undistort is not None:
+        xy = undistort(torch.stack([x, y], dim=-1))         # (B, 2) true normalised
+        x, y = xy[:, 0], xy[:, 1]
     d_cam = torch.stack([x, y, torch.ones_like(x)], dim=-1)  # (B, 3)
     d_w   = torch.einsum("bij,bj->bi", cw[:, :3, :3], d_cam)
     d_w   = d_w / d_w.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -358,7 +403,9 @@ def photometric_objective(f, cam_params: CameraParams, idx: Tensor,
     K_all       = cam_params.intrinsics()            # (V, 3, 3)
     origins_all = c2w_all[:, :3, 3]
     w2c_all     = torch.linalg.inv(c2w_all)
-    o, u = rays_from_pixels(c2w_all, K_all, px, py, vi)   # ← φ_i
+    _distort = cam_params.distort if cam_params.opt_distortion else None
+    _undistort = cam_params.undistort if cam_params.opt_distortion else None
+    o, u = rays_from_pixels(c2w_all, K_all, px, py, vi, undistort=_undistort)   # ← φ_i
 
     # Efficient (mostly no-grad) depth solve in the model's trace mode. We discard
     # the trace's own x_θ (it detaches o,u) and re-derive the intersection below
@@ -388,8 +435,15 @@ def photometric_objective(f, cam_params: CameraParams, idx: Tensor,
     # primary-camera reprojection of the hit point (φ_i view) for the L1 term
     w2c_self  = w2c_all[vi]
     xc_self   = torch.einsum("bij,bj->bi", w2c_self[:, :3, :3], x_theta) + w2c_self[:, :3, 3]
-    uv_h_self = torch.einsum("bij,bj->bi", K_all[vi], xc_self)
-    uv_self   = uv_h_self[:, :2] / uv_h_self[:, 2:3].clamp(min=1e-6)
+    if _distort is None:
+        uv_h_self = torch.einsum("bij,bj->bi", K_all[vi], xc_self)
+        uv_self   = uv_h_self[:, :2] / uv_h_self[:, 2:3].clamp(min=1e-6)
+    else:
+        xn_self = xc_self[:, :2] / xc_self[:, 2:3].clamp(min=1e-6)
+        xn_self = _distort(xn_self)
+        Kv = K_all[vi]
+        uv_self = torch.stack([xn_self[:, 0] * Kv[:, 0, 0] + Kv[:, 0, 2],
+                               xn_self[:, 1] * Kv[:, 1, 1] + Kv[:, 1, 2]], dim=-1)
 
     radius = max(1, int(math.ceil(2.0 * train_cfg.gaussian_sigma)))
     E, stats = photo_loss(
@@ -411,6 +465,7 @@ def photometric_objective(f, cam_params: CameraParams, idx: Tensor,
         ncc_normal_patch=train_cfg.ncc_normal_patch,
         ncc_normal_half_pix=train_cfg.ncc_normal_half_pix,
         ncc_patch_wsigma=train_cfg.ncc_patch_wsigma,
+        distort=_distort,
         trace_cfg=trace_cfg,
     )
     aux = dict(o=o, u=u, fg_self=fg_self, x_theta=x_theta, hit=hit,
@@ -532,7 +587,8 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
     cam_params = CameraParams(ctx.c2w_base, lock_first=ba.lock_first,
                               K_base=ctx.K_all,
                               opt_intrinsics=ba.opt_intrinsics,
-                              shared_intrinsics=ba.shared_intrinsics).to(device)
+                              shared_intrinsics=ba.shared_intrinsics,
+                              opt_distortion=ba.opt_distortion).to(device)
     # Optionally free ONLY one camera (e.g. the perturbed one in a recovery test):
     # zero every other camera's extrinsic gradient so the rig cannot translation-
     # drift and the recovery metric is read on that camera in isolation.
@@ -548,6 +604,9 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
     if ba.opt_intrinsics:
         phi_groups.append({"params": cam_params.intrinsics_params(),
                            "lr": ba.lr_intrinsics})
+    if ba.opt_distortion:
+        phi_groups.append({"params": cam_params.distortion_params(),
+                           "lr": ba.lr_distortion})
     opt_phi   = torch.optim.Adam(phi_groups)
     opt_theta = torch.optim.Adam(f.parameters(),          lr=ba.lr_theta)
 
@@ -643,6 +702,9 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
                   if ba.shared_intrinsics else "per-camera")
         print(f"  [BA] intrinsics K (fx,fy,cx,cy) refined in φ-block  "
               f"lr_K={ba.lr_intrinsics}  [{_Kmode}]", flush=True)
+    if ba.opt_distortion:
+        print(f"  [BA] shared radial distortion (k1,k2) refined in φ-block  "
+              f"lr_dist={ba.lr_distortion}  [one lens, all views]", flush=True)
     _trace_name = "trace_idr" if trace_cfg.grad_mode == "idr" else "trace_unrolled"
     _beta_note = ""
     if trace_cfg.grad_mode == "idr" and trace_cfg.sdf_min_beta > 0 and train_cfg.w_sil <= 0:
@@ -765,6 +827,10 @@ def run_bundle_adjustment(f, ctx: BAContext, train_cfg: TrainConfig,
                 msg += (f"  {which}: E={s['E']:.4f} ncc={ncc:.3f} "
                         f"|g|={s.get('grad_norm', float('nan')):.2e}")
         msg += f"  |Δφ|: rot={rot_deg:.3f}° trans={trans:.4g}"
+        if ba.opt_distortion:
+            with torch.no_grad():
+                k1, k2 = cam_params.dist.tolist()
+            msg += f"  dist(k1,k2)=({k1:+.5f},{k2:+.5f})"
         print(msg, flush=True)
 
         if run_dir is not None and (cycle + 1) % max(ba.ckpt_every, 1) == 0:
@@ -810,14 +876,18 @@ class InLoopBundleAdjuster:
         self.cam_params = CameraParams(self.ctx.c2w_base, lock_first=ba.lock_first,
                                        K_base=self.ctx.K_all,
                                        opt_intrinsics=ba.opt_intrinsics,
-                                       shared_intrinsics=ba.shared_intrinsics).to(device)
-        # φ-block optimiser: extrinsics group [0] is LR-ramped; intrinsics (if any)
-        # stay at their fixed lr.
+                                       shared_intrinsics=ba.shared_intrinsics,
+                                       opt_distortion=ba.opt_distortion).to(device)
+        # φ-block optimiser: extrinsics group [0] is LR-ramped; intrinsics /
+        # distortion (if any) stay at their fixed lr.
         phi_groups = [{"params": [self.cam_params.log_rot, self.cam_params.dt],
                        "lr": ba.lr}]
         if ba.opt_intrinsics:
             phi_groups.append({"params": self.cam_params.intrinsics_params(),
                                "lr": ba.lr_intrinsics})
+        if ba.opt_distortion:
+            phi_groups.append({"params": self.cam_params.distortion_params(),
+                               "lr": ba.lr_distortion})
         self.opt_phi = torch.optim.Adam(phi_groups)
         self.target_lr = ba.lr
         self.n_blocks = 0          # φ-blocks run so far (drives the LR ramp)
@@ -1025,6 +1095,11 @@ def main() -> None:
                          "capture (TnT). Implies --opt-intrinsics.")
     ap.add_argument("--lr-intrinsics", type=float, default=None,
                     help="intrinsics learning rate (dimensionless delta; default from config)")
+    ap.add_argument("--opt-distortion", action="store_true",
+                    help="also refine a shared radial distortion (k1,k2) in the φ-block "
+                         "(one lens for all views; only for raw, non-undistorted captures)")
+    ap.add_argument("--lr-distortion", type=float, default=None,
+                    help="radial distortion learning rate (default from config)")
     # --- synthetic perturbation-recovery test ---
     ap.add_argument("--perturb-rot-deg", type=float, default=0.0,
                     help="inject a fixed rotation (deg, random axis) into each "
@@ -1066,6 +1141,8 @@ def main() -> None:
         ba.shared_intrinsics = True
         ba.opt_intrinsics = True   # shared K is meaningless without refining K
     if args.lr_intrinsics is not None: ba.lr_intrinsics = args.lr_intrinsics
+    if args.opt_distortion: ba.opt_distortion = True
+    if args.lr_distortion is not None: ba.lr_distortion = args.lr_distortion
 
     run_dir = args.out or (args.ckpt.parent / "bundle_adjust")
     bundle_adjust_from_checkpoint(args.ckpt, cfg, run_dir=run_dir,

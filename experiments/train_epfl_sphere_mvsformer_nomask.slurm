@@ -23,8 +23,8 @@ set -euo pipefail
 #   sbatch experiments/train_epfl_sphere_mvsformer_nomask.slurm Herz-Jesu-P8
 
 SCENE_NAME=${1:-fountain-P11}
-ROOT=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-
-OUTPUTS=/scratch/_projets_/willow/1-lip-tracer-new/outputs
+ROOT=${ROOT:-/home/glenain/Sphere-traced-1-Lipschitz-MLPs-}
+OUTPUTS=${OUTPUTS:-/scratch/_projets_/willow/1-lip-tracer-new/outputs}
 OUTPUTS_HOME=$ROOT/outputs
 SCENE=${SCENE:-$ROOT/data/epfl_strecha/$SCENE_NAME}
 
@@ -51,9 +51,9 @@ OCC_EPS=${OCC_EPS:-1e-3}
 DOWN=${DOWN:-1}
 JOB_TAG=${JOB_TAG:-${SCENE_NAME}_epfl_sphere_nomask_mvsformer}
 
-source /scratch/_projets_/willow/1-lip-tracer-new/.venv/bin/activate
+source ${VENV:-/scratch/_projets_/willow/1-lip-tracer-new/.venv}/bin/activate
 cd "$ROOT"
-export PATH=/home/glenain/.pixi/bin:$PATH
+export PATH=${COLMAP_PATH:-/home/glenain/.pixi/bin}:$PATH
 export MVSFORMER_REPO=${MVSFORMER_REPO:-/scratch/glenain/MVSFormerPlusPlus}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MPLCONFIGDIR=/tmp/matplotlib-${JOB_TAG}-${SLURM_JOB_ID:-0}

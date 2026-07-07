@@ -15,8 +15,9 @@ cd /home/glenain/Sphere-traced-1-Lipschitz-MLPs-
 export MPLCONFIGDIR=/tmp/matplotlib-${SLURM_JOB_ID}
 
 python tools/viz_zncc_surface.py \
-    --pt outputs/run_20260510_094943_scan65/checkpoint_final.pt \
-    --views 16 0 24 32 40 \
+    --pt outputs/run_20260614_115440_truck_gsam_mvsformer_carved_init_nomask_abstau0_geosdf1.0_5018512/ckpt/checkpoint_latest.pt \
+    --scene /home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/truck_gsam_scene \
+    --views 0 50 100 150 200 242 \
     --down 1 \
     --batch 8192 \
-    --out outputs/zncc_viz
+    --out outputs/zncc_viz_truck

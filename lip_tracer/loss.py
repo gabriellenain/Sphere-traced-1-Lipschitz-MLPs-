@@ -11,6 +11,34 @@ from .model import FTheta
 from .sphere_tracing import trace_nograd
 
 
+# ---------- radial distortion ----------
+
+def radial_distort(xn: Tensor, k1: Tensor, k2: Tensor) -> Tensor:
+    """Forward radial distortion on *normalised* image coords (..., 2).
+
+        x_d = x · (1 + k1·r² + k2·r⁴),   r² = xn·xn.
+
+    k1, k2 are scalars (one shared lens). With k1=k2=0 this is the identity, so
+    the pinhole path is recovered exactly. Used at every 3D→pixel reprojection."""
+    r2 = (xn * xn).sum(-1, keepdim=True)
+    return xn * (1.0 + k1 * r2 + k2 * r2 * r2)
+
+
+def _distort_project(xc: Tensor, K: Tensor, distort) -> Tensor:
+    """Project camera-space points xc (..., 3) to distorted pixels (..., 2).
+
+    `distort` maps normalised coords (..., 2) → distorted. `K` is (B, 3, 3); a
+    trailing patch axis on xc (e.g. xc=(B, P, 3)) is broadcast automatically.
+    Only the radial path — callers keep the plain pinhole K·xc divide for None."""
+    xn = xc[..., :2] / xc[..., 2:3].clamp(min=1e-6)
+    xn = distort(xn)
+    extra = xc.dim() - 2                       # patch axes between B and the 2-vec
+    sl = (slice(None),) + (None,) * extra
+    fx = K[:, 0, 0][sl]; fy = K[:, 1, 1][sl]
+    cx = K[:, 0, 2][sl]; cy = K[:, 1, 2][sl]
+    return torch.stack([xn[..., 0] * fx + cx, xn[..., 1] * fy + cy], dim=-1)
+
+
 # ---------- photometric ----------
 
 def bilinear_sample(images: Tensor, vi: Tensor, uv: Tensor, H: int, W: int) -> Tensor:
@@ -121,6 +149,7 @@ def pmvs_ncc_loss(
     patch_wsigma: float = 0.0,
     patch_bilateral_gamma: float = 0.0,
     world_patch: float = -1.0,
+    distort=None,
     dbg: dict | None = None,
 ) -> tuple[Tensor, Tensor, int] | tuple[Tensor, Tensor, int, Tensor]:
     """PMVS-style ZNCC: NCC on a 3D oriented patch projected into two views.
@@ -193,8 +222,11 @@ def pmvs_ncc_loss(
         R   = w2c_all[vi, :3, :3]                                                   # (B, 3, 3)
         t_v = w2c_all[vi, :3, 3]                                                    # (B, 3)
         xc  = (R.unsqueeze(1) @ pts3d.unsqueeze(-1)).squeeze(-1) + t_v.unsqueeze(1) # (B, P*P, 3)
-        ph  = (K_all[vi].unsqueeze(1) @ xc.unsqueeze(-1)).squeeze(-1)               # (B, P*P, 3)
-        uv  = ph[:, :, :2] / ph[:, :, 2:3].clamp(min=1e-6)                         # (B, P*P, 2)
+        if distort is None:
+            ph  = (K_all[vi].unsqueeze(1) @ xc.unsqueeze(-1)).squeeze(-1)           # (B, P*P, 3)
+            uv  = ph[:, :, :2] / ph[:, :, 2:3].clamp(min=1e-6)                     # (B, P*P, 2)
+        else:
+            uv  = _distort_project(xc, K_all[vi], distort)                          # (B, P*P, 2)
         return uv, xc[:, :, 2]                                                       # (B,P*P,2), (B,P*P)
 
     uv_a, z_pa = _project(vi_a)
@@ -336,7 +368,9 @@ def photo_loss(
     sample_mode: str, gaussian_sigma: float, gaussian_radius: int,
     step: int, ncc_min: float = 0.4, occ_mode: str = "pinhole",
     hit_bg: Tensor | None = None,
+    ncc_sat_tau: float = -1.0,
     w_ncc_normal: float = 0.0,
+    ncc_detach_normals: bool = True,
     ncc_topk: int = 0,
     ncc_abs_tau: float = -1.0,
     ncc_normal_patch: int = -1,
@@ -346,6 +380,7 @@ def photo_loss(
     ncc_patch_wsigma: float = 0.0,
     ncc_patch_bilateral_gamma: float = 0.0,
     ncc_world_patch: float = -1.0,
+    distort=None,
     trace_cfg=None,
     prof=None,
 ) -> tuple[Tensor, dict]:
@@ -366,6 +401,15 @@ def photo_loss(
     _skw = dict(sigma=gaussian_sigma, radius=gaussian_radius)
     c_self = (_sampler(images, vi, uv_self, H, W, **_skw)
               if sample_mode == "gaussian" else bilinear_sample(images, vi, uv_self, H, W))
+    # Reference-saturation gate: drop rays whose reference pixel is near-saturated
+    # (max channel ≥ τ) — a specular highlight blown out in the reference view
+    # contaminates every (ref,alt) pair, so it must be removed ray-wise, not per
+    # pair. Disabled when ncc_sat_tau ≤ 0.
+    if ncc_sat_tau > 0.0:
+        ref_unsat = c_self.amax(dim=-1) < ncc_sat_tau          # (B,)
+    else:
+        ref_unsat = None
+    n_ref_sat = 0 if ref_unsat is None else int((~ref_unsat).sum())
     feat_self = None
     Hf = Wf = 0
     if feature_maps is not None and w_feature > 0:
@@ -389,6 +433,10 @@ def photo_loss(
     ncc_zncc_g_vals: list[float] = []      # gradient-magnitude ZNCC
     ncc_kept = ncc_textured = ncc_valid = 0
     ncc_n_kept = ncc_n_textured = ncc_n_valid = 0
+    # Σ zncc over kept (z>ncc_min, textured) pairs. Its mean is the ZNCC the
+    # loss actually optimizes (≈ 1 - loss), as opposed to ncc_zncc which is the
+    # mean over ALL valid pairs (incl. the dropped anti-correlated ones).
+    ncc_zncc_kept_sum = 0.0
 
     # Top-K robust aggregation: per surface point, keep the K best-correlating
     # alt views across the n_alt pool (PMVS/COLMAP-style occlusion/grazing
@@ -458,8 +506,11 @@ def photo_loss(
 
         Kp   = K_all[ak];  w2cp = w2c_all[ak]
         xc   = torch.einsum("bij,bj->bi", w2cp[:, :3, :3], x_theta) + w2cp[:, :3, 3]
-        uv_h = torch.einsum("bij,bj->bi", Kp, xc)
-        uv   = uv_h[:, :2] / uv_h[:, 2:3].clamp(min=1e-6)
+        if distort is None:
+            uv_h = torch.einsum("bij,bj->bi", Kp, xc)
+            uv   = uv_h[:, :2] / uv_h[:, 2:3].clamp(min=1e-6)
+        else:
+            uv   = _distort_project(xc, Kp, distort)
         in_frame = (xc[:, 2] > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < W) \
                    & (uv[:, 1] >= 0) & (uv[:, 1] < H)
 
@@ -484,6 +535,8 @@ def photo_loss(
             mask = hit & in_frame & not_occl & cos_ok & fg_alt & fg_self
         else:
             mask = hit & in_frame & not_occl & cos_ok
+        if ref_unsat is not None:
+            mask = mask & ref_unsat
 
         n_total    += B
         n_in_frame += int(in_frame.sum())
@@ -517,9 +570,10 @@ def photo_loss(
                 feat_vals.append(feat_term.detach())
             if w_ncc > 0:
                 _dbg = {} if ncc_grad_alpha > 0.0 else None
+                n_for_patch = n[mask].detach() if ncc_detach_normals else n[mask]
                 zncc, keep, n_valid, *zf = pmvs_ncc_loss(
                     images,
-                    x_theta[mask], n[mask].detach(),
+                    x_theta[mask], n_for_patch,
                     vi[mask], ak[mask],
                     K_all, w2c_all,
                     H, W, ncc_patch, ncc_half_pix,
@@ -531,6 +585,7 @@ def photo_loss(
                     patch_wsigma=ncc_patch_wsigma,
                     patch_bilateral_gamma=ncc_patch_bilateral_gamma,
                     world_patch=ncc_world_patch,
+                    distort=distort,
                     dbg=_dbg,
                 )
                 if _dbg and "zncc_I" in _dbg:
@@ -541,6 +596,8 @@ def photo_loss(
                 ncc_kept     += int(keep.sum())
                 if zncc.numel() > 0:
                     ncc_zncc_vals.append(zncc.detach().mean())
+                if keep.any():
+                    ncc_zncc_kept_sum += float(zncc[keep].detach().sum())
                 if use_topk:
                     zpos_cols.append(_scatter_col(
                         zf[0], mask.nonzero(as_tuple=True)[0]))
@@ -579,6 +636,7 @@ def photo_loss(
                     ncc_grad_alpha=ncc_grad_alpha,
                     patch_wsigma=ncc_patch_wsigma,
                     patch_bilateral_gamma=ncc_patch_bilateral_gamma,
+                    distort=distort,
                 )
                 ncc_n_valid    += n_valid_n
                 ncc_n_textured += int(zncc_n.numel())
@@ -707,7 +765,7 @@ def photo_loss(
         loss = f(x_theta.detach()[:1]).sum() * 0.0
     stats = dict(n_mask=n_mask, n_in_frame=n_in_frame,
                  n_not_occl=n_not_occl, n_cos_ok=n_cos_ok, n_total=n_total,
-                 n_mask_bg=n_mask_bg,
+                 n_mask_bg=n_mask_bg, n_ref_sat=n_ref_sat,
                  l1=torch.stack(l1_vals).mean().item() if l1_vals else 0.0,
                  feature=torch.stack(feat_vals).mean().item() if feat_vals else 0.0,
                  ncc=torch.stack(ncc_vals).mean().item() if ncc_vals else 0.0,
@@ -715,6 +773,7 @@ def photo_loss(
                  ncc_weighted=(w_ncc * torch.stack(ncc_vals).mean().item()) if ncc_vals else 0.0,
                  ncc_normal_weighted=(w_ncc_normal * torch.stack(ncc_n_vals).mean().item()) if ncc_n_vals else 0.0,
                  ncc_zncc=torch.stack(ncc_zncc_vals).mean().item() if ncc_zncc_vals else 0.0,
+                 ncc_zncc_used=(ncc_zncc_kept_sum / ncc_kept) if ncc_kept else 0.0,
                  ncc_zncc_mean=ncc_zncc_mean,
                  ncc_zncc_topk=ncc_zncc_topk,
                  ncc_grad_alpha=ncc_grad_alpha,

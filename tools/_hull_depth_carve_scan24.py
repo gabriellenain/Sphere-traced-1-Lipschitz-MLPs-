@@ -309,6 +309,7 @@ def sfm_aabb_clip_mask(
     occ: np.ndarray,
     bound: float,
     margin: float,
+    clip_top: bool = True,
 ) -> tuple[np.ndarray, dict]:
     sfm_path = scene / "sparse_sfm_points.txt"
     if not sfm_path.exists():
@@ -323,6 +324,11 @@ def sfm_aabb_clip_mask(
 
     lo = pts.min(axis=0) - margin
     hi = pts.max(axis=0) + margin
+    if not clip_top:
+        # don't cap the +y face: textureless caps (e.g. the scan65 skull dome)
+        # have no sparse SfM points, so the AABB top slices the dome flat. Let the
+        # sphere/depth define the top; keep the tight side/bottom clip.
+        hi[1] = float(bound)
 
     res = occ.shape[0]
     lin = np.linspace(-bound, bound, res, dtype=np.float32)
@@ -336,6 +342,7 @@ def sfm_aabb_clip_mask(
         "lo": lo.tolist(),
         "hi": hi.tolist(),
         "margin": float(margin),
+        "clip_top": bool(clip_top),
     }
     return keep, info
 

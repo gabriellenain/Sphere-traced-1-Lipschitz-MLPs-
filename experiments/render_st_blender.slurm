@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu,willow
 #SBATCH --time=2:00:00
 
 # Sphere-trace ONE view's surface (no marching cubes) into a screen-space mesh,
@@ -43,16 +43,62 @@ SS="${SS:-1}"
 # A square 1024x1024 frame with native K silently zooms+crops differently.
 RES_X="${RES_X:-$RES}"
 RES_Y="${RES_Y:-$RES}"
+# DEVICE=cpu: trace on CPU (--device cpu) and force Blender Cycles onto CPU, so the
+# whole render runs on an idle CPU partition (submit with --partition=cpu_homogen
+# --gres=gpu:0) instead of queueing for a GPU. Default cuda = original GPU path.
+DEVICE="${DEVICE:-cuda}"
+# MINIMAL=1: DTU phong+normal preview only. Trace on CPU and dump the raw
+# per-pixel phong + normal buffers with the dataset GT mask composited on
+# (--mask-bg: hits outside the mask -> white), then STOP — no largest-component
+# cleanup, no Blender studio render. Fast, GPU-free, foreground-only look at
+# exactly what the tracer produced. Submit with --partition=cpu_homogen
+# --gres=gpu:0. Forces DEVICE=cpu and DUMP_BUFFERS=1.
+MINIMAL="${MINIMAL:-0}"
+# MINIMAL_DEVICE: device for the MINIMAL trace (default cpu, for the GPU-free
+# cpu_homogen path). Set MINIMAL_DEVICE=cuda to run a high-res MINIMAL render
+# (DOWN=1 + SS supersampling = millions of rays) on a GPU instead — submit with
+# --partition=gpu,willow --gres=gpu:1. Still dump-only, still skips Blender.
+[[ "$MINIMAL" == "1" ]] && { DEVICE="${MINIMAL_DEVICE:-cpu}"; DUMP_BUFFERS=1; }
+DEVICE_ARG=(--device "$DEVICE")
+[[ "$DEVICE" == "cpu" ]] && export BLENDER_FORCE_CPU=1
 
 [ -d "$RUN_DIR" ] || { echo "[error] run_dir not found: $RUN_DIR"; exit 1; }
-[ -x "$BLENDER" ] || { echo "[error] Blender not at $BLENDER"; exit 1; }
+[[ "$MINIMAL" != "1" ]] && { [ -x "$BLENDER" ] || { echo "[error] Blender not at $BLENDER"; exit 1; }; }
 mkdir -p "$OUT"
-SCENE=$(python -c "import json;print(json.load(open('$RUN_DIR/config.json'))['scene'])")
+if [[ -f "$RUN_DIR/config.json" ]]; then
+    SCENE=$(python -c "import json;print(json.load(open('$RUN_DIR/config.json'))['scene'])")
+elif [[ -f "$RUN_DIR/run.conf" ]]; then
+    SCENE=$(python -c '
+from pathlib import Path
+import re, sys
+text = Path(sys.argv[1]).read_text()
+m = re.search(r"^\s*data_dir\s*=\s*(\S+)", text, re.M)
+if not m:
+    raise SystemExit("no dataset.data_dir in run.conf")
+print(m.group(1))
+' "$RUN_DIR/run.conf")
+else
+    echo "[error] neither config.json nor run.conf found in $RUN_DIR"; exit 1
+fi
 # Match the trace exactly to the run that made this ckpt by default:
 # eps + newton_steps load from cfg['trace'] inside the script; iters is the one
 # value the script overrides via --max-iters, so pull it from the config unless
 # TRACE_ITERS is set for an intentional re-render.
-ITERS="${TRACE_ITERS:-$(python -c "import json;print(json.load(open('$RUN_DIR/config.json'))['trace']['iters'])")}"
+if [[ -f "$RUN_DIR/config.json" ]]; then
+    ITERS="${TRACE_ITERS:-$(python -c "import json;print(json.load(open('$RUN_DIR/config.json'))['trace']['iters'])")}"
+else
+    ITERS="${TRACE_ITERS:-256}"
+fi
+# EPS / NEWTON: override the trace hit threshold + Newton steps (default = run cfg;
+# NeuS hardcodes eps=1e-5 newton=8). Set both to match another run's trace exactly.
+TRACE_OVERRIDE_ARG=()
+[[ -n "${EPS:-}" ]]    && TRACE_OVERRIDE_ARG+=(--eps "$EPS")
+[[ -n "${NEWTON:-}" ]] && TRACE_OVERRIDE_ARG+=(--newton-steps "$NEWTON")
+# TFAR: override the trace far cutoff (ray length). Rigs that place cameras far
+# from the normalized origin (e.g. MVMannequin, |cam|~5.6-5.9) need this raised
+# above the run cfg's t_far (often 5.0) or every ray is cut off before the
+# surface -> 0 hits / a floor sliver. Set TFAR=8 for MVMannequin.
+[[ -n "${TFAR:-}" ]]   && TRACE_OVERRIDE_ARG+=(--t-far "$TFAR")
 
 copy_blender_gt_view() {
     local view="$1"
@@ -110,13 +156,34 @@ for VIEW in ${VIEWS//,/ }; do
     # straight from the trace (pre-meshing, pre-Blender). Off by default.
     DUMP_ARG=()
     [[ "${DUMP_BUFFERS:-0}" == "1" ]] && DUMP_ARG=(--dump-buffers)
+    # MINIMAL=1 -> composite the dataset GT mask onto the phong/normal buffers.
+    [[ "$MINIMAL" == "1" ]] && DUMP_ARG+=(--mask-bg)
+    [[ "${MASK_DILATE_PX:-0}" != "0" ]] && DUMP_ARG+=(--mask-dilate-px "$MASK_DILATE_PX")
+    [[ "${NO_MASK_FILL_HOLES:-0}" == "1" ]] && DUMP_ARG+=(--no-mask-fill-holes)
+    [[ "${FILL_MASK_MISSES:-0}" == "1" ]] && DUMP_ARG+=(--fill-mask-misses)
+    [[ "${GT_PHOTO:-0}" == "1" ]] && DUMP_ARG+=(--gt-photo)
+    # LARGEST_COMPONENT=1 -> also keep only the largest depth-connected component
+    # of the buffers (drops background planes past the silhouette + floaters).
+    [[ "${LARGEST_COMPONENT:-0}" == "1" ]] && DUMP_ARG+=(--largest-component)
+    # SMOOTH_SIGMA>0: masked Gaussian (px) on the per-pixel ∇f normals before
+    # shading, to remove high-frequency striations/grain (NOT edge aliasing) from
+    # the phong/normal buffers without softening the silhouette or real detail.
+    # 1.0-1.2 = slight smoothing; >~2 starts losing fine detail. (--dump-buffers.)
+    [[ "${SMOOTH_SIGMA:-0}" != "0" ]] && DUMP_ARG+=(--smooth-sigma "$SMOOTH_SIGMA")
     # CHUNK lowers per-step ray batch → smaller GPU peak (use on busy/shared GPUs to avoid OOM).
     python -u analysis/sphere_traced_screen_mesh.py "$RUN_DIR" \
         --ckpt "$CKPT" --view "$VIEW" --down "$DOWN" --max-iters "$ITERS" \
+        "${TRACE_OVERRIDE_ARG[@]}" "${DEVICE_ARG[@]}" \
         --supersample "$SS" "${EXPAND_ARG[@]}" "${BA_ARG[@]}" "${DUMP_ARG[@]}" \
         --chunk "${CHUNK:-32768}" \
         --grazing-cos "$GRAZING_COS" --rel-depth-gap "$RELGAP" \
         --out "$ST_PLY" || { echo "[error] trace failed for view $VIEW"; continue; }
+
+    # MINIMAL: phong+normal buffers are the deliverable — skip Blender entirely.
+    if [[ "$MINIMAL" == "1" ]]; then
+        echo "[minimal] wrote masked phong+normal buffers for view $VIEW -> $OUT"
+        continue
+    fi
 
     RENDER_PLY="$ST_PLY"
     if [[ "$KEEP_LARGEST" == "1" ]]; then

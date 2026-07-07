@@ -25,6 +25,7 @@ from carve_visual_hull_with_mvsformer_scan24 import (
     _read_pfm,
     depth_vote_view,
     depth_vote_all_torch,
+    outward_normals_from_occ,
     save_sdf_grid,
     voxel_world_from_occ_indices,
 )
@@ -92,6 +93,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--votes-req", type=int, default=3)
     ap.add_argument("--margin-voxels", type=float, default=3.0)
     ap.add_argument(
+        "--frontal-only", action="store_true",
+        help="incidence-angle gate: a view may vote a voxel empty only if it sees "
+             "that voxel's surface near-frontally (angle between the outward normal "
+             "and the direction-to-camera <= --max-incidence-deg). Grazing-view "
+             "depths on smooth caps slide to the background and falsely carve real "
+             "surface (e.g. the scan65 skull dome, only ever seen edge-on); gating "
+             "them out leaves those regions to the silhouette/sphere. Outward normals "
+             "are taken from the init occupancy gradient (radial for a sphere).")
+    ap.add_argument("--max-incidence-deg", type=float, default=65.0,
+                    help="max angle (deg) between outward normal and dir-to-camera "
+                         "for an empty-vote to count under --frontal-only")
+    ap.add_argument("--frontal-normal-sigma", type=float, default=1.0,
+                    help="Gaussian sigma (voxels) for the occupancy-gradient normals "
+                         "used by --frontal-only")
+    ap.add_argument(
         "--depth-cap", type=float, default=None,
         help="drop depth pixels beyond this value before carving (absolute units). "
              "Use 'auto' via --depth-cap-pad to derive max_cam_dist+bound+pad.")
@@ -135,6 +151,12 @@ def parse_args() -> argparse.Namespace:
              "<= --sfm-roi-dist.")
     ap.add_argument("--sfm-clip", action="store_true")
     ap.add_argument("--clip-margin-voxels", type=float, default=6.0)
+    ap.add_argument(
+        "--no-clip-top", dest="clip_top", action="store_false", default=True,
+        help="with --sfm-clip, do NOT cap the +y (top) face by the SfM AABB. "
+             "Textureless caps have no sparse points, so the AABB top slices them "
+             "flat (the scan65 skull-dome failure); the sphere/depth then define the "
+             "top while the tight side/bottom clip still removes pedestal/blobs.")
     ap.add_argument("--depth-label", type=str, default="MVSFormer++",
                     help="name of the depth source, used in the compare-plot title, "
                          "carved-panel label, and console messages (e.g. 'ACMMP'). "
@@ -528,7 +550,7 @@ def geometric_consistency_filter_torch(
 
 def fuse_tsdf_occupancy_torch(
     mvs: dict, res: int, bound: float, trunc: float, device: str = "cuda",
-    shell: bool = False, shell_lo: float = -0.95,
+    shell: bool = False, shell_lo: float = -0.95, min_weight: float = 0.0,
     chunk: int = 16_000_000,
 ) -> tuple[np.ndarray, dict]:
     """GPU port of fuse_tsdf_occupancy (identical semantics).
@@ -580,13 +602,19 @@ def fuse_tsdf_occupancy_torch(
             Wsum.index_add_(0, sel, wgt[obs])
             Vsum.index_add_(0, sel, wgt[obs] * sample[obs])
 
+    # min_weight: consensus gate. A voxel's sign is trusted only after it has
+    # accumulated at least this much confidence-weight across views (weight is
+    # summed per-view conf in [0,1], so min_weight~=k requires ~k confident
+    # views). 0 = trust a single pixel (speckle-prone, KinectFusion-unlike);
+    # >0 removes isolated single-view wrong-depth voxels (the parasite fuzz).
     observed = Wsum > 0
+    trusted = Wsum > min_weight
     tsdf = torch.ones(N, device=dev)
     tsdf[observed] = Vsum[observed] / Wsum[observed]
     if shell:
-        occ_t = observed & (tsdf < 0.0) & (tsdf > shell_lo)
+        occ_t = trusted & (tsdf < 0.0) & (tsdf > shell_lo)
     else:
-        occ_t = tsdf < 0.0
+        occ_t = trusted & (tsdf < 0.0)
     occ = occ_t.reshape(res, res, res).cpu().numpy()
     info = {
         "trunc": float(trunc),
@@ -879,10 +907,19 @@ def main() -> None:
         occ_idx = np.argwhere(occ)
         occ_pts = voxel_world_from_occ_indices(occ_idx, args.bound, args.res)
         print(f"  device={args.device}  occupied voxels to vote: {len(occ_pts)}")
+        cos_thr = None
+        normals_occ = None
+        if args.frontal_only:
+            cos_thr = float(np.cos(np.deg2rad(args.max_incidence_deg)))
+            nrm_grid = outward_normals_from_occ(occ, sigma=args.frontal_normal_sigma)
+            normals_occ = nrm_grid[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]]
+            print(f"  [frontal] incidence gate ON: max {args.max_incidence_deg:g} deg "
+                  f"(cos>={cos_thr:.3f}), normal sigma={args.frontal_normal_sigma:g}")
         if args.device != "cpu":
             votes, per_view = depth_vote_all_torch(
                 occ_idx, occ_pts, mvs["depths"], mvs["valid"],
-                mvs["K"], mvs["c2w"], args.res, margin, args.device)
+                mvs["K"], mvs["c2w"], args.res, margin, args.device,
+                normals=normals_occ, cos_incidence_thr=cos_thr)
         else:
             votes = np.zeros_like(occ, dtype=np.uint16)
             for vi, (depth_t, valid_t) in enumerate(zip(mvs["depths"], mvs["valid"])):
@@ -897,6 +934,8 @@ def main() -> None:
                     votes,
                     margin,
                     args.chunk_size,
+                    normals=normals_occ,
+                    cos_incidence_thr=cos_thr,
                 )
                 per_view.append(stats)
                 print(f"  view {vi:03d}: valid={stats['valid_depth_px']:8d} "
@@ -929,7 +968,8 @@ def main() -> None:
     clip_info = None
     if args.sfm_clip:
         print(f"\napplying sparse-SfM AABB clip after {args.depth_label} carving ...")
-        keep, clip_info = sfm_aabb_clip_mask(args.scene, carved, args.bound, clip_margin)
+        keep, clip_info = sfm_aabb_clip_mask(args.scene, carved, args.bound, clip_margin,
+                                             clip_top=args.clip_top)
         before = int(carved.sum())
         carved = carved & keep
         n_clip_removed = before - int(carved.sum())
@@ -1015,6 +1055,9 @@ def main() -> None:
             "margin_voxels": args.margin_voxels,
             "margin": margin,
             "votes_req": args.votes_req,
+            "frontal_only": bool(args.frontal_only),
+            "max_incidence_deg": args.max_incidence_deg if args.frontal_only else None,
+            "frontal_normal_sigma": args.frontal_normal_sigma if args.frontal_only else None,
             "sfm_clip": args.sfm_clip,
             "clip_margin_voxels": args.clip_margin_voxels,
             "clip_margin": clip_margin,

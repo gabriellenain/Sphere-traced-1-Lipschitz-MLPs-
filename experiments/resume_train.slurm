@@ -44,6 +44,17 @@ DTU_OFFICIAL_FREQ=${DTU_OFFICIAL_FREQ:-10000}
 DTU_OFFICIAL_RES=${DTU_OFFICIAL_RES:-384}
 DTU_OFFICIAL_BOUND=${DTU_OFFICIAL_BOUND:-1.0}
 
+# Official BMVS Chamfer (ProbeSDF pysdf metric). The train.py --resume path keeps
+# bmvs_official_freq/res/bound/protocol/n_samples from the checkpoint, but drops
+# bmvs_gt_mesh to None unless re-passed, which silently disables the eval. So set
+# BMVS_GT_MESH to re-enable the in-training BMVS Chamfer (empty = off).
+BMVS_GT_MESH=${BMVS_GT_MESH:-}
+BMVS_OFFICIAL_FREQ=${BMVS_OFFICIAL_FREQ:-10000}
+BMVS_OFFICIAL_RES=${BMVS_OFFICIAL_RES:-512}
+BMVS_OFFICIAL_BOUND=${BMVS_OFFICIAL_BOUND:-1.5}
+BMVS_OFFICIAL_PROTOCOL=${BMVS_OFFICIAL_PROTOCOL:-probesdf}
+BMVS_OFFICIAL_N_SAMPLES=${BMVS_OFFICIAL_N_SAMPLES:-300000}
+
 # Official TnT F-score, same good-alignment recipe as eval_tnt_official.py.
 # Use `-` (not `:-`) so an explicitly-empty TNT_SCENE_NAME disables TnT eval
 # (e.g. when resuming a DTU run); only an UNSET var falls back to Ignatius.
@@ -99,6 +110,14 @@ if [ -n "$DTU_EVAL_DIR" ]; then
             --dtu-official-res "$DTU_OFFICIAL_RES" --dtu-official-bound "$DTU_OFFICIAL_BOUND")
 fi
 
+BMVS_ARGS=()
+if [ -n "$BMVS_GT_MESH" ]; then
+  BMVS_ARGS=(--bmvs-gt-mesh "$BMVS_GT_MESH" --bmvs-official-freq "$BMVS_OFFICIAL_FREQ" \
+             --bmvs-official-res "$BMVS_OFFICIAL_RES" --bmvs-official-bound "$BMVS_OFFICIAL_BOUND" \
+             --bmvs-official-protocol "$BMVS_OFFICIAL_PROTOCOL" \
+             --bmvs-official-n-samples "$BMVS_OFFICIAL_N_SAMPLES")
+fi
+
 echo "Resume ckpt:       $RESUME_CKPT"
 echo "Run dir (reused):  $RUN_DIR"
 echo "Steps (new end):   $STEPS"
@@ -106,6 +125,7 @@ echo "LR warm restart:   $LR_WARM_RESTART"
 echo "Trace:             occ-iters=$OCC_ITERS occ-newton=$OCC_NEWTON_STEPS occ-eps=$OCC_EPS  masks=${MASK_ARG[*]}"
 echo "TnT eval:          ${TNT_ARGS[*]:-<off>}"
 echo "DTU eval:          ${DTU_ARGS[*]:-<off>}"
+echo "BMVS eval:         ${BMVS_ARGS[*]:-<off>}"
 echo "Log:               $LOG"
 
 python -u -m lip_tracer.train \
@@ -119,4 +139,5 @@ python -u -m lip_tracer.train \
     ${WARM_ARG[@]+"${WARM_ARG[@]}"} \
     ${TNT_ARGS[@]+"${TNT_ARGS[@]}"} \
     ${DTU_ARGS[@]+"${DTU_ARGS[@]}"} \
+    ${BMVS_ARGS[@]+"${BMVS_ARGS[@]}"} \
     --wandb 2>&1 | tee "$LOG"

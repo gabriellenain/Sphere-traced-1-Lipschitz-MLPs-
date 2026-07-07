@@ -76,6 +76,132 @@ def _percentile_inside_masks(
     return (n_view >= min_views) & (n_fg >= percentile * np.maximum(n_view, 1))
 
 
+def _percentile_inside_masks_torch(
+    pts: np.ndarray,
+    masks: np.ndarray,
+    c2ws: np.ndarray,
+    Ks: np.ndarray,
+    H: int,
+    W: int,
+    percentile: float = 0.99,
+    min_views: int = 8,
+    device: str = "cuda",
+    chunk: int = 16_000_000,
+) -> np.ndarray:
+    """GPU port of _percentile_inside_masks (identical semantics).
+
+    Projects the voxel cloud into each view on the GPU and accumulates per-voxel
+    n_view / n_fg, instead of the NumPy per-view loop. Dominant cost for
+    open/unmasked scenes (e.g. TnT Barn, ~10^8 voxels x hundreds of views).
+    Points are processed in chunks so peak GPU memory stays bounded regardless of
+    grid resolution / view resolution."""
+    dev = torch.device(device)
+    N = len(pts)
+    pts_t = torch.as_tensor(pts, dtype=torch.float32, device=dev)
+    n_view = torch.zeros(N, dtype=torch.int32, device=dev)
+    n_fg = torch.zeros(N, dtype=torch.int32, device=dev)
+    # Pre-stage per-view camera tensors + masks once (small relative to pts).
+    for mask, c2w, K in zip(masks, c2ws, Ks):
+        if not mask.any():            # empty mask = seg failure → no observation
+            continue
+        m = torch.as_tensor(np.asarray(mask, dtype=np.float32), device=dev)
+        R = torch.as_tensor(c2w[:3, :3], dtype=torch.float32, device=dev)
+        t = torch.as_tensor(c2w[:3, 3], dtype=torch.float32, device=dev)
+        Kt = torch.as_tensor(K, dtype=torch.float32, device=dev)
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            cam = (pts_t[s:e] - t) @ R
+            z = cam[:, 2]
+            valid = z > 1e-3
+            zz = torch.where(valid, z, torch.ones_like(z))
+            px = cam[:, 0] / zz * Kt[0, 0] + Kt[0, 2]
+            py = cam[:, 1] / zz * Kt[1, 1] + Kt[1, 2]
+            xi = torch.floor(px.clamp(-1, W)).long()
+            yi = torch.floor(py.clamp(-1, H)).long()
+            inb = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H) & valid
+            n_view[s:e] += inb.to(torch.int32)
+            if inb.any():
+                xi_c = xi.clamp_(0, W - 1)
+                yi_c = yi.clamp_(0, H - 1)
+                # match NumPy: any nonzero mask sample counts as foreground
+                fg = (m[yi_c, xi_c] > 0) & inb
+                n_fg[s:e] += fg.to(torch.int32)
+    inside = (n_view >= min_views) & (
+        n_fg.float() >= percentile * torch.clamp(n_view, min=1).float())
+    return inside.cpu().numpy()
+
+
+def _points_inside_masks_torch(
+    pts: np.ndarray,
+    masks: np.ndarray,
+    c2ws: np.ndarray,
+    Ks: np.ndarray,
+    H: int,
+    W: int,
+    min_views: int = 0,
+    border_aware: bool = False,
+    edge: int = 2,
+    return_support: bool = False,
+    device: str = "cuda",
+    chunk: int = 16_000_000,
+):
+    """GPU port of _points_inside_masks (op-for-op identical semantics).
+
+    The DTU/border-aware silhouette carve is the carve bottleneck: project every
+    voxel of a res^3 grid into V views, bilinear-sample the mask, strict-AND the
+    cones. This mirrors the NumPy reference on the GPU, chunked over points so
+    peak memory stays bounded regardless of grid / view resolution."""
+    dev = torch.device(device)
+    N = len(pts)
+    pts_t = torch.as_tensor(pts, dtype=torch.float32, device=dev)
+    inside = torch.ones(N, dtype=torch.bool, device=dev)
+    n_view = torch.zeros(N, dtype=torch.int32, device=dev)
+    for mask, c2w, K in zip(masks, c2ws, Ks):
+        m = torch.as_tensor(np.asarray(mask, dtype=np.float32), device=dev)
+        R = torch.as_tensor(c2w[:3, :3], dtype=torch.float32, device=dev)
+        t = torch.as_tensor(c2w[:3, 3], dtype=torch.float32, device=dev)
+        Kt = torch.as_tensor(K, dtype=torch.float32, device=dev)
+        if border_aware:
+            mb = m > 0.5
+            touch_l = bool(mb[:, :edge].any());  touch_r = bool(mb[:, -edge:].any())
+            touch_t = bool(mb[:edge, :].any());  touch_b = bool(mb[-edge:, :].any())
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            cam = (pts_t[s:e] - t) @ R
+            z = cam[:, 2]
+            valid = z > 0
+            zz = torch.where(valid, z, torch.ones_like(z))
+            px = cam[:, 0] / zz * Kt[0, 0] + Kt[0, 2]
+            py = cam[:, 1] / zz * Kt[1, 1] + Kt[1, 2]
+            x0 = torch.floor(px.clamp(-1, W)).long()
+            y0 = torch.floor(py.clamp(-1, H)).long()
+            x1 = x0 + 1
+            y1 = y0 + 1
+            in_bounds = (x0 >= 0) & (x1 < W) & (y0 >= 0) & (y1 < H) & valid
+            n_view[s:e] += in_bounds.to(torch.int32)
+            x0c = x0.clamp(0, W - 1); x1c = x1.clamp(0, W - 1)
+            y0c = y0.clamp(0, H - 1); y1c = y1.clamp(0, H - 1)
+            wx = px - x0.to(px.dtype)
+            wy = py - y0.to(py.dtype)
+            mask_val = ((1.0 - wx) * (1.0 - wy) * m[y0c, x0c] +
+                        wx * (1.0 - wy) * m[y0c, x1c] +
+                        (1.0 - wx) * wy * m[y1c, x0c] +
+                        wx * wy * m[y1c, x1c])
+            carve_here = in_bounds & (mask_val < 0.5)
+            if border_aware:
+                off_bg = valid & ~in_bounds & (
+                    ((px < 0) & (not touch_l)) | ((px >= W) & (not touch_r)) |
+                    ((py < 0) & (not touch_t)) | ((py >= H) & (not touch_b)))
+                carve_here = carve_here | off_bg
+            inside[s:e] &= ~carve_here
+    if min_views > 0:
+        inside &= n_view >= min_views
+    inside_np = inside.cpu().numpy()
+    if return_support:
+        return inside_np, n_view.cpu().numpy()
+    return inside_np
+
+
 def _points_inside_masks(
     pts: np.ndarray,
     masks: np.ndarray,
@@ -223,7 +349,8 @@ def carve(scene: Path = BLENDER_SCENE, res: int = 128, bound: float = 1.5,
           sfm_free_eps: float = 0.02,
           vh_percentile: float = 0.99,
           vh_min_views: int = 8,
-          view_keep=None) -> np.ndarray:
+          view_keep=None,
+          device: str = "cpu") -> np.ndarray:
     """Returns (res, res, res) bool occupancy grid.
 
     For NSVF-T&T scenes (intrinsics.txt + pose/ + scene/mask/), masks are
@@ -241,20 +368,34 @@ def carve(scene: Path = BLENDER_SCENE, res: int = 128, bound: float = 1.5,
     is_tnt = (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir()
     if is_tnt:
         print(f"  [carve] T&T scene -> visibility-aware percentile "
-              f"p>={vh_percentile:.3f}, min_views={vh_min_views}")
-        inside = _percentile_inside_masks(pts, masks, c2ws, Ks, H, W,
-                                          percentile=vh_percentile,
-                                          min_views=vh_min_views)
+              f"p>={vh_percentile:.3f}, min_views={vh_min_views} (device={device})")
+        if device != "cpu":
+            inside = _percentile_inside_masks_torch(pts, masks, c2ws, Ks, H, W,
+                                                    percentile=vh_percentile,
+                                                    min_views=vh_min_views,
+                                                    device=device)
+        else:
+            inside = _percentile_inside_masks(pts, masks, c2ws, Ks, H, W,
+                                              percentile=vh_percentile,
+                                              min_views=vh_min_views)
         occ = inside.reshape(res, res, res)
         # Open-air scenes have multiple legitimate components (barn + ground +
         # trees + ...); skip keep_central_component which assumes one central
         # object and would collapse the hull to a few voxels.
         return occ
     else:
-        out = _points_inside_masks(pts, masks, c2ws, Ks, H, W,
-                                   min_views=min_views,
-                                   border_aware=border_aware,
-                                   return_support=sfm_gate)
+        if device != "cpu":
+            print(f"  [carve] DTU silhouette carve on {device} (torch)")
+            out = _points_inside_masks_torch(pts, masks, c2ws, Ks, H, W,
+                                             min_views=min_views,
+                                             border_aware=border_aware,
+                                             return_support=sfm_gate,
+                                             device=device)
+        else:
+            out = _points_inside_masks(pts, masks, c2ws, Ks, H, W,
+                                       min_views=min_views,
+                                       border_aware=border_aware,
+                                       return_support=sfm_gate)
         inside, support = out if sfm_gate else (out, None)
         if border_aware:
             print(f"  [carve] border-aware: off-frame through clear edges → carved")

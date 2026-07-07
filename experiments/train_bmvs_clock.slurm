@@ -24,6 +24,11 @@ cd /home/glenain/Sphere-traced-1-Lipschitz-MLPs-
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SCENE=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/data/bmvs/bmvs_clock
+# BlendedMVS GT-mesh root: numbered folders (e.g. 3-clock/GTMeshRaw.ply) or a
+# GT_meshes/<relpath> layout. Used for the in-training VolSDF-protocol Chamfer
+# at step 0 then every 10K steps; the eval self-disables (one log line) if the
+# GT mesh for this scene is not found.
+BMVS_GT_ROOT=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/data/bmvs_gt
 OUTPUTS=/scratch/_projets_/willow/1-lip-tracer-new/outputs
 OUTPUTS_HOME=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs
 TS=$(date +%Y%m%d_%H%M%S)
@@ -49,4 +54,7 @@ python -u -m lip_tracer.train \
     --ncc-half-pix 4 \
     --ncc-bilateral-gamma 1.0 \
     --ncc-bilateral-gamma-end 0.05 \
+    --bmvs-eval-dir "$BMVS_GT_ROOT" \
+    --bmvs-official-freq 10000 \
+    --bmvs-official-res 512 \
     --wandb 2>&1 | tee "$LOG"

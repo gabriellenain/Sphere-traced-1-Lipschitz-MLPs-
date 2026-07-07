@@ -30,6 +30,10 @@ SOURCE_CONFIG=$REFERENCE_RUN/source_config_scan24_mvsformer_carved_init.json
 BMVS=${BMVS:-bmvs_clock}
 RES_TAG=${RES_TAG:-768x576}
 SCENE=$ROOT/data/bmvs/$BMVS
+# BlendedMVS GT-mesh root for the in-training VolSDF-protocol Chamfer (step 0,
+# then every 10K steps). Per-scene relpath is resolved from the scene name; the
+# eval self-disables with one log line if the GT mesh is absent.
+BMVS_GT_ROOT=${BMVS_GT_ROOT:-$ROOT/data/bmvs_gt}
 # MVSFormer++ analysis/test.py appends the resolution to --out-dir (depths -> depths_768x576)
 DEPTH_DIR=$ROOT/_diagnostics/mvsformer_${BMVS}/depths_${RES_TAG}
 CARVE_DIR=$ROOT/_diagnostics/mvsformer_${BMVS}/hull_carve
@@ -120,4 +124,7 @@ python -u -m lip_tracer.train \
     --occ-iters 32 \
     --occ-newton-steps 0 \
     --occ-eps 1e-3 \
+    --bmvs-eval-dir "$BMVS_GT_ROOT" \
+    --bmvs-official-freq 10000 \
+    --bmvs-official-res 512 \
     --wandb 2>&1 | tee "$LOG"

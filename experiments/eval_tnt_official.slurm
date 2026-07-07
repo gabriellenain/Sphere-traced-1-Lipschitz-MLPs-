@@ -4,11 +4,11 @@
 #SBATCH --error=/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/outputs/tnt_official_%j.log
 # note: log is also copied into OUT dir at the end of the script
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=180G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=gpu
-#SBATCH --time=02:00:00
+#SBATCH --partition=gpu,willow
+#SBATCH --time=06:00:00
 #SBATCH --exclude=gpu004
 
 source /scratch/_projets_/willow/1-lip-tracer/.venv/bin/activate
@@ -24,7 +24,7 @@ SCENE_DIR=${SCENE_DIR:-data/tnt/${SCENE}}
 # GT assets downloaded from tanksandtemples.org (Training set + auxiliary).
 # Expect under $GT_DIR:  ${SCENE}.ply  ${SCENE}_trans.txt  ${SCENE}.json
 GT_DIR=${GT_DIR:-data/tnt_gt/${SCENE}}
-RES=${RES:-512}
+RES=${RES:-2048}
 BOUND=${BOUND:-1.5}
 N_SAMPLES=${N_SAMPLES:-2000000}
 OUT=${OUT:-outputs/tnt_official_${SLURM_JOB_ID}}

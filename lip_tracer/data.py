@@ -392,6 +392,143 @@ def _load_epfl_strecha_views(scene: Path, down: int = 1) -> dict:
     }
 
 
+def _quat_to_rot_colmap(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """COLMAP quaternion (w,x,y,z) -> world-to-camera rotation matrix."""
+    n = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),     2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw),     1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw),     2 * (qy * qz + qx * qw),     1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def _parse_colmap_pinhole(calib: Path):
+    """Parse an ETH3D-style COLMAP text model (PINHOLE cameras).
+
+    Returns (entries, sfm_pts) where entries is a list of dicts sorted by image
+    NAME (matching the ACMMP staging order), each {name, K(3x3), R(w2c), t, W, H},
+    and sfm_pts is (N,3) sparse points (or empty).
+    """
+    cams: dict[int, dict] = {}
+    for line in (calib / "cameras.txt").read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        t = line.split()
+        cid, model = int(t[0]), t[1]
+        if model != "PINHOLE":
+            raise ValueError(f"{calib}: expected PINHOLE camera, got {model}")
+        W, H = int(t[2]), int(t[3])
+        fx, fy, cx, cy = map(float, t[4:8])
+        cams[cid] = dict(W=W, H=H, K=np.array(
+            [[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]], dtype=np.float64))
+
+    entries = []
+    expect_pose = True
+    for line in (calib / "images.txt").read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if expect_pose:
+            t = line.split()
+            qw, qx, qy, qz = map(float, t[1:5])
+            tx, ty, tz = map(float, t[5:8])
+            cam_id, name = int(t[8]), t[9]
+            cam = cams[cam_id]
+            entries.append(dict(
+                name=name, K=cam["K"].copy(), W=cam["W"], H=cam["H"],
+                R=_quat_to_rot_colmap(qw, qx, qy, qz),
+                t=np.array([tx, ty, tz], dtype=np.float64)))
+            expect_pose = False
+        else:
+            expect_pose = True
+    entries.sort(key=lambda e: e["name"])
+
+    sfm = []
+    p3d = calib / "points3D.txt"
+    if p3d.is_file():
+        for line in p3d.read_text().splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            tok = line.split()
+            sfm.append((float(tok[1]), float(tok[2]), float(tok[3])))
+    return entries, (np.asarray(sfm, dtype=np.float64) if sfm else np.empty((0, 3)))
+
+
+def _load_eth3d_views(scene: Path, down: int = 1,
+                      sfm_pctile: float = 98.0, max_side: int = 800) -> dict:
+    """Load an ETH3D high-res DSLR scene (COLMAP-undistorted) in a NORMALIZED frame.
+
+    ETH3D is metric and off-origin; like the TnT/EPFL loaders we recentre on the
+    sparse-SfM cloud and scale so ~``sfm_pctile``% of SfM points fall inside the
+    unit ball, so the DTU-tuned carve (bound=1.5) just works. The (center, scale)
+    is persisted to ``scene/eth3d_norm.json`` so the ACMMP depths (metric cam-z)
+    can be divided by the same ``scale`` at carve time, and the normalized sparse
+    points are written to ``scene/sparse_sfm_points.txt`` for the carve ROI/center.
+
+    Images are loaded downsampled (longest side <= ``max_side``, then ``down``) —
+    full-res ETH3D frames are ~24 MP and only the cameras/K matter for the carve;
+    the carve's depth loader rescales K to the depth-map grid by W ratio.
+    """
+    import imageio.v2 as imageio
+    from PIL import Image as _PIL
+
+    calib = scene / "dslr_calibration_undistorted"
+    entries, sfm = _parse_colmap_pinhole(calib)
+    if not entries:
+        raise FileNotFoundError(f"no ETH3D images parsed under {calib}")
+
+    centers_metric = np.stack([-e["R"].T @ e["t"] for e in entries])
+    if len(sfm):
+        center = np.median(sfm, axis=0)
+        d = np.linalg.norm(sfm - center, axis=1)
+        scale = float(np.percentile(d, sfm_pctile))
+    else:  # degenerate: fall back to camera extent
+        center = centers_metric.mean(axis=0)
+        scale = float(np.linalg.norm(centers_metric - center, axis=1).max())
+    scale = max(scale, 1e-6)
+
+    (scene / "eth3d_norm.json").write_text(json.dumps(
+        {"center": center.tolist(), "scale": scale,
+         "sfm_pctile": sfm_pctile}, indent=2))
+    if len(sfm):
+        np.savetxt(scene / "sparse_sfm_points.txt",
+                   ((sfm - center) / scale).astype(np.float32))
+
+    imgs, c2ws, Ks, masks = [], [], [], []
+    for e in entries:
+        ip = scene / "images" / e["name"]
+        img = imageio.imread(ip).astype(np.float32) / 255.0
+        if img.ndim == 3 and img.shape[-1] == 4:
+            img = img[..., :3]
+        H0, W0 = img.shape[:2]
+        f = max(1, int(np.ceil(max(H0, W0) / max_side))) * max(1, down)
+        K = e["K"].astype(np.float32).copy()
+        if f > 1:
+            H1, W1 = H0 // f, W0 // f
+            img = np.array(_PIL.fromarray((img * 255).astype(np.uint8)).resize(
+                (W1, H1), _PIL.BILINEAR)).astype(np.float32) / 255.0
+            K[0] /= f
+            K[1] /= f
+        H, W = img.shape[:2]
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = e["R"].T.astype(np.float32)            # cam-to-world rotation
+        c2w[:3, 3] = ((-e["R"].T @ e["t"]) - center) / scale  # normalized centre
+        imgs.append(img)
+        c2ws.append(c2w)
+        Ks.append(K)
+        masks.append(np.ones((H, W), dtype=bool))
+
+    print(f"  eth3d[{scene.name}]: {len(imgs)} views {imgs[0].shape[0]}x{imgs[0].shape[1]}  "
+          f"norm_scale={scale:.3f} center={np.round(center,3).tolist()}  (down={down})")
+    return {
+        "images": torch.from_numpy(np.stack(imgs)),
+        "masks":  torch.from_numpy(np.stack(masks)),
+        "c2w":    torch.from_numpy(np.stack(c2ws)),
+        "K":      torch.from_numpy(np.stack(Ks)),
+        "H": imgs[0].shape[0], "W": imgs[0].shape[1],
+    }
+
+
 def load_view_keep(path) -> list[int]:
     """Read a newline/whitespace-separated list of view indices to keep."""
     txt = Path(path).read_text()
@@ -418,6 +555,8 @@ def load_views(scene: Path = SCENE, down: int = 1,
 
 
 def _load_views_dispatch(scene: Path = SCENE, down: int = 1) -> dict:
+    if (scene / "dslr_calibration_undistorted" / "cameras.txt").exists():
+        return _load_eth3d_views(scene, down=down)
     if (scene / "intrinsics.txt").exists() and (scene / "pose").is_dir():
         return _load_tnt_views(scene, down=down)
     if _find_epfl_strecha_urd(scene) is not None:

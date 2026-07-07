@@ -24,10 +24,99 @@ from .data import (load_colmap_points, colmap_visibility_counts, colmap_visibili
 from .loss import (photo_loss, idr_mask_loss, mask_loss_min_sdf, dvr_mask_loss, silhouette_loss, eikonal_loss, cam_free_loss,
                    sfm_sdf_loss, geo_neus_sdf_loss, free_space_loss, sfm_behind_loss, surface_loss, mvs_depth_loss,
                    mvsdf_carving_loss, behind_hit_loss, soft_argmin_photo_loss)
-from .model import FTheta, ConvexPotentialLayer, NeuSMLP, make_model
+from .model import FTheta, ConvexPotentialLayer, NeuSMLP, RadianceNet, make_model
 from .profile import StepProfiler, MemorySnapshot, dump_static_accounting
 from .sphere_tracing import trace_unrolled, trace_idr, trace_nograd, get_last_trace_stats
 from .bundle_adjustment import InLoopBundleAdjuster
+
+
+import errno as _errno
+import time as _time
+
+# On the shared willow /scratch Lustre project quota, a full quota makes every
+# write return ENOSPC (28) or EDQUOT (122). The condition is usually transient
+# (other users' jobs finish and free space), so rather than crash a multi-hour
+# run we wait for space and retry.
+_DISK_FULL_ERRNOS = {_errno.ENOSPC, _errno.EDQUOT}
+
+
+def _disk_full_retry(fn, *args, _desc="disk write", _wait=30, _max_wait=6 * 3600, **kwargs):
+    """Call fn(*args, **kwargs), retrying on a full-quota OSError.
+
+    Waits (blocking) for space to free instead of letting the run die. Other
+    OSErrors propagate immediately. Gives up only after _max_wait seconds so a
+    genuinely permanent full disk still eventually errors out.
+    """
+    waited = 0
+    delay = _wait
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except OSError as e:
+            if e.errno not in _DISK_FULL_ERRNOS:
+                raise
+            _safe_print(
+                f"[disk] {_desc} failed: [{e.errno}] {e.strerror}; quota/disk full — "
+                f"waiting {delay}s then retrying (waited {waited}s so far)")
+            _time.sleep(delay)
+            waited += delay
+            if waited >= _max_wait:
+                _safe_print(f"[disk] {_desc} still failing after {waited}s; giving up.")
+                raise
+            delay = min(delay * 2, 600)
+
+
+def _safe_print(msg):
+    """print() that never raises on a full disk (the log file lives on the same
+    quota). Best-effort: a few short retries, then drop the message."""
+    for _ in range(3):
+        try:
+            print(msg, flush=True)
+            return
+        except OSError as e:
+            if e.errno not in _DISK_FULL_ERRNOS:
+                raise
+            _time.sleep(5)
+
+
+class _DiskFullTolerantStream:
+    """Wrap a text stream so writes don't crash the process when the log file's
+    filesystem is full. Retries briefly, then drops the line and keeps training
+    (we never want a failed *log* write to kill a run — only checkpoints are
+    worth blocking for, via _disk_full_retry)."""
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, data):
+        for _ in range(3):
+            try:
+                n = self._s.write(data)
+                self._s.flush()
+                return n
+            except OSError as e:
+                if e.errno not in _DISK_FULL_ERRNOS:
+                    raise
+                _time.sleep(5)
+        return len(data)  # drop rather than crash
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except OSError as e:
+            if e.errno not in _DISK_FULL_ERRNOS:
+                raise
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def _install_disk_full_tolerant_stdio():
+    """Make stdout/stderr survive a transient full-quota condition."""
+    if not isinstance(sys.stdout, _DiskFullTolerantStream):
+        sys.stdout = _DiskFullTolerantStream(sys.stdout)
+    if not isinstance(sys.stderr, _DiskFullTolerantStream):
+        sys.stderr = _DiskFullTolerantStream(sys.stderr)
 
 
 def _image_grad_ray_weights(det: dict, H_d: int, W_d: int) -> torch.Tensor:
@@ -133,6 +222,10 @@ def load_config_json(path: Path) -> Config:
         eval_data["dtu_eval_dir"] = Path(eval_data["dtu_eval_dir"])
     if eval_data.get("tnt_eval_dir") is not None:
         eval_data["tnt_eval_dir"] = Path(eval_data["tnt_eval_dir"])
+    if eval_data.get("bmvs_eval_dir") is not None:
+        eval_data["bmvs_eval_dir"] = Path(eval_data["bmvs_eval_dir"])
+    if eval_data.get("bmvs_gt_mesh") is not None:
+        eval_data["bmvs_gt_mesh"] = Path(eval_data["bmvs_gt_mesh"])
 
     return Config(
         model=_dataclass_from_dict(ModelConfig, data.get("model", {})),
@@ -712,11 +805,14 @@ def _render_residual_map(
 
 def _render_poses(f, views, step: int, run_dir: Path, device: str,
                   res: int = 400, trace_cfg: TraceConfig | None = None,
-                  crop_fg: bool = False) -> None:
+                  crop_fg: bool = False, radiance=None) -> None:
     """Sphere-trace 4 training views with Phong shading → PNG strip.
 
     crop_fg=True (e.g. MVMannequin, where the object fills ~9% of the frame)
     crops every panel to its view's foreground-mask bbox to drop empty margins.
+
+    radiance!=None adds a 4th row: the IDR-style colour MLP's predicted RGB at
+    each surface hit (view-dependent, using the per-ray direction as view dir).
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -738,7 +834,7 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
     light = np.array([0.577, 0.577, 0.577], dtype=np.float32)
     base  = np.array([0.72, 0.72, 0.85],    dtype=np.float32)
 
-    imgs_phong, imgs_color, imgs_hit, crop_boxes = [], [], [], []
+    imgs_phong, imgs_color, imgs_hit, imgs_pred, crop_boxes = [], [], [], [], []
     for vi in ids:
         K   = views["K"][vi].cpu().numpy()
         c2w = views["c2w"][vi].cpu().numpy()
@@ -770,12 +866,24 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
             xr_chunk = xr_all[i:i + 4096].requires_grad_(True)
             with torch.enable_grad():
                 grads.append(torch.autograd.grad(f(xr_chunk).sum(), xr_chunk)[0].detach())
-        n = torch.cat(grads, dim=0)
-        n = (n / n.norm(dim=-1, keepdim=True).clamp(min=1e-6)).cpu().numpy()
+        n_t = torch.cat(grads, dim=0)
+        n_t = n_t / n_t.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        n = n_t.cpu().numpy()
+        hit_np  = hit.cpu().numpy().reshape(H, W, 1)
+
+        # predicted view-dependent colour from the IDR colour MLP (real hits only)
+        if radiance is not None:
+            pred_parts = []
+            with torch.no_grad():
+                for i in range(0, xr_all.shape[0], 65536):
+                    pred_parts.append(
+                        radiance(xr_all[i:i + 65536], n_t[i:i + 65536],
+                                 d_t[i:i + 65536]).cpu())
+            pred = torch.cat(pred_parts, dim=0).numpy().reshape(H, W, 3)
+            imgs_pred.append(np.where(hit_np, pred, 1.0))
 
         diffuse = np.clip((n * light).sum(-1, keepdims=True), 0, 1)
         shaded  = (0.35 + 0.65 * diffuse) * base
-        hit_np  = hit.cpu().numpy().reshape(H, W, 1)
         imgs_phong.append(np.where(hit_np, shaded.reshape(H, W, 3), 1.0))
 
         # colour render: GT image downsampled to render resolution, masked by hit
@@ -817,8 +925,10 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
         imgs_phong = [_cb(im, b) for im, b in zip(imgs_phong, crop_boxes)]
         imgs_color = [_cb(im, b) for im, b in zip(imgs_color, crop_boxes)]
         imgs_hit   = [_cb(im, b) for im, b in zip(imgs_hit,   crop_boxes)]
+        imgs_pred  = [_cb(im, b) for im, b in zip(imgs_pred,  crop_boxes)]
 
-    fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+    n_rows = 4 if imgs_pred else 3
+    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5 * n_rows))
     labels = ["view A", "view B", "view C", f"back (v{back_id})"]
     for ax, img, lbl in zip(axes[0], imgs_phong, labels):
         ax.imshow(img.clip(0, 1)); ax.axis("off"); ax.set_title(lbl, fontsize=9)
@@ -829,6 +939,10 @@ def _render_poses(f, views, step: int, run_dir: Path, device: str,
     axes[0][1].set_title("Phong", fontsize=10)
     axes[1][1].set_title("Colour (GT × hit)", fontsize=10)
     axes[2][1].set_title("Hit map (green=hit  red=hole)", fontsize=10)
+    if imgs_pred:
+        for ax, img in zip(axes[3], imgs_pred):
+            ax.imshow(img.clip(0, 1)); ax.axis("off")
+        axes[3][1].set_title("Predicted colour (RadianceNet, view-dep)", fontsize=10)
     fig.suptitle(f"step {step}", fontsize=11)
     fig.tight_layout()
     out = run_dir / "render" / f"render_{step:05d}.png"
@@ -1877,6 +1991,74 @@ def _extract_world_mesh_for_dtu(f, scale_mat: np.ndarray, device: str, out_ply: 
     return out_ply
 
 
+def _run_blender_official_eval(f, scene: Path, out_dir: Path, device: str,
+                               bound: float = 1.5, res: int = 512,
+                               n_samples: int = 100_000,
+                               mask_crop: bool = True, mask_dilate_px: int = 12,
+                               mask_crop_min_ratio: float = 1.0,
+                               mask_crop_min_views: int = 1,
+                               gt_mesh: Path | None = None,
+                               mc_level: float = 0.0) -> dict[str, float] | None:
+    """In-training HF-NeuS-style Blender Chamfer with DTU-style fg-mask crop.
+
+    Mirrors evaluation/eval_Blender_official.py (--mask-crop): extract the
+    normalized-frame MC mesh (largest connected component), crop faces by
+    dilated Blender alpha masks, then compute symmetric Chamfer-L1 against the
+    resolved exact GT mesh (data/blender_gt/<scene>.ply).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    eval_dir = repo_root / "evaluation"
+    if str(eval_dir) not in sys.path:
+        sys.path.insert(0, str(eval_dir))
+    try:
+        from eval_Blender_official import (
+            eval_Blender_official, crop_blender_mesh_by_foreground_masks,
+            _resolve_gt_mesh, _scene_from_mesh, NERF_SYNTHETIC_ROOT,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  [blender_official] skipped — cannot import evaluator ({e})", flush=True)
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scene_name = _scene_from_mesh(scene) or scene.name
+    try:
+        gt_path = _resolve_gt_mesh(scene_name, scene, gt_mesh,
+                                   repo_root / "data" / "blender_gt", NERF_SYNTHETIC_ROOT)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"  [blender_official] skipped — no GT mesh ({e})", flush=True)
+        return None
+
+    # MC mesh in the normalized Blender frame (identity scale_mat → no world xform)
+    pred_ply = _extract_world_mesh_for_dtu(
+        f, np.eye(4, dtype=np.float32), device, out_dir / "pred_norm_mesh.ply",
+        bound=bound, res=res, mc_level=mc_level,
+    )
+    if pred_ply is None:
+        return None
+
+    crop_stats = {"enabled": False}
+    eval_ply = pred_ply
+    if mask_crop:
+        try:
+            eval_ply, crop_stats = crop_blender_mesh_by_foreground_masks(
+                pred_ply, scene, out_dir / "pred_norm_mesh_fgcrop.ply",
+                dilate_px=mask_dilate_px, min_ratio=mask_crop_min_ratio,
+                min_views=mask_crop_min_views,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  [blender_official] mask crop failed: {e}", flush=True)
+            return None
+
+    try:
+        metrics = eval_Blender_official(eval_ply, gt_path, n_points=n_samples)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [blender_official] chamfer failed: {e}", flush=True)
+        return None
+    metrics["foreground_mask_crop"] = crop_stats
+    (out_dir / "blender_official.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
 def _dilate_masks_disk_np(masks: np.ndarray, radius: int) -> np.ndarray:
     masks = masks.astype(bool)
     if radius <= 0:
@@ -2234,6 +2416,108 @@ def _run_tnt_official_eval(points_ply: Path, scene: Path, eval_dir: Path,
         return None
 
 
+def _run_bmvs_official_eval(f, gt_mesh_path: Path, scale_mat: np.ndarray, out_dir: Path,
+                            device: str, bound: float, res: int, n_samples: int,
+                            protocol: str, ground_axis: int, ground_value: float | None,
+                            scene_dir: Path | None = None, gt_space: str = "normalized",
+                            metric: str = "auto", mask_crop: bool = False,
+                            mask_dilate: int = 12, mc_level: float = 0.0) -> dict[str, float] | None:
+    """In-training BlendedMVS Chamfer eval. Mirrors analysis/eval_bmvs_chamfer.py.
+
+    protocol="probesdf" reproduces ProbeSDF's BMVS eval: pysdf distance from
+    each mesh's vertices to the other mesh, ignoring distances >= 0.025 in the
+    normalized frame. protocol="volsdf" keeps the sampled B.2-style recipe.
+    """
+    from skimage.measure import marching_cubes
+    import trimesh
+
+    eval_dir = Path(__file__).resolve().parent.parent / "analysis"
+    if str(eval_dir) not in sys.path:
+        sys.path.insert(0, str(eval_dir))
+    try:
+        from eval_bmvs_chamfer import (_load_mesh, _transform_mesh, _largest_component,
+                                       _drop_below_plane, _sample, _nn_metrics,
+                                       _dists_to_mesh_pysdf, _dists_to_mesh,
+                                       _dists_to_points, _mask_hull_keep)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [bmvs_official] skipped — cannot import evaluator ({e})", flush=True)
+        return None
+
+    vox = torch.linspace(-bound, bound, res, device=device)
+    grid = torch.stack(torch.meshgrid(vox, vox, vox, indexing="ij"), dim=-1).reshape(-1, 3)
+    with torch.no_grad():
+        vals = torch.cat([f(grid[i:i + 4096]) for i in range(0, len(grid), 4096)])
+    vol = vals.reshape(res, res, res).detach().cpu().numpy()
+    if vol.min() > 0 or vol.max() < 0:
+        return None
+    spacing = 2 * bound / (res - 1)
+    verts, faces, *_ = marching_cubes(vol, level=mc_level, spacing=(spacing,) * 3)
+    verts = (verts - bound).astype(np.float32)
+    if len(verts) == 0 or len(faces) == 0:
+        return None
+    pred_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    gt_mesh = _load_mesh(gt_mesh_path)
+    if gt_space == "world":
+        gt_mesh = _transform_mesh(gt_mesh, np.linalg.inv(scale_mat))
+
+    if protocol == "volsdf":
+        if ground_value is not None:
+            pred_mesh = _drop_below_plane(pred_mesh, ground_axis, ground_value)
+        pred_mesh = _largest_component(pred_mesh)
+        max_dist = None
+    else:
+        max_dist = 0.025
+
+    # NB: `probesdf` would use pysdf's surface-distance primitive, but pysdf is
+    # not in the training venv (3.9, no build headers). The earlier BMVS runs all
+    # used open3d point-to-mesh, so default `auto`->point-to-mesh keeps numbers
+    # comparable. Pass metric="probesdf" explicitly only where pysdf is available.
+    metric = "point-to-mesh" if metric == "auto" else metric
+
+    if metric == "probesdf":
+        pred_pts = np.asarray(pred_mesh.vertices, dtype=np.float32)
+        gt_pts = np.asarray(gt_mesh.vertices, dtype=np.float32)
+    else:
+        pred_pts = _sample(pred_mesh, n_samples, 0)
+        gt_pts = _sample(gt_mesh, n_samples, 1)
+    mask_stats = None
+    if mask_crop and scene_dir is not None:
+        keep_p, sp = _mask_hull_keep(pred_pts, scene_dir, mask_dilate, 1, "all", 0.95)
+        keep_g, sg = _mask_hull_keep(gt_pts, scene_dir, mask_dilate, 1, "all", 0.95)
+        pred_pts, gt_pts = pred_pts[keep_p], gt_pts[keep_g]
+        mask_stats = {"pred": sp, "gt": sg}
+    if metric == "probesdf":
+        try:
+            acc = _dists_to_mesh_pysdf(pred_pts, gt_mesh)
+            comp = _dists_to_mesh_pysdf(gt_pts, pred_mesh)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [bmvs_official] skipped — ProbeSDF pysdf metric unavailable ({e})", flush=True)
+            return None
+    elif metric == "point-to-mesh":
+        acc = _dists_to_mesh(pred_pts, gt_mesh)
+        comp = _dists_to_mesh(gt_pts, pred_mesh)
+    else:
+        acc = _dists_to_points(pred_pts, gt_pts)
+        comp = _dists_to_points(gt_pts, pred_pts)
+    metrics = _nn_metrics(acc, comp, max_dist, ignore=True)
+    raw_units_per_norm = float(np.linalg.norm(scale_mat[:3, :3], axis=0)[0])
+    metrics.update({
+        "protocol": protocol,
+        "metric": metric,
+        "gt_space": gt_space,
+        "mask_crop": mask_stats,
+        "gt_mesh": str(gt_mesh_path),
+        "n_pred_points": int(len(pred_pts)),
+        "n_gt_points": int(len(gt_pts)),
+        "raw_units_per_normalized_unit": raw_units_per_norm,
+        "chamfer_raw_units": metrics["chamfer"] * raw_units_per_norm,
+    })
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "bmvs_chamfer.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
 # ---------- debug region monitoring ----------
 
 def _setup_debug_regions(region_str: str, views: dict, device: str) -> list[dict]:
@@ -2395,6 +2679,9 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     Returns the path to the final checkpoint.
     """
     import os
+    # Survive a transient full shared-quota (see _disk_full_retry): don't let a
+    # failed log/checkpoint write kill a multi-hour run.
+    _install_disk_full_tolerant_stdio()
     cfg = cfg or Config()
     # unpack for convenience
     model_cfg = cfg.model
@@ -2447,6 +2734,26 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         # resume path may be <run>/ckpt/foo.pt (new) or <run>/foo.pt (legacy)
         run_dir = resume.parent.parent if resume.parent.name == "ckpt" else resume.parent
         run_dir.mkdir(parents=True, exist_ok=True)
+        # Preemption recovery for explicit-resume jobs: an explicitly passed
+        # --resume points at a FIXED checkpoint (e.g. checkpoint_final.pt). On a
+        # SLURM requeue we must not rewind to it — that throws away every step
+        # this run has logged since. Prefer the run's own checkpoint_latest.pt
+        # when it has advanced past the explicit target.
+        if slurm_restart_cnt > 0:
+            for cand in (run_dir / "ckpt" / "checkpoint_latest.pt",
+                         run_dir / "checkpoint_latest.pt"):
+                if cand.exists() and cand.resolve() != resume.resolve():
+                    try:
+                        cand_step = int(torch.load(cand, map_location="cpu").get("step", -1))
+                        res_step  = int(torch.load(resume, map_location="cpu").get("step", -1))
+                    except Exception:
+                        cand_step = res_step = -1
+                    if cand_step > res_step:
+                        print(f"  [preemption] SLURM_RESTART_COUNT={slurm_restart_cnt}: "
+                              f"explicit --resume {resume.name} (step {res_step}) is stale; "
+                              f"using {cand.name} (step {cand_step}) instead")
+                        resume = cand
+                    break
         print(f"  [resume] reusing run dir {run_dir}")
     elif run_dir is not None:
         run_dir = Path(run_dir)
@@ -2472,7 +2779,12 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     SURFACE_OUT = render_dir / "surface.png"
 
     full_cfg = {**cfg.to_dict(), "cmd": " ".join(sys.argv)}
-    (run_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
+    # Atomic write: a failed (ENOSPC) write to a tmp file then replace() can never
+    # truncate an existing-good config.json to 0 bytes (that corruption broke the
+    # hotdog resume — write_text opens with truncate before the failing write).
+    _cfg_tmp = run_dir / "config.json.tmp"
+    _disk_full_retry(_cfg_tmp.write_text, json.dumps(full_cfg, indent=2), _desc="config.json")
+    _cfg_tmp.replace(run_dir / "config.json")
     print(f"  run dir → {run_dir}")
 
     if use_wandb:
@@ -2574,6 +2886,39 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 print(f"  [tnt_official] {tnt_scene_name}: every "
                       f"{eval_cfg.tnt_official_freq} steps  res={eval_cfg.tnt_official_res}  "
                       f"n={eval_cfg.tnt_official_n_samples:,}  frame={eval_cfg.tnt_official_frame}")
+        # BlendedMVS scene auto-detect: cameras_sphere.npz frame + a resolvable GT mesh.
+        bmvs_scale_mat = None
+        bmvs_gt_mesh_path = None
+        if eval_cfg.bmvs_official_freq > 0:
+            cam = scene / "cameras_sphere.npz"
+            if not cam.exists():
+                print(f"  [bmvs_official] disabled — missing {cam}")
+            else:
+                gtp = eval_cfg.bmvs_gt_mesh
+                if gtp is None and eval_cfg.bmvs_eval_dir is not None:
+                    _adir = Path(__file__).resolve().parent.parent / "analysis"
+                    if str(_adir) not in sys.path:
+                        sys.path.insert(0, str(_adir))
+                    try:
+                        from eval_bmvs_chamfer import GT_REL
+                    except Exception:  # noqa: BLE001
+                        GT_REL = {}
+                    rel = GT_REL.get(scene.name)
+                    if rel is not None:
+                        cand = eval_cfg.bmvs_eval_dir / rel
+                        if not cand.exists():
+                            alt = eval_cfg.bmvs_eval_dir / "GT_meshes" / rel
+                            cand = alt if alt.exists() else cand
+                        gtp = cand
+                if gtp is None or not Path(gtp).exists():
+                    print("  [bmvs_official] disabled — GT mesh not found "
+                          "(set eval.bmvs_gt_mesh, or eval.bmvs_eval_dir for a known bmvs_* scene)")
+                else:
+                    bmvs_gt_mesh_path = Path(gtp)
+                    bmvs_scale_mat = np.load(cam)["scale_mat_0"].astype(np.float64)
+                    print(f"  [bmvs_official] {scene.name}: every {eval_cfg.bmvs_official_freq} steps  "
+                          f"res={eval_cfg.bmvs_official_res}  n={eval_cfg.bmvs_official_n_samples:,}  "
+                          f"protocol={eval_cfg.bmvs_official_protocol}  gt={bmvs_gt_mesh_path.name}")
         if train_cfg.w_sfm > 0 or train_cfg.w_geo_sdf > 0:
             try:
                 sfm_pts_all = load_colmap_points(scene)
@@ -2686,6 +3031,20 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             print("  [blender] sphere-init radius=1.0")
         f, _ = fit_sphere_init(model_cfg=model_cfg, init_cfg=_init_cfg, scene=scene)
     f = f.to(device)
+    # --- optional IDR-style view-dependent colour MLP ---
+    radiance = None
+    if train_cfg.w_rgb > 0:
+        radiance = RadianceNet(hidden=train_cfg.rgb_hidden, depth=train_cfg.rgb_depth,
+                               view_dep=train_cfg.rgb_view_dep,
+                               input_encoding=train_cfg.rgb_input_encoding,
+                               multires=train_cfg.rgb_multires).to(device)
+        if _resume_ckpt is not None and "radiance" in _resume_ckpt:
+            radiance.load_state_dict(_resume_ckpt["radiance"])
+        print(f"  radiance MLP: hidden={train_cfg.rgb_hidden} depth={train_cfg.rgb_depth} "
+              f"view_dep={train_cfg.rgb_view_dep} "
+              f"enc={train_cfg.rgb_input_encoding}"
+              f"{f'(L={train_cfg.rgb_multires})' if train_cfg.rgb_input_encoding == 'pe' else ''} "
+              f"params={sum(p.numel() for p in radiance.parameters()):,}")
     total_params = sum(p.numel() for p in f.parameters())
     n_cpl = sum(1 for m in f.net if isinstance(m, ConvexPotentialLayer)) if hasattr(f, "net") else 0
     arch_tag = getattr(f, "architecture", "mlp")
@@ -2914,7 +3273,10 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             if t_dbg.item() > 10.0: print("    MISS"); break
 
     # --- optimiser ---
-    opt       = torch.optim.Adam(f.parameters(), lr=train_cfg.lr)
+    _opt_params = list(f.parameters())
+    if radiance is not None:
+        _opt_params += list(radiance.parameters())
+    opt       = torch.optim.Adam(_opt_params, lr=train_cfg.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg.steps,
                                                              eta_min=train_cfg.lr / 10)
     start_step = 0
@@ -3028,10 +3390,14 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
 
         _need_eik = train_cfg.w_eikonal > 0 or train_cfg.w_mvs_sdf > 0 or train_cfg.mvsdf_schedule.enabled
         _trace_fn = trace_idr if trace_cfg.grad_mode == "idr" else trace_unrolled
+        _need_diff_normal = (
+            train_cfg.w_ncc_normal > 0
+            or (train_cfg.w_ncc > 0 and not train_cfg.ncc_detach_normals)
+        )
         with prof.timed("trace"):
             x_theta, t, hit, eik_pts, n_raw, sdf_min, hit_bg = _trace_fn(f_fwd, o, u, trace_cfg,
                                                                           collect_eik=_need_eik,
-                                                                          diff_normal=train_cfg.w_ncc_normal > 0)
+                                                                          diff_normal=_need_diff_normal)
         neus_trace_stats = get_last_trace_stats() if f.architecture == "neus" else None
         neus_trace_str = ""
         # hit_real = real convergence; hit_bg = reached bounding sphere exit.
@@ -3105,7 +3471,9 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 train_cfg.sample_mode, _eff_sigma, _eff_radius,
                 step, train_cfg.ncc_min, train_cfg.occ_mode,
                 hit_bg=hit_bg if trace_cfg.bsphere_radius > 0 else None,
+                ncc_sat_tau=getattr(train_cfg, "ncc_sat_tau", -1.0),
                 w_ncc_normal=train_cfg.w_ncc_normal,
+                ncc_detach_normals=train_cfg.ncc_detach_normals,
                 ncc_topk=train_cfg.ncc_topk,
                 ncc_abs_tau=getattr(train_cfg, "ncc_abs_tau", -1.0),
                 ncc_color=train_cfg.ncc_color,
@@ -3259,7 +3627,20 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         else:
             nrm = torch.zeros(1, device=device).squeeze()
 
-        loss = (ph + train_cfg.w_idr_mask * idr_mask + train_cfg.w_sil * sil + train_cfg.w_eikonal * eik
+        # learned view-dependent colour: L1 between predicted RGB at the surface
+        # hit and the observed pixel colour `gt` (real hits only). Gradient flows
+        # through x_theta → SDF (à la IDR).
+        if radiance is not None and hit.any():
+            rgb_pred = radiance(x_theta[hit], n[hit], u[hit])
+            rgb = (rgb_pred - gt[hit]).abs().mean()
+        elif radiance is not None:
+            # no hits this step — keep a valid grad_fn so backward doesn't error
+            rgb = radiance(x_theta[:1], n[:1], u[:1]).sum() * 0.0
+        else:
+            rgb = torch.zeros(1, device=device).squeeze()
+
+        loss = (ph + train_cfg.w_rgb * rgb
+                + train_cfg.w_idr_mask * idr_mask + train_cfg.w_sil * sil + train_cfg.w_eikonal * eik
                 + train_cfg.w_mask_fg * mask_fg + train_cfg.w_mask_bg * mask_bg
                 + train_cfg.w_cam_free * cfr + train_cfg.w_sfm * sfm + train_cfg.w_geo_sdf * sfm_geo + train_cfg.w_free * fs
                 + train_cfg.w_surf * surf + train_cfg.w_mvs * mvs + _eff_w_msdf * msdf
@@ -3315,23 +3696,35 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                              "multires": f.multires,
                              "opt": opt.state_dict(),
                              "scheduler": scheduler.state_dict()}
+            if radiance is not None:
+                _ckpt_payload["radiance"] = radiance.state_dict()
             if inloop_ba is not None:
                 _ckpt_payload["inloop_ba"] = inloop_ba.state_dict()
             tmp = LATEST_OUT.with_suffix(".pt.tmp")
-            torch.save(_ckpt_payload, tmp)
+            _disk_full_retry(torch.save, _ckpt_payload, tmp, _desc="latest checkpoint")
             tmp.replace(LATEST_OUT)
 
         # --- step checkpoint every STEP_CKPT_FREQ steps ---
         if step > 0 and step % STEP_CKPT_FREQ == 0:
             step_out = ckpt_dir / f"checkpoint_step_{step:06d}.pt"
-            torch.save({"f": f.state_dict(), "step": step,
+            _step_payload = {"f": f.state_dict(), "step": step,
                         "architecture": f.architecture, "group_size": f.group_size,
                         "depth": f.depth, "activation": f.activation,
                         "input_encoding": f.input_encoding,
                         "multires": f.multires,
                         "opt": opt.state_dict(),
-                        "scheduler": scheduler.state_dict()}, step_out)
-            print(f"  [ckpt] saved step checkpoint → {step_out.name}", flush=True)
+                        "scheduler": scheduler.state_dict()}
+            if radiance is not None:
+                _step_payload["radiance"] = radiance.state_dict()
+            try:
+                torch.save(_step_payload, step_out)
+                print(f"  [ckpt] saved step checkpoint → {step_out.name}", flush=True)
+            except OSError as e:
+                if e.errno not in _DISK_FULL_ERRNOS:
+                    raise
+                # redundant backup — latest checkpoint already holds progress; skip
+                step_out.unlink(missing_ok=True)
+                _safe_print(f"  [ckpt] disk full — skipped step checkpoint {step_out.name}")
             # Disabled to keep training fast: the 10k-step MC normal-map dump +
             # per-view diag PNGs are heavy diagnostics. Re-enable if needed.
             # _dump_mc_normal_maps(f, views, NORMAL_DUMP_VIEWS, step, run_dir,
@@ -3364,7 +3757,9 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                 _v = pm['ncc_valid']; _t = pm['ncc_textured']; _k = pm['ncc_kept']
                 _kf = (_k / _t) if _t > 0 else 0.0
                 _tf = (_t / _v) if _v > 0 else 0.0
-                photo_str += f"  ncc[zncc={pm['ncc_zncc']:.3f} kept={_k}/{_t}/{_v} ({_kf:.2f}|{_tf:.2f})]"
+                photo_str += (f"  ncc[zncc_all={pm['ncc_zncc']:.3f} "
+                              f"zncc_used={pm.get('ncc_zncc_used', 0.0):.3f} "
+                              f"kept={_k}/{_t}/{_v} ({_kf:.2f}|{_tf:.2f})]")
                 if train_cfg.ncc_topk > 0:
                     photo_str += (f"  ZNCC[mean{train_cfg.n_alt}="
                                   f"{pm.get('ncc_zncc_mean', 0.0):.3f} "
@@ -3401,6 +3796,9 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                           f"  sa_τ={sa_stats['sa_tau']:.3f}"
                           f"  sa_Δt={sa_stats['sa_t_err']:.3f}"
                           f"  sa_sig={sa_stats['sa_signal_frac']:.2f}")
+            rgb_str = ""
+            if radiance is not None:
+                rgb_str = f"  rgb {rgb.item():.4f}[w={train_cfg.w_rgb} -> {train_cfg.w_rgb * rgb.item():.4f}]"
             _hit_bg_str = (f"+bg{hit_bg.sum()}(ph:{ph_stats['n_mask_bg']})"
                            if trace_cfg.bsphere_radius > 0 else "")
             if train_cfg.w_idr_mask > 0 and idr_stats:
@@ -3420,7 +3818,7 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                   f"surf {surf.item():.4f}  mvs {mvs.item():.4f}  "
                   f"msdf {msdf.item():.4f}[w={_eff_w_msdf}]  beh {beh.item():.4f}  "
                   f"rf {rf.item():.4f}  eik {eik.item():.4f}[w={train_cfg.w_eikonal}]  "
-                  f"nrm {nrm.item():.4f}  ∇head {grad_norm:.6f}{neus_trace_str}{sa_str}")
+                  f"nrm {nrm.item():.4f}  ∇head {grad_norm:.6f}{neus_trace_str}{sa_str}{rgb_str}")
 
             # geometry metrics on held-out subset
             with torch.no_grad():
@@ -3490,17 +3888,22 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
 
             if score < best_score:
                 best_score = score; best_step = step
-                torch.save({"f": f.state_dict(), "step": step, "score": score,
-                            "architecture": f.architecture, "group_size": f.group_size,
-                            "depth": f.depth, "activation": f.activation,
-                            "input_encoding": f.input_encoding,
-                            "multires": f.multires}, BEST_OUT)
-                print(f"  [best_geo@{step}] score={score:.4f} → {BEST_OUT.name}")
-                torch.cuda.empty_cache()
-                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
-                render_src = render_dir / f"render_{step:05d}.png"
-                if render_src.exists():
-                    shutil.copy(render_src, render_dir / "render_best_geo.png")
+                try:
+                    torch.save({"f": f.state_dict(), "step": step, "score": score,
+                                "architecture": f.architecture, "group_size": f.group_size,
+                                "depth": f.depth, "activation": f.activation,
+                                "input_encoding": f.input_encoding,
+                                "multires": f.multires}, BEST_OUT)
+                    print(f"  [best_geo@{step}] score={score:.4f} → {BEST_OUT.name}")
+                    torch.cuda.empty_cache()
+                    _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm, radiance=radiance)
+                    render_src = render_dir / f"render_{step:05d}.png"
+                    if render_src.exists():
+                        shutil.copy(render_src, render_dir / "render_best_geo.png")
+                except OSError as e:
+                    if e.errno not in _DISK_FULL_ERRNOS:
+                        raise
+                    _safe_print(f"  [best_geo@{step}] disk full — skipped save/render")
 
             # best_photo block disabled: with a single active loss (e.g. NCC-only,
             # w_photo=0), best_photo and best_loss track the same quantity, so
@@ -3511,17 +3914,22 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             loss_ckpt_ok = train_cfg.use_blender or hr_log > 0.01
             if _cur_loss < best_loss_score and loss_ckpt_ok:
                 best_loss_score = _cur_loss
-                torch.save({"f": f.state_dict(), "step": step, "loss": _cur_loss,
-                            "architecture": f.architecture, "group_size": f.group_size,
-                            "depth": f.depth, "activation": f.activation,
-                            "input_encoding": f.input_encoding,
-                            "multires": f.multires}, BEST_LOSS_OUT)
-                print(f"  [best_loss@{step}] loss={_cur_loss:.4f} → {BEST_LOSS_OUT.name}")
-                torch.cuda.empty_cache()
-                _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
-                render_src = render_dir / f"render_{step:05d}.png"
-                if render_src.exists():
-                    shutil.copy(render_src, render_dir / "render_best_loss.png")
+                try:
+                    torch.save({"f": f.state_dict(), "step": step, "loss": _cur_loss,
+                                "architecture": f.architecture, "group_size": f.group_size,
+                                "depth": f.depth, "activation": f.activation,
+                                "input_encoding": f.input_encoding,
+                                "multires": f.multires}, BEST_LOSS_OUT)
+                    print(f"  [best_loss@{step}] loss={_cur_loss:.4f} → {BEST_LOSS_OUT.name}")
+                    torch.cuda.empty_cache()
+                    _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm, radiance=radiance)
+                    render_src = render_dir / f"render_{step:05d}.png"
+                    if render_src.exists():
+                        shutil.copy(render_src, render_dir / "render_best_loss.png")
+                except OSError as e:
+                    if e.errno not in _DISK_FULL_ERRNOS:
+                        raise
+                    _safe_print(f"  [best_loss@{step}] disk full — skipped save/render")
             elif _cur_loss < best_loss_score and not loss_ckpt_ok:
                 print(f"  [best_loss@{step}] skipped: loss={_cur_loss:.4f} but hit={hr_log:.2%}")
 
@@ -3549,15 +3957,45 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             dtu_official = None
             mvm_official = None
             tnt_official = None
-            if (train_cfg.use_blender and gt_pts is not None
-                    and eval_cfg.blender_chamfer_freq > 0
-                    and step % eval_cfg.blender_chamfer_freq == 0):
-                cd = _mc_chamfer(f, gt_pts, device, bound=eval_cfg.bound_blender, mc_level=eval_cfg.mc_level)
-                if cd is not None:
-                    print(f"  [chamfer@{step:5d}] sym={cd['chamfer']:.6f}  "
-                          f"precision={cd['precision']:.6f}  completeness={cd['completeness']:.6f}")
-                else:
-                    print(f"  [chamfer@{step:5d}] n/a (surface not in bounds)")
+            bmvs_official = None
+            blender_official = None
+            if train_cfg.use_blender:
+                if (gt_pts is not None and eval_cfg.blender_chamfer_freq > 0
+                        and step % eval_cfg.blender_chamfer_freq == 0):
+                    cd = _mc_chamfer(f, gt_pts, device, bound=eval_cfg.bound_blender, mc_level=eval_cfg.mc_level)
+                    if cd is not None:
+                        print(f"  [chamfer@{step:5d}] sym={cd['chamfer']:.6f}  "
+                              f"precision={cd['precision']:.6f}  completeness={cd['completeness']:.6f}")
+                    else:
+                        print(f"  [chamfer@{step:5d}] n/a (surface not in bounds)")
+                if (eval_cfg.blender_official_freq > 0
+                        and step % eval_cfg.blender_official_freq == 0):
+                    off_dir = run_dir / "blender_official" / f"step_{step:06d}"
+                    try:
+                        blender_official = _run_blender_official_eval(
+                            f, scene, off_dir, device,
+                            bound=eval_cfg.blender_official_bound,
+                            res=eval_cfg.blender_official_res,
+                            n_samples=eval_cfg.blender_official_n_samples,
+                            mask_crop=eval_cfg.blender_official_mask_crop,
+                            mask_dilate_px=eval_cfg.blender_official_mask_dilate_px,
+                            mask_crop_min_ratio=eval_cfg.blender_official_mask_crop_min_ratio,
+                            mask_crop_min_views=eval_cfg.blender_official_mask_crop_min_views,
+                            mc_level=eval_cfg.mc_level,
+                        )
+                    except OSError as e:
+                        if e.errno not in _DISK_FULL_ERRNOS:
+                            raise
+                        blender_official = None
+                        _safe_print(f"  [blender_official@{step:5d}] disk full — skipped eval")
+                    if blender_official is not None:
+                        print(f"  [blender_official@{step:5d}] "
+                              f"chamfer={blender_official['chamfer']:.6f}  "
+                              f"acc={blender_official['accuracy']:.6f}  "
+                              f"comp={blender_official['completeness']:.6f}  "
+                              f"x100={blender_official['chamfer_x100']:.4f}  out={off_dir}")
+                    else:
+                        print(f"  [blender_official@{step:5d}] n/a (surface not in bounds / no GT)")
             elif not train_cfg.use_blender:
                 sfm_surf_due = eval_cfg.dtu_chamfer_freq > 0 and step % eval_cfg.dtu_chamfer_freq == 0
                 official_due = (
@@ -3572,6 +4010,19 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                     and eval_cfg.tnt_eval_dir is not None
                     and tnt_scene_name is not None
                 )
+                bmvs_official_due = (
+                    eval_cfg.bmvs_official_freq > 0 and step >= 0
+                    and step % eval_cfg.bmvs_official_freq == 0
+                    and bmvs_scale_mat is not None and bmvs_gt_mesh_path is not None
+                )
+                # colour render on the DTU-official cadence (step 0 then every
+                # dtu_official_freq): predicted RGB from the colour MLP alongside
+                # Phong/GT/hit. Only when the colour MLP is active.
+                if (radiance is not None and eval_cfg.dtu_official_freq > 0
+                        and step % eval_cfg.dtu_official_freq == 0):
+                    torch.cuda.empty_cache()
+                    _render_poses(f, views, step, run_dir, device,
+                                  trace_cfg=trace_cfg, crop_fg=is_mvm, radiance=radiance)
                 if sfm_surf_due and (train_cfg.w_sfm > 0 or train_cfg.w_geo_sdf > 0) and sfm_pts.numel() > 3:
                     sfm_surf = _mc_sfm_surface_distance(
                         f, sfm_pts, device,
@@ -3610,7 +4061,7 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                                   f"comp={dtu_official['completeness']:.4f}mm  out={off_dir}")
                 # MVMannequin parallel path: same cadence, different eval recipe.
                 mvm_official_due = (
-                    eval_cfg.dtu_official_freq > 0 and step > 0
+                    eval_cfg.dtu_official_freq > 0 and step >= 0
                     and step % eval_cfg.dtu_official_freq == 0 and is_mvm
                 )
                 if mvm_official_due:
@@ -3647,16 +4098,38 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                                   f"P={tnt_official['precision']:.4f}  "
                                   f"R={tnt_official['recall']:.4f}  "
                                   f"tau={tnt_official['tau']:.4f}  out={off_dir}")
+                if bmvs_official_due:
+                    off_dir = run_dir / "bmvs_official" / f"step_{step:06d}"
+                    bmvs_official = _run_bmvs_official_eval(
+                        f, bmvs_gt_mesh_path, bmvs_scale_mat, off_dir, device,
+                        bound=eval_cfg.bmvs_official_bound,
+                        res=eval_cfg.bmvs_official_res,
+                        n_samples=eval_cfg.bmvs_official_n_samples,
+                        protocol=eval_cfg.bmvs_official_protocol,
+                        ground_axis=eval_cfg.bmvs_official_ground_axis,
+                        ground_value=eval_cfg.bmvs_official_ground_value,
+                        scene_dir=scene,
+                        mc_level=eval_cfg.mc_level,
+                    )
+                    if bmvs_official is not None:
+                        print(f"  [bmvs_official@{step:5d}] chamfer={bmvs_official['chamfer']:.6f}  "
+                              f"acc={bmvs_official['accuracy']:.6f}  "
+                              f"comp={bmvs_official['completeness']:.6f}  out={off_dir}")
+                    else:
+                        print(f"  [bmvs_official@{step:5d}] n/a (surface not in bounds)")
 
             if use_wandb:
                 import wandb
                 log = {"loss": loss.item(), "photo": ph.item(), "sil": sil.item(),
                        "sfm": sfm.item(), "geo_sdf": sfm_geo.item(),
+                       "eik": eik.item(),
+                       "eik_weighted": train_cfg.w_eikonal * eik.item(),
                        "photo_l1": ph_stats["l1"], "photo_ncc": ph_stats["ncc"],
                        "photo_ncc_weighted": ph_stats.get("ncc_weighted", 0.0),
                        "photo_ncc_normal": ph_stats.get("ncc_normal", 0.0),
                        "photo_ncc_normal_weighted": ph_stats.get("ncc_normal_weighted", 0.0),
                        "photo_ncc_zncc": ph_stats.get("ncc_zncc", 0.0),
+                       "photo_ncc_zncc_used": ph_stats.get("ncc_zncc_used", 0.0),
                        "photo_ncc_zncc_mean": ph_stats.get("ncc_zncc_mean", 0.0),
                        "photo_ncc_zncc_topk": ph_stats.get("ncc_zncc_topk", 0.0),
                        "photo_ncc_zncc_I": ph_stats.get("ncc_zncc_I", 0.0),
@@ -3669,6 +4142,9 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                        "hit_rate": hit.float().mean().item(), "cams_out": cams_out,
                        "grad_norm_mean": grad_mean, "sil_iou": sil_iou,
                        "best_geo_score": best_score}
+                if radiance is not None:
+                    log["rgb_l1"] = rgb.item()
+                    log["rgb_weighted"] = train_cfg.w_rgb * rgb.item()
                 if torch.cuda.is_available():
                     log["peak_mem_mb"] = torch.cuda.max_memory_allocated(device) / 1e6
                     torch.cuda.reset_peak_memory_stats(device)
@@ -3694,6 +4170,16 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                     log["tnt_official_precision"] = tnt_official["precision"]
                     log["tnt_official_recall"] = tnt_official["recall"]
                     log["tnt_official_tau"] = tnt_official["tau"]
+                if bmvs_official is not None:
+                    log["bmvs_official_chamfer"] = bmvs_official["chamfer"]
+                    log["bmvs_official_acc"] = bmvs_official["accuracy"]
+                    log["bmvs_official_comp"] = bmvs_official["completeness"]
+                    log["bmvs_official_chamfer_raw"] = bmvs_official["chamfer_raw_units"]
+                if blender_official is not None:
+                    log["blender_official_chamfer"] = blender_official["chamfer"]
+                    log["blender_official_acc"] = blender_official["accuracy"]
+                    log["blender_official_comp"] = blender_official["completeness"]
+                    log["blender_official_chamfer_x100"] = blender_official["chamfer_x100"]
                 if (render_dir / "render_{:05d}.png".format(step)).exists():
                     log["render"] = wandb.Image(str(render_dir / "render_{:05d}.png".format(step)))
                 wandb.log(log, step=step)
@@ -3704,13 +4190,13 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                      "activation": f.activation,
                      "input_encoding": f.input_encoding,
                      "multires": f.multires, "step": step}
-    torch.save(final_payload, OUT)
+    _disk_full_retry(torch.save, final_payload, OUT, _desc="final checkpoint")
     FINAL_OUT = ckpt_dir / "checkpoint_final.pt"
-    torch.save(final_payload, FINAL_OUT)
+    _disk_full_retry(torch.save, final_payload, FINAL_OUT, _desc="checkpoint_final")
     print(f"saved → {OUT}")
     print(f"final → {FINAL_OUT.name}")
     try:
-        _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm)
+        _render_poses(f, views, step, run_dir, device, trace_cfg=trace_cfg, crop_fg=is_mvm, radiance=radiance)
         final_render = render_dir / f"render_{step:05d}.png"
         if final_render.exists():
             shutil.copy(final_render, render_dir / "render_final.png")
@@ -3784,7 +4270,8 @@ if __name__ == "__main__":
     ap.add_argument("--depth",      type=int,   default=_mc.depth)
     ap.add_argument("--group-size", type=int,   default=_mc.group_size)
     ap.add_argument("--activation", type=str,   default=_mc.activation,
-                    choices=["groupsort", "nact"], help="activation: groupsort or nact (N-Activation)")
+                    choices=["groupsort", "nact", "softplus", "centered_softplus", "softplus_cpl", "softmax_cpl", "softplus_cpl_maxmin"],
+                    help="activation: groupsort, nact, softplus, centered_softplus, softplus_cpl, softmax_cpl, or softplus_cpl_maxmin")
     ap.add_argument("--input-encoding", type=str, default=_mc.input_encoding,
                     choices=["identity", "pe"], help="input encoding before the 1-Lipschitz backbone")
     ap.add_argument("--architecture", type=str, default=_mc.architecture, choices=["cpl", "mlp", "neus"],
@@ -3812,6 +4299,11 @@ if __name__ == "__main__":
                          "the sphere become hit_bg and participate in photo loss with "
                          "photometrically inconsistent colors → gradient fills holes. "
                          "Set to ~1.5× the object bounding-sphere radius.")
+    ap.add_argument("--bsphere-start-radius", type=float, default=_trc.bsphere_start_radius,
+                    help=">0: START each trace at the ray's near intersection with this "
+                         "origin-centred bounding sphere (skip the empty camera→object gap) "
+                         "instead of at the camera. Set to the object englobing radius "
+                         "(~1.05-1.2 for origin-normalised DTU). 0 = trace from camera.")
     ap.add_argument("--t-far", type=float, default=_trc.t_far,
                     help="global ray cut-off distance (used when --bsphere-radius=0). "
                          "Must exceed max camera distance + object radius.")
@@ -3862,6 +4354,17 @@ if __name__ == "__main__":
     ap.add_argument("--points-normal-knn", type=int, default=_ic.points_normal_knn,
                     help="points init: kNN for PCA normal estimation + orientation MST")
     ap.add_argument("--w-photo",    type=float, default=_tc.w_photo)
+    ap.add_argument("--w-rgb",      type=float, default=_tc.w_rgb,
+                    help="IDR-style learned view-dependent colour MLP weight (0=off)")
+    ap.add_argument("--rgb-hidden", type=int,   default=_tc.rgb_hidden)
+    ap.add_argument("--rgb-depth",  type=int,   default=_tc.rgb_depth)
+    ap.add_argument("--rgb-no-view-dep", action="store_true",
+                    help="colour MLP: diffuse albedo only (drop view direction)")
+    ap.add_argument("--rgb-pe", action="store_true",
+                    help="colour MLP: Fourier positional encoding on position "
+                         "(not Lipschitz-constrained; sharper appearance)")
+    ap.add_argument("--rgb-multires", type=int, default=_tc.rgb_multires,
+                    help="colour MLP PE bands when --rgb-pe (default 6)")
     ap.add_argument("--w-feature",  type=float, default=_tc.w_feature,
                     help="weight for cosine distance on precomputed feature maps")
     ap.add_argument("--feature-maps", type=Path, default=_tc.feature_maps,
@@ -3886,6 +4389,10 @@ if __name__ == "__main__":
                     help="weight of the normal-branch PMVS NCC term "
                          "L=w_ncc·NCC(x,detach(n))+w_ncc_normal·NCC(detach(x),n); "
                          ">0 enables a differentiable normal (double-backward)")
+    ap.add_argument("--ncc-detach-normals", action=argparse.BooleanOptionalAction,
+                    default=_tc.ncc_detach_normals,
+                    help="detach normals in the position-branch NCC tangent patch "
+                         "(use --no-ncc-detach-normals for the normal-gradient ablation)")
     ap.add_argument("--ncc-patch", type=int, default=_tc.ncc_patch,
                     help="PMVS patch side P (PxP sample grid)")
     ap.add_argument("--ncc-half-pix", type=float, default=_tc.ncc_half_pix,
@@ -3904,6 +4411,9 @@ if __name__ == "__main__":
                          "--ncc-half-pix); pair with --ncc-normal-patch≈2·hp+1")
     ap.add_argument("--ncc-min", type=float, default=_tc.ncc_min,
                     help="PMVS photometric gate: drop pairs with ZNCC below this")
+    ap.add_argument("--ncc-sat-tau", type=float, default=_tc.ncc_sat_tau,
+                    help="reference-saturation gate: drop rays whose reference pixel "
+                         "max-channel ≥ τ (specular highlight). ≤0 disabled; τ≈0.9 typical")
     ap.add_argument("--ncc-topk", type=int, default=_tc.ncc_topk,
                     help="0: mean over all valid alt views; >0: per-point top-K "
                          "best ZNCC across the n_alt pool (robust MVS, use 3-4 "
@@ -4043,6 +4553,27 @@ if __name__ == "__main__":
                     help="cadence (steps) for the cheap in-training sfm_surf diagnostic (0=off)")
     ap.add_argument("--blender-chamfer-freq", type=int, default=_ec.blender_chamfer_freq,
                     help="cadence (steps) for in-training Blender GT chamfer (0=off)")
+    ap.add_argument("--blender-official-freq", type=int, default=_ec.blender_official_freq,
+                    help="cadence (steps) for full official HF-NeuS Blender Chamfer w/ fg-mask crop (0=off)")
+    ap.add_argument("--blender-official-res", type=int, default=_ec.blender_official_res,
+                    help="MC resolution for periodic official Blender Chamfer")
+    ap.add_argument("--blender-official-bound", type=float, default=_ec.blender_official_bound,
+                    help="MC bound for periodic official Blender Chamfer")
+    ap.add_argument("--blender-official-n-samples", type=int, default=_ec.blender_official_n_samples,
+                    help="area-uniform surface samples per mesh for periodic official Blender Chamfer")
+    ap.add_argument("--blender-official-mask-crop", action=argparse.BooleanOptionalAction,
+                    default=_ec.blender_official_mask_crop,
+                    help="crop periodic official Blender eval mesh with dilated Blender alpha masks "
+                         f"(default {_ec.blender_official_mask_crop})")
+    ap.add_argument("--blender-official-mask-dilate-px", type=int,
+                    default=_ec.blender_official_mask_dilate_px,
+                    help="mask dilation radius in pixels for periodic official Blender eval crop")
+    ap.add_argument("--blender-official-mask-crop-min-ratio", type=float,
+                    default=_ec.blender_official_mask_crop_min_ratio,
+                    help="required fraction of in-frame mask projections for official Blender eval crop")
+    ap.add_argument("--blender-official-mask-crop-min-views", type=int,
+                    default=_ec.blender_official_mask_crop_min_views,
+                    help="minimum in-frame views for official Blender eval crop")
     ap.add_argument("--dtu-chamfer-res", type=int, default=_ec.dtu_chamfer_res,
                     help="MC resolution for the sfm_surf diagnostic")
     ap.add_argument("--dtu-official-freq", type=int, default=_ec.dtu_official_freq,
@@ -4081,6 +4612,24 @@ if __name__ == "__main__":
                     help="MC bound for periodic official TnT F-score")
     ap.add_argument("--tnt-official-n-samples", type=int, default=None,
                     help="number of sampled surface points for periodic official TnT F-score")
+    ap.add_argument("--bmvs-eval-dir", default=None,
+                    help="GT root with <relpath> or GT_meshes/<relpath> for known bmvs_* scenes")
+    ap.add_argument("--bmvs-gt-mesh", default=None,
+                    help="explicit raw BlendedMVS GTMeshRaw.ply (overrides --bmvs-eval-dir lookup)")
+    ap.add_argument("--bmvs-official-freq", type=int, default=None,
+                    help="BlendedMVS Chamfer frequency in steps (0=off); step 0 included")
+    ap.add_argument("--bmvs-official-res", type=int, default=None,
+                    help="MC resolution for periodic BlendedMVS Chamfer")
+    ap.add_argument("--bmvs-official-bound", type=float, default=None,
+                    help="MC bound for periodic BlendedMVS Chamfer")
+    ap.add_argument("--bmvs-official-n-samples", type=int, default=None,
+                    help="samples per surface for periodic BlendedMVS Chamfer (VolSDF B.2 uses 100K)")
+    ap.add_argument("--bmvs-official-protocol", choices=["volsdf", "probesdf"], default=None,
+                    help="BlendedMVS Chamfer protocol (default volsdf = paper supplementary B.2)")
+    ap.add_argument("--bmvs-official-ground-axis", type=int, default=None,
+                    help="volsdf: axis (0=x,1=y,2=z) normal to the ground plane")
+    ap.add_argument("--bmvs-official-ground-value", type=float, default=None,
+                    help="volsdf: drop geometry below this offset (normalized frame); omit to skip")
     ap.add_argument("--mc-level", type=float, default=_ec.mc_level,
                     help="marching-cubes isovalue (default 0.0); slightly >0 (e.g. 0.005) "
                          "trims noisy near-zero wandering in under-supervised pockets")
@@ -4131,6 +4680,14 @@ if __name__ == "__main__":
                 dtu_eval_dir=Path(args.dtu_eval_dir) if args.dtu_eval_dir else run_cfg.eval.dtu_eval_dir,
                 dtu_chamfer_freq=args.dtu_chamfer_freq,
                 blender_chamfer_freq=args.blender_chamfer_freq,
+                blender_official_freq=args.blender_official_freq,
+                blender_official_res=args.blender_official_res,
+                blender_official_bound=args.blender_official_bound,
+                blender_official_n_samples=args.blender_official_n_samples,
+                blender_official_mask_crop=args.blender_official_mask_crop,
+                blender_official_mask_dilate_px=args.blender_official_mask_dilate_px,
+                blender_official_mask_crop_min_ratio=args.blender_official_mask_crop_min_ratio,
+                blender_official_mask_crop_min_views=args.blender_official_mask_crop_min_views,
                 dtu_chamfer_res=args.dtu_chamfer_res,
                 dtu_official_freq=args.dtu_official_freq,
                 dtu_official_res=args.dtu_official_res,
@@ -4158,6 +4715,31 @@ if __name__ == "__main__":
                 tnt_official_n_samples=(args.tnt_official_n_samples
                                         if args.tnt_official_n_samples is not None
                                         else run_cfg.eval.tnt_official_n_samples),
+                bmvs_eval_dir=(Path(args.bmvs_eval_dir) if args.bmvs_eval_dir
+                               else run_cfg.eval.bmvs_eval_dir),
+                bmvs_gt_mesh=(Path(args.bmvs_gt_mesh) if args.bmvs_gt_mesh
+                              else run_cfg.eval.bmvs_gt_mesh),
+                bmvs_official_freq=(args.bmvs_official_freq
+                                    if args.bmvs_official_freq is not None
+                                    else run_cfg.eval.bmvs_official_freq),
+                bmvs_official_res=(args.bmvs_official_res
+                                   if args.bmvs_official_res is not None
+                                   else run_cfg.eval.bmvs_official_res),
+                bmvs_official_bound=(args.bmvs_official_bound
+                                     if args.bmvs_official_bound is not None
+                                     else run_cfg.eval.bmvs_official_bound),
+                bmvs_official_n_samples=(args.bmvs_official_n_samples
+                                         if args.bmvs_official_n_samples is not None
+                                         else run_cfg.eval.bmvs_official_n_samples),
+                bmvs_official_protocol=(args.bmvs_official_protocol
+                                        if args.bmvs_official_protocol is not None
+                                        else run_cfg.eval.bmvs_official_protocol),
+                bmvs_official_ground_axis=(args.bmvs_official_ground_axis
+                                           if args.bmvs_official_ground_axis is not None
+                                           else run_cfg.eval.bmvs_official_ground_axis),
+                bmvs_official_ground_value=(args.bmvs_official_ground_value
+                                            if args.bmvs_official_ground_value is not None
+                                            else run_cfg.eval.bmvs_official_ground_value),
                 mc_level=args.mc_level,
             ),
         )
@@ -4173,6 +4755,13 @@ if __name__ == "__main__":
             # and the full-res deterministic ray set (H*W*V) OOMs on many-view scenes.
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, down=args.down))
+        if args.t_far != _trc.t_far:
+            # Honour an explicit --t-far on the --config/--resume path (same pattern as
+            # --steps). Without this the config's own `t_far` silently wins. Needed when a
+            # shared source config's flat t_far is too short for a scene whose cameras sit
+            # farther from the origin (e.g. bmvs_jade cams at ~7-8 vs t_far=5 → 0 hits).
+            run_cfg = dataclasses.replace(
+                run_cfg, trace=dataclasses.replace(run_cfg.trace, t_far=args.t_far))
         if args.profile:
             run_cfg = dataclasses.replace(
                 run_cfg, train=dataclasses.replace(run_cfg.train, profile=True))
@@ -4198,9 +4787,25 @@ if __name__ == "__main__":
         if args.ncc_abs_tau != _tc.ncc_abs_tau:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, ncc_abs_tau=args.ncc_abs_tau))
+        if args.ncc_sat_tau != _tc.ncc_sat_tau:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, ncc_sat_tau=args.ncc_sat_tau))
+        if args.ncc_detach_normals != _tc.ncc_detach_normals:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, ncc_detach_normals=args.ncc_detach_normals))
         if args.w_geo_sdf != _tc.w_geo_sdf:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, w_geo_sdf=args.w_geo_sdf))
+        # colour MLP overrides on the --config path (same `!= default` pattern as
+        # --steps): without these an explicit --w-rgb is silently dropped and the
+        # config's own w_rgb=0 wins, so the colour MLP is never built.
+        if args.w_rgb != _tc.w_rgb:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, w_rgb=args.w_rgb,
+                rgb_hidden=args.rgb_hidden, rgb_depth=args.rgb_depth,
+                rgb_view_dep=not args.rgb_no_view_dep,
+                rgb_input_encoding=("pe" if args.rgb_pe else "identity"),
+                rgb_multires=args.rgb_multires))
         if args.force_fg_bg_split != _tc.force_fg_bg_split:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, force_fg_bg_split=args.force_fg_bg_split))
@@ -4230,6 +4835,7 @@ if __name__ == "__main__":
                               occ_newton_steps=args.occ_newton_steps,
                               occ_eps=args.occ_eps,
                               bsphere_radius=args.bsphere_radius,
+                              bsphere_start_radius=args.bsphere_start_radius,
                               t_far=args.t_far, sdf_min_beta=args.sdf_min_beta),
             init=InitConfig(
                 init=args.init,
@@ -4260,11 +4866,17 @@ if __name__ == "__main__":
                 init_hit_sampling=args.init_hit_sampling,
                 use_blender=args.blender, single_view=args.single_view,
                 w_photo=args.w_photo, w_feature=args.w_feature, feature_maps=args.feature_maps,
+                w_rgb=args.w_rgb, rgb_hidden=args.rgb_hidden, rgb_depth=args.rgb_depth,
+                rgb_view_dep=not args.rgb_no_view_dep,
+                rgb_input_encoding=("pe" if args.rgb_pe else "identity"),
+                rgb_multires=args.rgb_multires,
                 n_alt=args.n_alt,
                 view_selection=args.view_selection, pairs_path=args.pairs_path,
                 w_ncc=args.w_ncc, w_ncc_normal=args.w_ncc_normal,
+                ncc_detach_normals=args.ncc_detach_normals,
                 ncc_patch=args.ncc_patch,
                 ncc_half_pix=args.ncc_half_pix, ncc_min=args.ncc_min,
+                ncc_sat_tau=args.ncc_sat_tau,
                 ncc_world_patch=args.ncc_world_patch,
                 ncc_topk=args.ncc_topk,
                 ncc_abs_tau=args.ncc_abs_tau,
@@ -4319,6 +4931,14 @@ if __name__ == "__main__":
                 dtu_eval_dir=Path(args.dtu_eval_dir) if args.dtu_eval_dir else None,
                 dtu_chamfer_freq=args.dtu_chamfer_freq,
                 blender_chamfer_freq=args.blender_chamfer_freq,
+                blender_official_freq=args.blender_official_freq,
+                blender_official_res=args.blender_official_res,
+                blender_official_bound=args.blender_official_bound,
+                blender_official_n_samples=args.blender_official_n_samples,
+                blender_official_mask_crop=args.blender_official_mask_crop,
+                blender_official_mask_dilate_px=args.blender_official_mask_dilate_px,
+                blender_official_mask_crop_min_ratio=args.blender_official_mask_crop_min_ratio,
+                blender_official_mask_crop_min_views=args.blender_official_mask_crop_min_views,
                 dtu_chamfer_res=args.dtu_chamfer_res,
                 dtu_official_freq=args.dtu_official_freq,
                 dtu_official_res=args.dtu_official_res,
@@ -4340,6 +4960,26 @@ if __name__ == "__main__":
                 tnt_official_n_samples=(_ec.tnt_official_n_samples
                                         if args.tnt_official_n_samples is None
                                         else args.tnt_official_n_samples),
+                bmvs_eval_dir=(Path(args.bmvs_eval_dir) if args.bmvs_eval_dir else None),
+                bmvs_gt_mesh=(Path(args.bmvs_gt_mesh) if args.bmvs_gt_mesh else None),
+                bmvs_official_freq=(_ec.bmvs_official_freq if args.bmvs_official_freq is None
+                                    else args.bmvs_official_freq),
+                bmvs_official_res=(_ec.bmvs_official_res if args.bmvs_official_res is None
+                                   else args.bmvs_official_res),
+                bmvs_official_bound=(_ec.bmvs_official_bound if args.bmvs_official_bound is None
+                                     else args.bmvs_official_bound),
+                bmvs_official_n_samples=(_ec.bmvs_official_n_samples
+                                         if args.bmvs_official_n_samples is None
+                                         else args.bmvs_official_n_samples),
+                bmvs_official_protocol=(_ec.bmvs_official_protocol
+                                        if args.bmvs_official_protocol is None
+                                        else args.bmvs_official_protocol),
+                bmvs_official_ground_axis=(_ec.bmvs_official_ground_axis
+                                           if args.bmvs_official_ground_axis is None
+                                           else args.bmvs_official_ground_axis),
+                bmvs_official_ground_value=(_ec.bmvs_official_ground_value
+                                            if args.bmvs_official_ground_value is None
+                                            else args.bmvs_official_ground_value),
                 mc_level=args.mc_level,
             ),
             scene=scene_path,
@@ -4409,6 +5049,14 @@ if __name__ == "__main__":
                           dtu_chamfer_res=args.dtu_chamfer_res,
                           dtu_chamfer_freq=args.dtu_chamfer_freq,
                           blender_chamfer_freq=args.blender_chamfer_freq,
+                          blender_official_freq=args.blender_official_freq,
+                          blender_official_res=args.blender_official_res,
+                          blender_official_bound=args.blender_official_bound,
+                          blender_official_n_samples=args.blender_official_n_samples,
+                          blender_official_mask_crop=args.blender_official_mask_crop,
+                          blender_official_mask_dilate_px=args.blender_official_mask_dilate_px,
+                          blender_official_mask_crop_min_ratio=args.blender_official_mask_crop_min_ratio,
+                          blender_official_mask_crop_min_views=args.blender_official_mask_crop_min_views,
                           dtu_official_freq=args.dtu_official_freq,
                           dtu_official_res=args.dtu_official_res,
                           dtu_official_bound=args.dtu_official_bound,

@@ -19,7 +19,7 @@ class ModelConfig:
     hidden:     int =  256# network width (must be divisible by group_size)
     depth:      int = 8  # number of CPL layers
     group_size: int = 2     # 2 → MaxMin, >2 → GroupSort-N (ignored when activation="nact")
-    activation: str = "groupsort"  # "groupsort" | "nact"
+    activation: str = "groupsort"  # "groupsort" | "nact" | "softplus" | "centered_softplus" | "softplus_cpl" | "softmax_cpl" | "softplus_cpl_maxmin"
     input_encoding: str = "pe"  # "identity" | "pe"
     multires: int = 6  # PE frequencies when input_encoding="pe"
     architecture: str = "cpl"  # "cpl" | "neus" | "mlp"
@@ -47,6 +47,11 @@ class TraceConfig:
                                    # rays that reach the sphere exit are marked hit_bg=True so the
                                    # photo loss applies there (photometric inconsistency → gradient
                                    # pulls surface inward, eliminating fg-miss holes)
+    bsphere_start_radius: float = 0.0  # >0: START each trace at the ray's NEAR intersection with the
+                                   # bounding sphere (radius R, centred at origin) instead of at the
+                                   # camera (t0=0), skipping the empty camera→object gap. Set to the
+                                   # object englobing radius (~1.05-1.2 for origin-normalised DTU). 0
+                                   # = trace from the camera (default, unchanged). center=origin only.
     sdf_min_beta:   float = 200.0   # 0: hard min over trace iters for sdf_min (gradient through argmin only);
                                    # >0: soft-min via -1/β·logsumexp(-β·sdf_k) — gradient flows through every
                                    # iteration weighted by proximity to the minimum. β≈50 ≈ hard min but
@@ -166,6 +171,11 @@ class BundleAdjustConfig:
     shared_intrinsics: bool = False  # tie K across all views (single-camera capture, e.g. TnT);
                                      # per-camera otherwise (multi-rig calib, e.g. DTU)
     lr_intrinsics:  float = 1e-4   # intrinsics learning rate (dimensionless delta; see CameraParams)
+    opt_distortion: bool  = False  # also refine a shared radial distortion (k1, k2) in the φ-block.
+                                   # ALWAYS shared across all views (one physical lens, e.g. TnT),
+                                   # regardless of shared_intrinsics. Only meaningful when the input
+                                   # frames are NOT already undistorted. See CameraParams.
+    lr_distortion:  float = 1e-4   # radial distortion learning rate (k1, k2 start at 0 → pinhole)
     batch:        int   = 0        # rays per BA step; 0 → reuse TrainConfig.batch
     ckpt_every:   int   = 1        # save a BA checkpoint every N cycles
     log_every:    int   = 20       # stdout per-step log cadence (CSV logs every step)
@@ -257,6 +267,15 @@ class TrainConfig:
 
     # loss weights
     w_photo:     float = 0.0
+    # IDR-style learned view-dependent colour MLP (lip_tracer.model.RadianceNet).
+    # L = w_rgb · L1(radiance(x_θ, n, ray_dir), observed_pixel_colour) on real
+    # hits. Adds an appearance model + a gentle geometry gradient through x_θ.
+    w_rgb:        float = 0.0
+    rgb_hidden:   int   = 256
+    rgb_depth:    int   = 3
+    rgb_view_dep: bool  = True   # False → diffuse albedo only (drop view direction)
+    rgb_input_encoding: str = "identity"  # "pe" → Fourier PE on position (not Lipschitz)
+    rgb_multires: int   = 6      # PE bands when rgb_input_encoding=="pe"
     w_feature:   float = 0.0  # cosine distance on precomputed feature maps
     feature_maps: Path | None = None
     w_ncc:       float = 1.0
@@ -265,6 +284,10 @@ class TrainConfig:
     # (double-backward through ∇f) so the photometric loss reshapes local
     # curvature/orientation independently of the level-set position.
     w_ncc_normal: float = 0.0
+    # Position-branch NCC normally freezes the tangent-plane normal, matching
+    # the legacy first-order geometry update. Disable for the controlled
+    # ablation where NCC gradients also flow through n_theta in the same term.
+    ncc_detach_normals: bool = True
     ncc_patch:   int   = 5
     ncc_half_pix: float = 2.0   # PMVS patch half-width in reference-view pixels
     # Object-fixed patch footprint (WORLD units). >0 → size the position-branch
@@ -288,6 +311,13 @@ class TrainConfig:
                                 # the patch gradient magnitude (Gipuma-style edge term,
                                 # ZNCC-consistent): zncc←(1-α)·zncc_I+α·zncc_∇. Sharpens
                                 # the depth minimum on fine texture (feathers). ~0.3-0.5.
+    ncc_sat_tau:  float = -1.0  # ≤0: disabled. 0<τ≤1: reference-saturation gate. Drop a
+                                # ray from ALL photo/NCC terms when its reference-pixel
+                                # colour is near-saturated (max channel ≥ τ) — i.e. a
+                                # specular highlight blown out in the reference view, which
+                                # contaminates every (ref,alt) pair (top-K can't recover it).
+                                # τ≈0.9 flags ~1% of pixels on glossy DTU scans (see
+                                # analysis/scan69_saturation_detector.py).
     ncc_min:      float = 0.0   # PMVS photometric gate: drop pairs with ZNCC below this
     ncc_abs_tau:  float = -1.0  # ≥0: replace the kept-mean NCC loss with the fixed-batch
                                 # reward −(1/|B|)Σ H_i(z_i−τ). τ is an ABSOLUTE keep/carve
@@ -421,6 +451,14 @@ class EvalConfig:
     dtu_chamfer_freq:  int   = 0     # cadence (steps) for the cheap in-training sfm_surf diagnostic (0 = off)
     dtu_chamfer_res:   int   = 256   # MC resolution for the sfm_surf diagnostic
     blender_chamfer_freq: int = 0    # cadence (steps) for in-training Blender GT chamfer (0 = off)
+    blender_official_freq: int = 0   # run full official HF-NeuS Blender Chamfer every N steps (0 = off)
+    blender_official_res:  int = 512 # MC resolution for periodic official Blender eval
+    blender_official_bound: float = 1.5  # MC bound for periodic official Blender eval
+    blender_official_n_samples: int = 100_000  # area-uniform surface samples per mesh
+    blender_official_mask_crop: bool = True    # DTU-style crop with dilated Blender alpha masks
+    blender_official_mask_dilate_px: int = 12
+    blender_official_mask_crop_min_ratio: float = 1.0
+    blender_official_mask_crop_min_views: int = 1
     dtu_official_freq: int   = 0     # run DTUeval-python every N train steps (0 = off)
     dtu_official_res:  int   = 384   # MC resolution for periodic official eval
     dtu_official_bound: float = 1.0  # MC bound for periodic official eval
@@ -435,6 +473,15 @@ class EvalConfig:
     tnt_official_res:  int = 512    # MC resolution for periodic official TnT eval
     tnt_official_bound: float = 1.5 # MC bound for periodic official TnT eval
     tnt_official_n_samples: int = 2_000_000  # area-uniform points sampled from MC mesh
+    bmvs_eval_dir:  Path | None = None  # GT root with <relpath> or GT_meshes/<relpath> for bmvs_* scenes
+    bmvs_gt_mesh:   Path | None = None  # explicit raw BlendedMVS GTMeshRaw.ply (overrides bmvs_eval_dir lookup)
+    bmvs_official_freq: int = 0      # run BlendedMVS Chamfer every N train steps (0 = off)
+    bmvs_official_res:  int = 512    # MC resolution for periodic BlendedMVS Chamfer
+    bmvs_official_bound: float = 1.0 # MC bound for periodic BlendedMVS Chamfer
+    bmvs_official_n_samples: int = 100_000  # samples per surface (VolSDF B.2 uses 100K)
+    bmvs_official_protocol: str = "volsdf"  # "volsdf" (paper B.2) | "probesdf"
+    bmvs_official_ground_axis: int = 2      # volsdf: axis normal to the ground plane
+    bmvs_official_ground_value: float | None = None  # volsdf: drop geom below this offset (normalized frame); None=skip
     mc_level: float = 0.0            # marching-cubes isovalue; slightly >0 (e.g. 0.005) trims
                                      # noisy near-zero wandering in under-supervised pockets
 
@@ -471,4 +518,8 @@ class Config:
             d["eval"]["dtu_eval_dir"] = str(d["eval"]["dtu_eval_dir"])
         if d["eval"]["tnt_eval_dir"] is not None:
             d["eval"]["tnt_eval_dir"] = str(d["eval"]["tnt_eval_dir"])
+        if d["eval"]["bmvs_eval_dir"] is not None:
+            d["eval"]["bmvs_eval_dir"] = str(d["eval"]["bmvs_eval_dir"])
+        if d["eval"]["bmvs_gt_mesh"] is not None:
+            d["eval"]["bmvs_gt_mesh"] = str(d["eval"]["bmvs_gt_mesh"])
         return d

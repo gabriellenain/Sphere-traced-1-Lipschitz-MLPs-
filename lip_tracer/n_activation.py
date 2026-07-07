@@ -1,7 +1,7 @@
 """
 N-Activation: a learnable 1-Lipschitz piecewise-linear activation.
-Reference: Prach & Lampert, "Almost-Orthogonal Layers for Efficient
-General-Purpose Lipschitz Networks" (2022).
+Reference: Prach & Lampert, "1-Lipschitz Neural Networks are more expressive
+with N-Activations" (arXiv:2311.06103).
 https://github.com/berndprach/NActivation
 """
 
@@ -16,11 +16,14 @@ def n_activation(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
     x     : [..., C, ...]  — any shape, channel dim is dim 1
     theta : [C, 2]         — per-channel breakpoints (sorted internally)
     """
-    t, _ = torch.sort(theta, dim=1)           # t[:, 0] <= t[:, 1]
+    # min/max instead of torch.sort: identical (theta has exactly 2 columns) but
+    # stays on the Triton codegen path — sort forces an inductor C++ fallback.
+    t0 = torch.minimum(theta[:, 0], theta[:, 1])   # == theta_min
+    t1 = torch.maximum(theta[:, 0], theta[:, 1])   # == theta_max
     for _ in range(len(x.shape) - 2):
-        t = t[..., None]                       # broadcast to spatial dims
+        t0 = t0[..., None]                     # broadcast to spatial dims
+        t1 = t1[..., None]
 
-    t0, t1 = t[:, 0], t[:, 1]
     out = torch.where(x < t0, x - 2 * t0,
           torch.where(x < t1, -x,
                                x - 2 * t1))
@@ -33,7 +36,11 @@ class NActivation(nn.Module):
 
     Args:
         in_channels : number of channels / features (C)
-        init        : (theta0, theta1) initial breakpoints, default (-1, 0)
+        init        : (theta0, theta1) uniform breakpoints, default (-1, 0) — the
+                      SDF-appropriate default (every channel is a real "N", no
+                      sign-destroying |x|). Pass "absid" for the paper's
+                      classification init (alternating Abs / Identity channels,
+                      arXiv:2311.06103) — worse here, see model.py.
         trainable   : whether theta is a learnable parameter
         lr_factor   : scale learning rate for theta independently
     """
@@ -41,14 +48,19 @@ class NActivation(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        init: tuple[float, float] = (-1.0, 0.0),
+        init: "str | tuple[float, float]" = (-1.0, 0.0),
         trainable: bool = True,
         lr_factor: float = 1.0,
     ):
         super().__init__()
         self._scale = lr_factor ** 0.5
-        theta = torch.tensor(init).expand(in_channels, -1).clone() / self._scale
-        self.theta = nn.Parameter(theta, requires_grad=trainable)
+        if init == "absid":
+            theta = torch.zeros(in_channels, 2)
+            theta[0::2, 0] = -100.0          # even channels → (-100, 0) = Abs
+            # odd channels remain (0, 0)     # odd  channels → Identity
+        else:
+            theta = torch.tensor(init).expand(in_channels, -1).clone()
+        self.theta = nn.Parameter(theta / self._scale, requires_grad=trainable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return n_activation(x, self.theta * self._scale)

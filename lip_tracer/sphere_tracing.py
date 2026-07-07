@@ -112,6 +112,32 @@ def ray_sphere_exit(o: Tensor, d: Tensor, R: float) -> Tensor:
     return t.clamp(min=0.0)
 
 
+def ray_sphere_entry(o: Tensor, d: Tensor, R: float) -> Tensor:
+    """Per-ray NEAR intersection distance with the bounding sphere of radius R
+    centred at the origin (|d|=1). Used to START the trace on the sphere, skipping
+    the empty camera→object gap.
+
+    Returns t_entry ≥ 0 for rays that enter the sphere from outside; 0 for rays
+    that miss it or start inside (nothing to skip). center=origin assumes the
+    object is origin-normalised (DTU/IDR); do not use on un-centred rigs.
+    """
+    b    = (o * d).sum(-1)
+    c    = (o * o).sum(-1) - R * R
+    disc = b * b - c
+    t    = -b - disc.clamp(min=0.0).sqrt()
+    hits = (disc > 0) & (t > 0)
+    return torch.where(hits, t, torch.zeros_like(t))
+
+
+def _trace_t0(o: Tensor, d: Tensor, cfg: TraceConfig) -> Tensor:
+    """Initial ray parameter t for a trace: the bounding-sphere entry when
+    cfg.bsphere_start_radius > 0, else 0 (start at the camera). Detached — t0 is a
+    constant offset that just skips empty space; gradients flow via later f-evals."""
+    if getattr(cfg, "bsphere_start_radius", 0.0) > 0:
+        return ray_sphere_entry(o.detach(), d.detach(), cfg.bsphere_start_radius)
+    return torch.zeros(o.shape[0], device=o.device)
+
+
 def _newton_step(
     f: FTheta, o: Tensor, d: Tensor, t: Tensor, gate: Tensor, eps: float
 ) -> Tensor:
@@ -176,7 +202,7 @@ def trace_unrolled(
     else:
         t_far_ray = torch.full((B,), cfg.t_far, device=o.device)
 
-    t = torch.zeros(B, device=o.device)
+    t = _trace_t0(o, d, cfg)
     sdf = torch.zeros(B, device=o.device)
     sdf_min = torch.full((B,), float("inf"), device=o.device)
     sdf_iters: list[Tensor] = []                          # for soft-min logsumexp
@@ -296,7 +322,7 @@ def trace_idr(
 
     # --- no-grad trace ---
     with torch.no_grad():
-        t = torch.zeros(B, device=o.device)
+        t = _trace_t0(o, d, cfg)
         sdf = torch.zeros(B, device=o.device)
         sdf_min = torch.full((B,), float("inf"), device=o.device)
         x_iters: list[Tensor] = []                    # detached x for differentiable sdf_min
@@ -436,7 +462,7 @@ def trace_nograd(
     else:
         t_far_ray = torch.full((B,), cfg.t_far, device=o.device)
 
-    t = torch.zeros(B, device=o.device)
+    t = _trace_t0(o, d, cfg)
     sdf = torch.zeros(B, device=o.device)
     converged = torch.zeros(B, dtype=torch.bool, device=o.device)
     use_bracket = _needs_bracket(f)

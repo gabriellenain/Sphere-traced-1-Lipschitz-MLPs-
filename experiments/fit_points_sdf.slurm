@@ -32,9 +32,22 @@ GRID_RES=${GRID_RES:-256}
 LEGACY_ARG=()
 [ "${LEGACY:-0}" = "1" ] && LEGACY_ARG=(--legacy-igr)
 
+# LD=1 : MVSDF L_D-only fit (Zhang et al. 2021); --points is a fused scanXX.ply
+# with a sibling depth dir (or set MVS_DEPTH_ROOT). Whole-space sampling by default.
+LD_ARG=()
+if [ "${LD:-0}" = "1" ]; then
+    LD_ARG=(--ld
+            --ld-pix-stride "${LD_PIX_STRIDE:-4}"
+            --ld-conf-thr "${LD_CONF_THR:-0.5}"
+            --ld-t-out "${LD_T_OUT:-2}"
+            --ld-surface-frac "${LD_SURFACE_FRAC:-0.5}"
+            --ld-eikonal-weight "${LD_EIKONAL_WEIGHT:-0.1}")
+    [ -n "${MVS_DEPTH_ROOT:-}" ] && LD_ARG+=(--mvs-depth-root "$MVS_DEPTH_ROOT")
+fi
+
 echo "points : $POINTS"
 echo "out_dir: $OUT_DIR"
-echo "steps=$STEPS bound=$BOUND mc_res=$MC_RES eps=$EPS max_comp=$MAX_COMPONENTS shift=$SHIFT grid_res=$GRID_RES legacy=${LEGACY:-0}"
+echo "steps=$STEPS bound=$BOUND mc_res=$MC_RES eps=$EPS max_comp=$MAX_COMPONENTS shift=$SHIFT grid_res=$GRID_RES legacy=${LEGACY:-0} ld=${LD:-0}"
 
 python -u fit_points_sdf.py \
     --points "$POINTS" \
@@ -49,4 +62,5 @@ python -u fit_points_sdf.py \
     --max-components "$MAX_COMPONENTS" \
     --shift "$SHIFT" \
     --grid-res "$GRID_RES" \
-    "${LEGACY_ARG[@]}"
+    "${LEGACY_ARG[@]}" \
+    "${LD_ARG[@]}"

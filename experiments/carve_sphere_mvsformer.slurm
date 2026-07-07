@@ -27,10 +27,19 @@ SCENE=${SCENE:-$ROOT/data/tnt/${SCENE_NAME}}
 DEPTH_DIR=${DEPTH_DIR:-$SCENE/mvsformer_depth_1152x640_1152x640}
 OUT_DIR=${OUT_DIR:-$ROOT/_diagnostics/mvsformer_${SCENE_NAME,,}_sphere/sphere_carve_auto_res384_nomask_sfmclip_close2}
 RES=${RES:-384}
+# Occupancy estimator: 'carve' (hard depth-vote space carving, default) or
+# 'tsdf' (confidence-weighted front-truncated signed fusion; noise-robust).
+METHOD=${METHOD:-carve}
+TSDF_TRUNC_VOXELS=${TSDF_TRUNC_VOXELS:-4.0}
 # Carve aggressiveness knobs (override to be more conservative and avoid punching
 # holes through real surface from a few bad MVSFormer depths). VOTES_REQ higher =
 # more views must agree empty before a voxel is removed; DEPTH_CAP_AUTO drops
 # runaway background/sky pixels; FILL_HOLES closes enclosed interior holes.
+# DEVICE: 'cpu' (NumPy depth-vote loop, default for back-compat) or 'cuda' (torch
+# GPU vote/scatter). The per-view projection+scatter is the carve bottleneck, so
+# 'cuda' is dramatically faster at high res — use it for res>=512, since a GPU is
+# already allocated.
+DEVICE=${DEVICE:-cpu}
 CONF_THR=${CONF_THR:-0.5}
 VOTES_REQ=${VOTES_REQ:-3}
 MARGIN_VOXELS=${MARGIN_VOXELS:-3.0}
@@ -84,9 +93,11 @@ python -u tools/carve_sphere_with_mvsformer_truck.py \
     --depth-dir "$DEPTH_DIR" \
     --out-dir "$OUT_DIR" \
     --res "$RES" --bound 1.5 \
+    --method "$METHOD" --tsdf-trunc-voxels "$TSDF_TRUNC_VOXELS" \
     --sphere-radius auto --sphere-radius-percentile 99.9 --sphere-radius-pad 0.02 \
     --center-from-sfm \
     --conf-thr "$CONF_THR" --votes-req "$VOTES_REQ" --margin-voxels "$MARGIN_VOXELS" \
     --sfm-clip --clip-margin-voxels 6.0 \
     --close-iters "$CLOSE_ITERS" --largest-component \
+    --device "$DEVICE" \
     ${EXTRA_CARVE_ARGS[@]+"${EXTRA_CARVE_ARGS[@]}"}

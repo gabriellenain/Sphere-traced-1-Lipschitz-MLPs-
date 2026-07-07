@@ -127,5 +127,8 @@ python -u -m lip_tracer.train \
   --occ-iters 32 \
   --occ-newton-steps 0 \
   --occ-eps 1e-3 \
+  --blender-official-freq 10000 \
+  --blender-official-mask-crop \
+  --blender-official-mask-dilate-px 12 \
   "${RESUME_ARGS[@]}" \
   --wandb 2>&1 | tee -a "$LOG"

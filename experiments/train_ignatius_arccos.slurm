@@ -42,8 +42,13 @@ OUTPUTS=/scratch/_projets_/willow/1-lip-tracer-new/outputs
 OUTPUTS_HOME=$ROOT/outputs
 
 REFERENCE_RUN=$OUTPUTS/run_20260606_211917_ignatius_sphere_nomask_res384_init_4992251
-SOURCE_CONFIG=$REFERENCE_RUN/config.json
-SCENE=$ROOT/data/tnt/${SCENE_NAME}
+# SOURCE_CONFIG defaults to the Ignatius arccos reference, but may be overridden to
+# reproduce a different run's params verbatim (e.g. the scan114 true-nomask config).
+SOURCE_CONFIG=${SOURCE_CONFIG:-$REFERENCE_RUN/config.json}
+# SCENE defaults to the TnT scene dir but may be overridden (e.g. a BlendedMVS
+# scene under data/bmvs). When eval is off (TNT_OFFICIAL_FREQ=0) the TnT-GT check
+# below is skipped, so non-TnT scenes can reuse this launcher unchanged.
+SCENE=${SCENE:-$ROOT/data/tnt/${SCENE_NAME}}
 
 STEPS=${STEPS:-600000}
 # WOBJ (optional): object-fixed ZNCC patch footprint in WORLD units. When set,
@@ -66,6 +71,14 @@ TNT_OFFICIAL_FREQ=${TNT_OFFICIAL_FREQ:-10000}
 TNT_OFFICIAL_RES=${TNT_OFFICIAL_RES:-512}
 TNT_OFFICIAL_N_SAMPLES=${TNT_OFFICIAL_N_SAMPLES:-2000000}
 
+# INIT_MESH (optional): fit f_theta DIRECTLY to this mesh's signed-distance field
+# (the --init colmap path / fit_colmap_init, mm-accurate surface hand-off) instead
+# of the hull/carve init. Mesh must be in the un-normalised world frame; it is
+# re-normalised into the model unit cube via scene/bbox.txt. Takes precedence over
+# INIT_SDF_GRID. Defined here (before RUN_DIR) so the run dir carries an init tag.
+INIT_MESH=${INIT_MESH:-}
+INIT_TAG=""; [ -n "$INIT_MESH" ] && INIT_TAG="_meshinit"
+
 if [ ! -f "$SOURCE_CONFIG" ]; then
   echo "ERROR: missing reference config: $SOURCE_CONFIG" >&2
   exit 1
@@ -74,7 +87,7 @@ if [ ! -d "$SCENE" ]; then
   echo "ERROR: missing TnT scene: $SCENE" >&2
   exit 1
 fi
-if [ ! -f "$TNT_EVAL/${SCENE_NAME}/${SCENE_NAME}.ply" ]; then
+if [ "$TNT_OFFICIAL_FREQ" != "0" ] && [ ! -f "$TNT_EVAL/${SCENE_NAME}/${SCENE_NAME}.ply" ]; then
   echo "ERROR: missing official TnT GT: $TNT_EVAL/${SCENE_NAME}/${SCENE_NAME}.ply" >&2
   exit 1
 fi
@@ -85,7 +98,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MPLCONFIGDIR=/tmp/matplotlib-1lip-arccos
 
 TS=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=$OUTPUTS/run_${TS}_${SCENE_NAME}_sphere_nomask_arccos_${MODE}${WOBJ:+_wobj${WOBJ}}${BA_TAG}_${SLURM_JOB_ID}
+RUN_DIR=$OUTPUTS/run_${TS}_${SCENE_NAME}_sphere_nomask_arccos_${MODE}${WOBJ:+_wobj${WOBJ}}${INIT_TAG}${BA_TAG}_${SLURM_JOB_ID}
 DERIVED_CONFIG=$RUN_DIR/source_config_arccos.json
 LOG=$RUN_DIR/train.log
 mkdir -p "$RUN_DIR" "$OUTPUTS_HOME"
@@ -112,7 +125,7 @@ BA_PHI=${BA_PHI:-200}
 BA_LR=${BA_LR:-1e-5}
 BA_RAMP=${BA_RAMP:-2}
 python - "$SOURCE_CONFIG" "$DERIVED_CONFIG" "$STEPS" "$SCENE_NAME" "$SCENE" "$INIT_SDF_GRID" \
-    "$BA_INLOOP" "$BA_WARMUP" "$BA_INTERVAL" "$BA_PHI" "$BA_LR" "$BA_RAMP" <<'PY'
+    "$BA_INLOOP" "$BA_WARMUP" "$BA_INTERVAL" "$BA_PHI" "$BA_LR" "$BA_RAMP" "$INIT_MESH" <<'PY'
 import json, sys
 from pathlib import Path
 src, dst, steps, scene_name, scene, init_grid = (
@@ -121,6 +134,7 @@ src, dst, steps, scene_name, scene, init_grid = (
 ba_inloop, ba_warmup, ba_interval, ba_phi, ba_lr, ba_ramp = (
     sys.argv[7] == "1", int(sys.argv[8]), int(sys.argv[9]),
     int(sys.argv[10]), float(sys.argv[11]), int(sys.argv[12]))
+init_mesh = sys.argv[13]
 cfg = json.loads(src.read_text())
 cfg.pop("cmd", None)
 cfg["train"]["steps"] = steps
@@ -135,7 +149,15 @@ if ba_inloop:
           f"block_phi={ba_phi} lr={ba_lr:g} ramp={ba_ramp}")
 if cfg.get("init", {}).get("init") != "hull":
     raise SystemExit("reference run is not hull init")
-if init_grid:
+if init_mesh:
+    # Fit f_theta to a mesh's signed-distance field (fit_colmap_init). Overrides
+    # the hull/carve init and any SDF grid; the mesh is re-normalised via bbox.txt.
+    if not Path(init_mesh).exists():
+        raise SystemExit(f"missing INIT_MESH: {init_mesh}")
+    cfg["init"]["init"] = "colmap"
+    cfg["init"]["init_mesh"] = init_mesh
+    cfg["init"]["init_sdf_grid"] = None
+elif init_grid:
     if not Path(init_grid).exists():
         raise SystemExit(f"missing INIT_SDF_GRID: {init_grid}")
     cfg["init"]["init_sdf_grid"] = init_grid
@@ -146,6 +168,7 @@ else:
     cfg["init"]["init_sdf_grid"] = None   # carve hull in-loop for this scene
 dst.write_text(json.dumps(cfg, indent=2) + "\n")
 print(f"derived config -> {dst}  (scene={scene_name}, steps={steps}, "
+      f"init={cfg['init']['init']}, init_mesh={cfg['init'].get('init_mesh')}, "
       f"init_sdf_grid={cfg['init']['init_sdf_grid']})")
 PY
 
@@ -169,6 +192,7 @@ if [ -n "$WOBJ" ]; then WOBJ_FLAG=(--ncc-world-patch "$WOBJ"); fi
 
 echo "Reference run:     $REFERENCE_RUN"
 echo "Scene:             $SCENE_NAME ($SCENE)"
+echo "Init:              ${INIT_MESH:+mesh-SDF fit (colmap) from $INIT_MESH}${INIT_MESH:-hull/carve or INIT_SDF_GRID}"
 echo "Run dir:           $RUN_DIR"
 echo "Steps (from 0):    $STEPS"
 echo "Downsample:        $DOWN"

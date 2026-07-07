@@ -94,6 +94,24 @@ def voxel_world_from_occ_indices(occ_idx_zyx: np.ndarray, bound: float, res: int
     return np.stack([lin[ix], lin[iy], lin[iz]], axis=-1).astype(np.float32)
 
 
+def outward_normals_from_occ(occ: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """Per-voxel outward surface normals (world xyz) from an occupancy grid.
+
+    Normal = -grad(smoothed occupancy), pointing solid->empty. For a sphere init
+    this is exactly the radial direction. Voxels with negligible gradient
+    (deep interior / far exterior) get a zero vector, which callers treat as
+    "no normal -> do not gate". Grid axes are (z, y, x); the returned vectors are
+    world (x, y, z) unit normals shaped (res, res, res, 3).
+    """
+    from scipy.ndimage import gaussian_filter
+
+    f = gaussian_filter(occ.astype(np.float32), sigma=sigma)
+    gz, gy, gx = np.gradient(f)                       # along (z, y, x) indices
+    n = np.stack([-gx, -gy, -gz], axis=-1)            # world xyz, points outward
+    mag = np.linalg.norm(n, axis=-1, keepdims=True)
+    return np.where(mag > 1e-8, n / np.clip(mag, 1e-8, None), 0.0).astype(np.float32)
+
+
 def depth_vote_view(
     view_id: int,
     depth: np.ndarray,
@@ -105,12 +123,15 @@ def depth_vote_view(
     votes: np.ndarray,
     margin: float,
     chunk_size: int,
+    normals: np.ndarray | None = None,
+    cos_incidence_thr: float | None = None,
 ) -> dict:
     R = c2w[:3, :3].astype(np.float64)
     c = c2w[:3, 3].astype(np.float64)
     h, w = depth.shape
     n_voted = 0
     valid_depth_px = int(valid_depth.sum())
+    gate = normals is not None and cos_incidence_thr is not None
 
     for start in range(0, len(occ_pts), chunk_size):
         end = min(start + chunk_size, len(occ_pts))
@@ -132,6 +153,16 @@ def depth_vote_view(
         d[inb] = depth[vi[inb], ui[inb]]
         good[inb] = valid_depth[vi[inb], ui[inb]]
         empty = inb & good & (z < (d - margin))
+        if gate and empty.any():
+            # frontal gate: keep an empty-vote only if this view sees the voxel's
+            # surface near-frontally (angle(outward normal, dir-to-camera) small).
+            nrm = normals[start:end].astype(np.float64)
+            nmag = np.linalg.norm(nrm, axis=1)
+            dvec = c[None] - pts
+            dvec /= np.clip(np.linalg.norm(dvec, axis=1, keepdims=True), 1e-12, None)
+            cosang = np.sum(nrm * dvec, axis=1)
+            frontal = (nmag < 0.5) | (cosang >= cos_incidence_thr * np.clip(nmag, 1e-8, None))
+            empty &= frontal
         if empty.any():
             idx = occ_idx[start:end][empty]
             votes[idx[:, 0], idx[:, 1], idx[:, 2]] += 1
@@ -155,6 +186,8 @@ def depth_vote_all_torch(
     margin: float,
     device: str,
     chunk: int = 16_000_000,
+    normals: np.ndarray | None = None,
+    cos_incidence_thr: float | None = None,
 ) -> tuple[np.ndarray, list]:
     """GPU port of the per-view depth_vote_view loop.
 
@@ -162,7 +195,12 @@ def depth_vote_all_torch(
     voxel empty when it sits >margin in front of a valid depth), but the occ_pts
     cloud is projected on the GPU and the empty votes accumulated with index_add_.
     Points are processed in chunks so peak GPU memory stays bounded (a res1024
-    sphere init is ~10^8 voxels). Returns (votes[res,res,res] uint16, per_view)."""
+    sphere init is ~10^8 voxels). Returns (votes[res,res,res] uint16, per_view).
+
+    If `normals` (N,3 outward unit normals) and `cos_incidence_thr` are given,
+    a view's empty-vote is kept only where it sees the voxel near-frontally
+    (cos(angle(normal, dir-to-camera)) >= threshold); zero-length normals are
+    never gated."""
     import torch
     dev = torch.device(device)
     N = len(occ_pts)
@@ -170,6 +208,10 @@ def depth_vote_all_torch(
     oidx = torch.as_tensor(occ_idx, dtype=torch.long, device=dev)          # (N,3) zyx
     flat = (oidx[:, 0] * res + oidx[:, 1]) * res + oidx[:, 2]              # (N,)
     votes = torch.zeros(res * res * res, dtype=torch.int32, device=dev)
+    gate = normals is not None and cos_incidence_thr is not None
+    if gate:
+        nrm = torch.as_tensor(np.asarray(normals, np.float32), device=dev)  # (N,3)
+        nmag = nrm.norm(dim=1)
     per_view = []
     for vi in range(len(depths)):
         d = torch.as_tensor(np.asarray(depths[vi], dtype=np.float32), device=dev)
@@ -196,6 +238,12 @@ def depth_vote_all_torch(
             dval = d[vj_c, ui_c]
             good = vmask[vj_c, ui_c]
             empty = inb & good & (z < (dval - margin))
+            if gate:
+                dvec = c - pts[s:e]
+                dvec = dvec / dvec.norm(dim=1, keepdim=True).clamp(min=1e-12)
+                cosang = (nrm[s:e] * dvec).sum(dim=1)
+                frontal = (nmag[s:e] < 0.5) | (cosang >= cos_incidence_thr * nmag[s:e].clamp(min=1e-8))
+                empty &= frontal
             ne = int(empty.sum().item())
             if ne:
                 votes.index_add_(0, flat[s:e][empty],

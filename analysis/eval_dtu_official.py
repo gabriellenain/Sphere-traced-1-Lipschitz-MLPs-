@@ -132,7 +132,10 @@ def _extract_world_mesh(ckpt_path: Path, bound: float, res: int, device: str, sc
         print(f"[mesh] extracting from {ckpt_path} (res={res}, bound={bound})", flush=True)
         verts, faces, _ = _extract_mesh_from_model(ckpt_path, bound, res, device)
     verts_world = _to_world(verts, scale_mat)
-    out_ply = ckpt_path.parent / "pred_world_mesh.ply"
+    # Name the extracted mesh by checkpoint stem so concurrent evals of different
+    # checkpoints from the SAME run (e.g. best-step + final) don't race on a shared
+    # ckpt/pred_world_mesh.ply and end up scoring each other's mesh.
+    out_ply = ckpt_path.parent / f"pred_world_mesh_{ckpt_path.stem}.ply"
     trimesh.Trimesh(vertices=verts_world, faces=faces, process=False).export(str(out_ply))
     print(f"[mesh] saved -> {out_ply}", flush=True)
     return out_ply

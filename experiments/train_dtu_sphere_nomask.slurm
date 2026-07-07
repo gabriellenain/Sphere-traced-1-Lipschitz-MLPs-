@@ -39,10 +39,45 @@ NEW_INIT_SDF=${NEW_INIT_SDF:-$ROOT/_diagnostics/mvsformer_${SCAN}_sphere/sphere_
 BAKE_BG=${BAKE_BG:-1}
 if [ "$BAKE_BG" = "0" ]; then BAKE_BG_FLAG=--no-bake-background; else BAKE_BG_FLAG=--bake-background; fi
 
+# NCC_SAT_TAU>0 → reference-saturation gate (drop rays whose reference pixel max
+# channel ≥ τ, i.e. specular highlights). Empty/<=0 → disabled (unchanged behaviour).
+NCC_SAT_TAU=${NCC_SAT_TAU:-}
+if [ -n "$NCC_SAT_TAU" ]; then SAT_FLAG="--ncc-sat-tau $NCC_SAT_TAU"; else SAT_FLAG=""; fi
+
+# T_FAR>0 → override the source config's flat sphere-trace t_far. The shared
+# source config uses t_far=5, which is too short for scenes whose cameras sit far
+# from the origin in the normalized frame (e.g. bmvs_jade cams at ~7-8 → 0 hits).
+T_FAR=${T_FAR:-}
+if [ -n "$T_FAR" ]; then TFAR_FLAG="--t-far $T_FAR"; else TFAR_FLAG=""; fi
+
+# W_EIKONAL / MULTIRES: baked into the DERIVED CONFIG below (NOT passed as CLI
+# flags — on the --config path train.py ignores --w-eikonal and --multires).
+# Empty → leave the source config's value untouched (unchanged behaviour).
+#   W_EIKONAL  activate the eikonal loss, e.g. 0.1 (source config carries 0.0)
+#   MULTIRES   positional-encoding L (frequency bands); 0 = no Fourier bands
+W_EIKONAL=${W_EIKONAL:-}
+MULTIRES=${MULTIRES:-}
+
 DTU_EVAL_DIR=${DTU_EVAL_DIR:-/scratch/_projets_/willow/1-lip-tracer-new/data/dtu_eval/SampleSet/MVS Data}
 DTU_OFFICIAL_FREQ=${DTU_OFFICIAL_FREQ:-10000}
 DTU_OFFICIAL_RES=${DTU_OFFICIAL_RES:-384}
 DTU_OFFICIAL_BOUND=${DTU_OFFICIAL_BOUND:-1.0}
+
+# Optional in-training BlendedMVS Chamfer (for BMVS scenes). Off unless
+# BMVS_GT_MESH is set. Uses the corrected eval baked into
+# lip_tracer/train.py:_run_bmvs_official_eval — gt-space normalized
+# GroundTruth.ply, point-to-mesh distance, DTU-style mask crop+dilate12 —
+# at step 0 then every BMVS_OFFICIAL_FREQ steps. DTU runs are unaffected.
+BMVS_GT_MESH=${BMVS_GT_MESH:-}
+BMVS_FLAGS=()
+if [ -n "$BMVS_GT_MESH" ]; then
+  BMVS_FLAGS=(--bmvs-gt-mesh "$BMVS_GT_MESH"
+    --bmvs-official-freq "${BMVS_OFFICIAL_FREQ:-10000}"
+    --bmvs-official-res "${BMVS_OFFICIAL_RES:-512}"
+    --bmvs-official-bound "${BMVS_OFFICIAL_BOUND:-1.5}"
+    --bmvs-official-protocol "${BMVS_OFFICIAL_PROTOCOL:-probesdf}"
+    --bmvs-official-n-samples "${BMVS_OFFICIAL_N_SAMPLES:-300000}")
+fi
 
 source /scratch/_projets_/willow/1-lip-tracer-new/.venv/bin/activate
 cd "$ROOT"
@@ -65,7 +100,7 @@ fi
 
 # Derive config: change ONLY scene, init SDF grid, and scan-specific feature_maps.
 python - "$SOURCE_CONFIG" "$DERIVED_CONFIG" "$SCENE" "$NEW_INIT_SDF" <<'PY'
-import copy, json, sys
+import copy, json, os, sys
 from pathlib import Path
 src, dst, scene, init_sdf = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 cfg = json.loads(Path(src).read_text()); cfg.pop("cmd", None)
@@ -76,6 +111,20 @@ out["scene"] = scene
 out["init"]["init_sdf_grid"] = init_sdf
 out["train"]["feature_maps"] = None  # scan122-specific path; w_feature=0 so unused
 
+# feature_maps may already be null in the source config (no diff then)
+required = {"scene", "init.init_sdf_grid"}
+allowed = required | {"train.feature_maps"}
+# Model/loss overrides baked into the config (train.py ignores the matching CLI
+# flags on the --config path). Each is applied only when its env var is set.
+w_eik = os.environ.get("W_EIKONAL", "")
+if w_eik:
+    out["train"]["w_eikonal"] = float(w_eik)
+    allowed.add("train.w_eikonal")
+multires = os.environ.get("MULTIRES", "")
+if multires:
+    out["model"]["multires"] = int(multires)
+    allowed.add("model.multires")
+
 def flat(v, p=""):
     if isinstance(v, dict):
         o = {}
@@ -84,9 +133,6 @@ def flat(v, p=""):
     return {p: v}
 before, after = flat(cfg), flat(out)
 changes = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
-# feature_maps may already be null in the source config (no diff then)
-required = {"scene", "init.init_sdf_grid"}
-allowed = required | {"train.feature_maps"}
 if not (required <= set(changes) <= allowed):
     raise SystemExit(f"unexpected config changes: {changes!r}\nallowed: {sorted(allowed)!r}")
 Path(dst).write_text(json.dumps(out, indent=2) + "\n")
@@ -107,8 +153,11 @@ python -u -m lip_tracer.train \
   --occ-eps 1e-3 \
   --no-use-masks \
   $BAKE_BG_FLAG \
+  $SAT_FLAG \
+  $TFAR_FLAG \
   --dtu-eval-dir "$DTU_EVAL_DIR" \
   --dtu-official-freq "$DTU_OFFICIAL_FREQ" \
   --dtu-official-res "$DTU_OFFICIAL_RES" \
   --dtu-official-bound "$DTU_OFFICIAL_BOUND" \
+  "${BMVS_FLAGS[@]}" \
   --wandb 2>&1 | tee "$LOG"

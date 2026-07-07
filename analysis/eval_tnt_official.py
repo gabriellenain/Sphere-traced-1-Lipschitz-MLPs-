@@ -91,13 +91,21 @@ def extract_mesh_from_ckpt(ckpt_path: Path, scene_dir: Path,
     gx = torch.linspace(float(lo_n[0]), float(hi_n[0]), mc_res, device=device)
     gy = torch.linspace(float(lo_n[1]), float(hi_n[1]), mc_res, device=device)
     gz = torch.linspace(float(lo_n[2]), float(hi_n[2]), mc_res, device=device)
-    xs, ys, zs = torch.meshgrid(gx, gy, gz, indexing="ij")
-    pts = torch.stack([xs, ys, zs], dim=-1).reshape(-1, 3)
-    print(f"[mc] evaluating {pts.shape[0]:,} pts at res={mc_res}  "
+    # Evaluate one x-slab (a yz plane) at a time and write straight to a CPU
+    # array. Materialising the full mc_res^3 grid on the GPU is ~103 GB at
+    # res=2048 (and the dense volume itself is ~34 GB), so we never hold more
+    # than a single mc_res^2 plane on-device.
+    ys, zs = torch.meshgrid(gy, gz, indexing="ij")
+    yz = torch.stack([ys, zs], dim=-1).reshape(-1, 2)        # (mc_res^2, 2)
+    print(f"[mc] evaluating {mc_res ** 3:,} pts at res={mc_res} (slab-wise)  "
           f"scene-box(norm) lo={lo_n} hi={hi_n}", flush=True)
+    vals = np.empty((mc_res, mc_res, mc_res), dtype=np.float32)
     with torch.no_grad():
-        vals = torch.cat([f(p) for p in pts.split(65536)]).reshape(
-            mc_res, mc_res, mc_res).cpu().numpy()
+        for i in range(mc_res):
+            xcol = gx[i].expand(yz.shape[0], 1)
+            slab = torch.cat([xcol, yz], dim=1)              # (mc_res^2, 3)
+            sv = torch.cat([f(p) for p in slab.split(65536)])
+            vals[i] = sv.reshape(mc_res, mc_res).cpu().numpy()
     if vals.min() > 0 or vals.max() < 0:
         raise SystemExit(f"no zero crossing: f in [{vals.min():.4f}, {vals.max():.4f}]")
     verts, faces, _, _ = measure.marching_cubes(vals, level=0.0)
@@ -392,7 +400,7 @@ def main():
     ap.add_argument("--scene",     required=True,
                     help="scene name, e.g. Barn  (must match GT filenames)")
     ap.add_argument("--out",       type=Path, required=True)
-    ap.add_argument("--mc-res",    type=int,   default=512)
+    ap.add_argument("--mc-res",    type=int,   default=2048)  # Neuralangelo TnT extraction res
     ap.add_argument("--bound",     type=float, default=1.5)
     ap.add_argument("--n-samples", type=int,   default=2_000_000)
     ap.add_argument("--frame", choices=["colmap-pose", "nsvf", "colmap-sfm", "colmap-local"],

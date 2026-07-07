@@ -32,11 +32,63 @@ import lip_tracer.data as data_mod
 from plot_sphere_trace_steps import rays_for_view
 
 
+class _NeuSSDF(torch.nn.Module):
+    """Thin wrapper so the project sphere tracer can call a NeuS SDFNetwork."""
+
+    architecture = "neus"
+    input_encoding = "pe"
+
+    def __init__(self, net: torch.nn.Module):
+        super().__init__()
+        self.net = net
+
+    def forward(self, x):
+        return self.net.sdf(x).reshape(-1)
+
+    def sdf(self, x):
+        return self.forward(x)
+
+
+def _resolve_ckpt_path(run_dir: Path, ckpt_name: str) -> Path:
+    ckpt_path = Path(ckpt_name)
+    if ckpt_path.is_absolute() and ckpt_path.exists():
+        return ckpt_path
+    candidates = [
+        run_dir / "ckpt" / ckpt_name,
+        run_dir / "checkpoints" / ckpt_name,
+        run_dir / ckpt_name,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0]
+
+
+def load_neus_run(run_dir: Path, ckpt_name: str, device: str):
+    from pyhocon import ConfigFactory
+
+    neus_dir = Path(__file__).resolve().parent.parent / "baselines" / "NeuS"
+    sys.path.insert(0, str(neus_dir))
+    from models.fields import SDFNetwork
+
+    conf_path = run_dir / "run.conf"
+    conf = ConfigFactory.parse_file(str(conf_path))
+    net = SDFNetwork(**conf["model.sdf_network"]).to(device).eval()
+    ckpt_path = _resolve_ckpt_path(run_dir, ckpt_name)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    net.load_state_dict(ckpt["sdf_network_fine"])
+    f = _NeuSSDF(net).to(device).eval()
+    scene = Path(str(conf["dataset.data_dir"]))
+    cfg = TraceConfig(iters=256, eps=1e-5, t_far=10.0, newton_steps=8)
+    return f, cfg, scene
+
+
 def load_run(run_dir: Path, ckpt_name: str, device: str):
+    if not (run_dir / "config.json").exists() and (run_dir / "run.conf").exists():
+        return load_neus_run(run_dir, ckpt_name, device)
+
     cfg = json.loads((run_dir / "config.json").read_text())
-    ckpt_path = run_dir / "ckpt" / ckpt_name
-    if not ckpt_path.exists():
-        ckpt_path = run_dir / ckpt_name
+    ckpt_path = _resolve_ckpt_path(run_dir, ckpt_name)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     m = cfg["model"]
     f = make_model(
@@ -499,6 +551,53 @@ def chart_diag(f, views, vi, cfg_trace, args, out_dir: Path):
     print(f"chart-diag done → {out_dir}/view{vi}_chart_*", flush=True)
 
 
+def largest_depth_component(hit: np.ndarray, t: np.ndarray, H: int, W: int,
+                            rel_depth_gap: float) -> np.ndarray:
+    """(H,W) bool mask of the largest depth-connected component of hit pixels.
+
+    Two 4-neighbour hits are linked only when their depth spread stays within
+    rel_depth_gap·min(t) — the SAME silhouette test build_screen_mesh uses on
+    quads. So a background plane seen past the object's silhouette (a depth jump
+    away) becomes a separate component and is dropped when it is not the biggest,
+    and disconnected floaters/speckles are removed. Keeps the single largest
+    component by pixel count.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    hit2 = hit.reshape(H, W)
+    t2 = t.reshape(H, W)
+    ids = np.arange(H * W).reshape(H, W)
+
+    rows, cols = [], []
+    # horizontal neighbours (c, c+1)
+    hh = hit2[:, :-1] & hit2[:, 1:]
+    ta, tb = t2[:, :-1], t2[:, 1:]
+    ok = hh & (np.abs(ta - tb) < rel_depth_gap * np.minimum(ta, tb))
+    rows.append(ids[:, :-1][ok]); cols.append(ids[:, 1:][ok])
+    # vertical neighbours (r, r+1)
+    vv = hit2[:-1, :] & hit2[1:, :]
+    ta, tb = t2[:-1, :], t2[1:, :]
+    ok = vv & (np.abs(ta - tb) < rel_depth_gap * np.minimum(ta, tb))
+    rows.append(ids[:-1, :][ok]); cols.append(ids[1:, :][ok])
+
+    r = np.concatenate(rows); c = np.concatenate(cols)
+    data = np.ones(len(r), dtype=np.uint8)
+    g = coo_matrix((data, (r, c)), shape=(H * W, H * W))
+    n_comp, labels = connected_components(g, directed=False)
+
+    flat_hit = hit2.reshape(-1)
+    lab_hit = labels[flat_hit]
+    if lab_hit.size == 0:
+        return np.zeros((H, W), dtype=bool)
+    counts = np.bincount(lab_hit)
+    biggest = counts.argmax()
+    keep = (labels == biggest) & flat_hit
+    print(f"  [largest-component] {n_comp} comps, kept {keep.sum():,}/"
+          f"{flat_hit.sum():,} hit px", flush=True)
+    return keep.reshape(H, W)
+
+
 def build_screen_mesh(hit: np.ndarray, pos: np.ndarray, t: np.ndarray,
                       normals: np.ndarray, H: int, W: int,
                       rel_depth_gap: float, grazing_cos: float, dirs_hw3: np.ndarray):
@@ -557,7 +656,9 @@ def build_screen_mesh(hit: np.ndarray, pos: np.ndarray, t: np.ndarray,
 
 
 def dump_buffers(out_png_stem: Path, hit: np.ndarray, normals: np.ndarray,
-                 pts: np.ndarray, c2w: np.ndarray, H: int, W: int, ss: int = 1):
+                 pts: np.ndarray, c2w: np.ndarray, H: int, W: int, ss: int = 1,
+                 fg_mask: np.ndarray = None, smooth_sigma: float = 0.0,
+                 fill_holes: bool = True, fill_mask_misses: bool = False):
     """Write the raw sphere-trace buffers as PNGs — the surface exactly as the
     tracer sees it from this camera, BEFORE any mesh stitching / culling / Blender.
 
@@ -570,8 +671,79 @@ def dump_buffers(out_png_stem: Path, hit: np.ndarray, normals: np.ndarray,
     import imageio.v2 as imageio
 
     hit2 = hit.reshape(H, W)
+    if fg_mask is not None:
+        # Drop hits outside the dataset foreground mask (pedestal / floaters /
+        # background surface) so the buffers show only the masked object.
+        hit2 = hit2 & fg_mask.reshape(H, W).astype(bool)
     n = normals.reshape(H, W, 3).astype(np.float64)
     p = pts.reshape(H, W, 3).astype(np.float64)
+
+    # Fill interior miss pixels (grazing-angle silhouette/thin-feature slivers the
+    # sphere trace slips past — |f| never drops to eps, so raising iters does NOT
+    # recover them: diagnosed at ~0.25% of the fg). Left alone they punch white
+    # holes THROUGH the subject. Fill each hole with the nearest surface pixel's
+    # normal + position and mark it a hit, so shading closes it seamlessly. The
+    # hole set is restricted to the dataset fg silhouette (fg_mask), so genuine
+    # background gaps (between legs, arm↔torso) are NOT filled; without a mask,
+    # fall back to fully ENCLOSED holes only (binary_fill_holes), never the open
+    # silhouette. Done at the ss grid, before smoothing/SSAA.
+    if fill_holes and hit2.any():
+        from scipy.ndimage import distance_transform_edt, binary_fill_holes
+        if fg_mask is not None:
+            # binary_fill_holes on the mask first, so tiny 0-holes IN the dataset
+            # eval mask itself (mask defects on the body) also count as interior
+            # and get filled — only ENCLOSED holes close, the open leg gap stays.
+            silo = binary_fill_holes(fg_mask.reshape(H, W).astype(bool))
+            holes = silo & ~hit2
+        else:
+            holes = binary_fill_holes(hit2) & ~hit2
+        if holes.any():
+            ir, ic = distance_transform_edt(
+                ~hit2, return_distances=False, return_indices=True)
+            n[holes] = n[ir[holes], ic[holes]]
+            p[holes] = p[ir[holes], ic[holes]]
+            hit2[holes] = True
+            print(f"[fill-holes] filled {int(holes.sum())} interior miss px "
+                  f"from nearest surface", flush=True)
+
+    # Display-only repair for strict masks / subpixel silhouettes: if a cleaned
+    # foreground mask says a pixel belongs to the subject but the tracer misses
+    # it, copy the nearest traced surface sample. Unlike fill_holes, this also
+    # repairs open boundary bites (hands/shoes), so keep it explicit.
+    if fill_mask_misses and fg_mask is not None and hit2.any():
+        from scipy.ndimage import distance_transform_edt
+        holes = fg_mask.reshape(H, W).astype(bool) & ~hit2
+        if holes.any():
+            ir, ic = distance_transform_edt(
+                ~hit2, return_distances=False, return_indices=True)
+            n[holes] = n[ir[holes], ic[holes]]
+            p[holes] = p[ir[holes], ic[holes]]
+            hit2[holes] = True
+            print(f"[fill-mask-misses] filled {int(holes.sum())} fg miss px "
+                  f"from nearest surface", flush=True)
+
+    # Optional screen-space smoothing of the per-pixel ∇f normal field. The raw
+    # 1-Lipschitz gradient carries high-frequency wobble (fine speckle on the
+    # body, grain over genuine ridges/terracing) that shading amplifies — visible
+    # as striations that are NOT edge aliasing. A small masked Gaussian on the
+    # normal VECTORS (then renormalize) removes that grain while preserving the
+    # silhouette and low-frequency shape. Masked + normalized-convolution so the
+    # white background never bleeds across the silhouette; only hit pixels
+    # contribute and edges keep their own normals. σ≈1.0-1.2 px is the sweet spot
+    # (σ≳2 starts softening real detail like wing feathers / facial features).
+    # Applied at the supersampled grid, BEFORE the SSAA box-average below.
+    if smooth_sigma and smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        m_hit = hit2.astype(np.float64)
+        num = np.stack(
+            [gaussian_filter(n[..., c] * m_hit, smooth_sigma) for c in range(3)],
+            axis=-1,
+        )
+        den = gaussian_filter(m_hit, smooth_sigma)[..., None]
+        n = num / np.clip(den, 1e-6, None)
+        n = n / np.clip(np.linalg.norm(n, axis=-1, keepdims=True), 1e-9, None)
+        print(f"[smooth] masked Gaussian on normals  sigma={smooth_sigma}px",
+              flush=True)
 
     cam_right = c2w[:3, 0]; cam_up = c2w[:3, 1]; cam_fwd = -c2w[:3, 2]
     cam_pos = c2w[:3, 3]
@@ -617,6 +789,28 @@ def dump_buffers(out_png_stem: Path, hit: np.ndarray, normals: np.ndarray,
         path = out_png_stem.with_name(f"{out_png_stem.name}_{tag}.png")
         imageio.imwrite(path, np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8))
         print(f"saved buffer {path}  hit_rate={hit2.mean():.2%}", flush=True)
+
+
+def clean_display_mask(mask: np.ndarray, *, fill_holes: bool = True,
+                       dilate_px: int = 0) -> np.ndarray:
+    """Heal a foreground mask used only for RGB/phong preview compositing."""
+    out = mask.astype(bool)
+    if fill_holes:
+        from scipy.ndimage import binary_fill_holes
+        before = int(out.sum())
+        out = binary_fill_holes(out)
+        added = int(out.sum()) - before
+        if added:
+            print(f"[mask-clean] filled {added:,} enclosed mask hole px", flush=True)
+    if dilate_px > 0:
+        from scipy.ndimage import binary_dilation
+        before = int(out.sum())
+        out = binary_dilation(out, iterations=int(dilate_px))
+        added = int(out.sum()) - before
+        if added:
+            print(f"[mask-clean] dilated mask by {dilate_px}px "
+                  f"(+{added:,} px)", flush=True)
+    return out
 
 
 def write_ply(path: Path, verts: np.ndarray, normals: np.ndarray, faces: np.ndarray):
@@ -840,6 +1034,17 @@ def main():
                     help="sphere-trace iteration budget. Default = the run config's "
                          "own `iters`, i.e. EXACTLY what was used to render this .pt. "
                          "Only set this to deliberately deviate from the run.")
+    ap.add_argument("--eps", type=float, default=None,
+                    help="sphere-trace hit threshold |f(x)|<eps. Default = run cfg "
+                         "(NeuS hardcodes 1e-5). Override to match another run's trace.")
+    ap.add_argument("--newton-steps", type=int, default=None,
+                    help="Newton refinement steps after the sphere trace. Default = "
+                         "run cfg (NeuS hardcodes 8). Override to match another run.")
+    ap.add_argument("--t-far", type=float, default=None,
+                    help="sphere-trace far cutoff (ray length). Default = run cfg. "
+                         "Some rigs (e.g. MVMannequin) place cameras farther from the "
+                         "normalized origin than the run's t_far, so the ray is cut off "
+                         "before the surface (0 hits). Raise it to reach the object.")
     ap.add_argument("--chunk", type=int, default=32768)
     ap.add_argument("--rel-depth-gap", type=float, default=0.02,
                     help="reject quads where max(Δt) > rel·min(t)")
@@ -853,10 +1058,47 @@ def main():
                          "trace and upsampled to the buffer grid (GT reference for "
                          "side-by-side with the _phong/_normals buffers). Requires "
                          "--dump-buffers and --supersample>1.")
+    ap.add_argument("--largest-component", action="store_true",
+                    help="(--dump-buffers only) keep only the largest "
+                         "depth-connected component of hit pixels (same "
+                         "silhouette depth-gap test as the mesh), dropping "
+                         "background planes seen past the silhouette and "
+                         "detached floaters. Combined with --mask-bg.")
     ap.add_argument("--dump-buffers", action="store_true",
                     help="also write raw per-pixel phong + normal PNGs from the "
                          "trace (pre-meshing, pre-Blender) next to --out, to tell "
                          "whether missing geometry is in f_theta or the render.")
+    ap.add_argument("--no-fill-holes", action="store_true",
+                    help="(--dump-buffers only) DON'T fill interior miss pixels "
+                         "(grazing-angle slivers the trace slips past) from the "
+                         "nearest surface pixel. Filling is on by default so the "
+                         "subject has no white holes punched through it; pass this "
+                         "to see the raw hit/miss buffer instead.")
+    ap.add_argument("--fill-mask-misses", action="store_true",
+                    help="(--dump-buffers/--mask-bg only) fill every traced miss "
+                         "inside the cleaned display mask from the nearest hit. "
+                         "Repairs open silhouette bites at hands/shoes; display "
+                         "only, not a raw geometry diagnostic.")
+    ap.add_argument("--smooth-sigma", type=float, default=0.0,
+                    help="(--dump-buffers only) masked Gaussian sigma (px) applied "
+                         "to the per-pixel normal field before shading, to remove "
+                         "the high-frequency ∇f striations/grain without softening "
+                         "the silhouette or genuine detail. 0=off; 1.0-1.2 is a "
+                         "good slight smoothing (>~2 starts losing fine detail).")
+    ap.add_argument("--mask-bg", action="store_true",
+                    help="(--dump-buffers only) composite the dataset foreground "
+                         "mask onto the phong/normal buffers: any hit outside the "
+                         "GT mask (pedestal/floaters/background surface) is set to "
+                         "white. Minimal DTU preview that shows only the masked "
+                         "object the way the dataset masks define it.")
+    ap.add_argument("--no-mask-fill-holes", action="store_true",
+                    help="(--dump-buffers/--mask-bg only) keep enclosed 0-islands "
+                         "inside the display mask. By default they are filled so "
+                         "mask defects do not punch white pixels through GT/phong.")
+    ap.add_argument("--mask-dilate-px", type=int, default=0,
+                    help="(--dump-buffers/--mask-bg only) dilate the display mask "
+                         "by this many pixels after hole filling. Useful for "
+                         "strict eval masks that trim hands/shoes at the boundary.")
     ap.add_argument("--diag", action="store_true",
                     help="write <stem>_diag.png: a 2x3 figure comparing analytic vs "
                          "screen-space geometric normals (+ angular error) and "
@@ -981,10 +1223,15 @@ def main():
     # already inherited from cfg, so the whole trace matches the run unless
     # --max-iters is explicitly passed to deviate.
     iters = args.max_iters if args.max_iters is not None else cfg.iters
-    cfg_trace = replace(cfg, iters=iters)
-    print(f"trace cfg (from run): iters={cfg_trace.iters} eps={cfg.eps:g} "
-          f"newton={cfg.newton_steps}"
-          f"{'  [DEFAULT = run value]' if args.max_iters is None else '  [OVERRIDDEN via --max-iters]'}",
+    eps = args.eps if args.eps is not None else cfg.eps
+    newton = args.newton_steps if args.newton_steps is not None else cfg.newton_steps
+    t_far = args.t_far if args.t_far is not None else cfg.t_far
+    cfg_trace = replace(cfg, iters=iters, eps=eps, newton_steps=newton, t_far=t_far)
+    over = [n for n, v in (("iters", args.max_iters), ("eps", args.eps),
+                           ("newton", args.newton_steps), ("t_far", args.t_far)) if v is not None]
+    print(f"trace cfg: iters={cfg_trace.iters} eps={cfg_trace.eps:g} "
+          f"newton={cfg_trace.newton_steps} t_far={cfg_trace.t_far:g}"
+          f"{'  [DEFAULT = run value]' if not over else '  [OVERRIDDEN: ' + ','.join(over) + ']'}",
           flush=True)
 
     for vi in view_list:
@@ -1038,11 +1285,56 @@ def main():
             )
 
         if args.dump_buffers:
+            fg_mask = None
+            if args.mask_bg:
+                # Sample the dataset fg mask onto the trace grid (full frame at
+                # ss=1, or the fg-bbox crop when --supersample>1), nearest so it
+                # stays a hard 0/1 silhouette.
+                from PIL import Image
+                m = views["masks"][vi].numpy().astype(bool)      # (Himg, Wimg)
+                if args.expand_px > 0:
+                    # Expanded full-frame grid: rows/cols run -pad..(H0/W0+pad) in
+                    # native pixel coords, ss× denser (see rays_for_view_expanded).
+                    # Sample the native mask at each sub-pixel's native index; any
+                    # sub-pixel outside the image (the pad margin) is background.
+                    H0, W0 = m.shape
+                    pad, ss = args.expand_px, max(args.supersample, 1)
+                    rr = np.floor(-pad + (np.arange(H) + 0.5) / ss).astype(int)
+                    cc = np.floor(-pad + (np.arange(W) + 0.5) / ss).astype(int)
+                    rv, cv = (rr >= 0) & (rr < H0), (cc >= 0) & (cc < W0)
+                    fg = m[np.clip(rr, 0, H0 - 1)[:, None],
+                           np.clip(cc, 0, W0 - 1)[None, :]]
+                    fg_mask = fg & rv[:, None] & cv[None, :]
+                else:
+                    if bbox is not None:
+                        r0, r1, c0, c1 = bbox
+                        m = m[r0:r1, c0:c1]
+                    if m.shape != (H, W):   # ss× fg-bbox crop: linear NEAREST is exact
+                        m = np.asarray(Image.fromarray((m * 255).astype(np.uint8))
+                                       .resize((W, H), Image.NEAREST)) > 127
+                    fg_mask = m
+                raw_mean = fg_mask.mean()
+                fg_mask = clean_display_mask(
+                    fg_mask,
+                    fill_holes=not args.no_mask_fill_holes,
+                    dilate_px=max(0, args.mask_dilate_px),
+                )
+                print(f"[mask-bg] fg mask {fg_mask.mean():.2%} of grid", flush=True)
+                if fg_mask.mean() != raw_mean:
+                    print(f"[mask-bg] raw fg mask was {raw_mean:.2%}", flush=True)
+            if args.largest_component:
+                comp = largest_depth_component(
+                    hit.reshape(-1) if hit.ndim > 1 else hit,
+                    t.astype(np.float32), H, W, args.rel_depth_gap)
+                fg_mask = comp if fg_mask is None else (fg_mask & comp)
             dump_buffers(
                 buf_stem, hit, normals,
                 pts.detach().cpu().numpy().astype(np.float32),
                 views["c2w"][vi].numpy().astype(np.float64), H, W,
-                ss=args.supersample,
+                ss=args.supersample, fg_mask=fg_mask,
+                smooth_sigma=args.smooth_sigma,
+                fill_holes=not args.no_fill_holes,
+                fill_mask_misses=args.fill_mask_misses,
             )
             if args.gt_photo:
                 if bbox is None:
@@ -1054,11 +1346,25 @@ def main():
                     from PIL import Image
                     r0, r1, c0, c1 = bbox
                     rgb = views["images"][vi].numpy()            # (Himg,Wimg,3) float 0-1
-                    msk = views["masks"][vi].numpy().astype(bool)
-                    masked = (rgb * msk[..., None])[r0:r1, c0:c1]
+                    rgb_crop = rgb[r0:r1, c0:c1]
                     # Match the (now box-averaged) phong/normals output size so the
                     # GT photo stays pixel-aligned for side-by-side comparison.
                     gw, gh = W // args.supersample, H // args.supersample
+                    if fg_mask is not None and fg_mask.shape == (H, W):
+                        if args.supersample > 1:
+                            msk = fg_mask.reshape(
+                                gh, args.supersample, gw, args.supersample
+                            ).any(axis=(1, 3))
+                        else:
+                            msk = fg_mask
+                    else:
+                        msk = views["masks"][vi].numpy().astype(bool)[r0:r1, c0:c1]
+                        msk = clean_display_mask(
+                            msk,
+                            fill_holes=not args.no_mask_fill_holes,
+                            dilate_px=max(0, args.mask_dilate_px),
+                        )
+                    masked = np.where(msk[..., None], rgb_crop, 1.0)
                     gt_img = Image.fromarray(
                         np.clip(masked * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     ).resize((gw, gh), Image.Resampling.LANCZOS)

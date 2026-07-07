@@ -322,8 +322,8 @@ def plot_image_overlays(out_dir: Path, scan_id: int, images: np.ndarray,
 
         fig, ax = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
         panels = [
-            ("gray GT-plane ZNCC", g_xy, g_z, "magma", 0.0, 0.85),
-            ("RGB GT-plane ZNCC", r_xy, r_z, "magma", 0.0, 0.85),
+            ("gray GT-plane ZNCC", g_xy, g_z, "magma", 0.0, 0.95),
+            ("RGB GT-plane ZNCC", r_xy, r_z, "magma", 0.0, 0.95),
             ("gray - RGB ZNCC", d_xy, d_z, "coolwarm", -0.25, 0.25),
         ]
         for a, (title, xy, val, cmap, vmin, vmax) in zip(ax, panels):
@@ -406,8 +406,8 @@ def _plot_dense_overlay(out_path: Path, scan_id: int, ref_view: int,
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
     panels = [
-        ("gray GT-plane ZNCC", g_xy, g_z, "magma", 0.0, 0.85),
-        ("RGB GT-plane ZNCC", r_xy, r_z, "magma", 0.0, 0.85),
+        ("gray GT-plane ZNCC", g_xy, g_z, "magma", 0.0, 0.95),
+        ("RGB GT-plane ZNCC", r_xy, r_z, "magma", 0.0, 0.95),
         ("gray - RGB ZNCC", d_xy, d_z, "coolwarm", -0.25, 0.25),
     ]
     for a, (title, xy, val, cmap, vmin, vmax) in zip(ax, panels):
@@ -490,7 +490,7 @@ def _plot_paper_grid(out_path: Path, scan_id: int,
         vals = [p["gray_z"], p["rgb_z"], p["diff_z"]]
         cmaps = ["magma", "magma", "coolwarm"]
         vmins = [0.0, 0.0, -0.25]
-        vmaxs = [0.85, 0.85, 0.25]
+        vmaxs = [0.95, 0.95, 0.25]
         stats = [p["gray_mean"], p["rgb_mean"], p["diff_mean"]]
         counts = [p["gray_total_n"], p["rgb_total_n"], p["diff_total_n"]]
         for j in range(3):
@@ -514,7 +514,7 @@ def _plot_paper_grid(out_path: Path, scan_id: int,
                     fontsize=7.5, color="white",
                     bbox=dict(facecolor="black", alpha=0.45, pad=1.5, edgecolor="none"))
 
-    zncc_sm = ScalarMappable(norm=Normalize(0.0, 0.85), cmap="magma")
+    zncc_sm = ScalarMappable(norm=Normalize(0.0, 0.95), cmap="magma")
     diff_sm = ScalarMappable(norm=Normalize(-0.25, 0.25), cmap="coolwarm")
     zncc_axes = [axes[r, c] for r in range(rows) for c in range(cols)
                  if c % 3 in (0, 1)]
@@ -581,7 +581,7 @@ def _plot_crop_check(out_path: Path, scene_tag: str, ref_view: int,
     ax.imshow(image)
     if len(z_in):
         ax.scatter(xy_in[:, 0], xy_in[:, 1], c=z_in, s=2.0, cmap="magma",
-                   vmin=0.0, vmax=0.85, linewidths=0)
+                   vmin=0.0, vmax=0.95, linewidths=0)
     ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
                            edgecolor="red", lw=2.0))
     ax.set_title(f"{scene_tag}  v{ref_view:03d}  crop = ({x0:.0f},{y0:.0f})-"

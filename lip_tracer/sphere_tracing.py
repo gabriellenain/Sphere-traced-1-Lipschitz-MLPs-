@@ -166,6 +166,7 @@ def trace_unrolled(
     cfg: TraceConfig = _DEFAULT_TRACE,
     collect_eik: bool = True,
     diff_normal: bool = False,
+    attach_normal_point: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Differentiable sphere tracing — exact gradients through unrolled iterations.
 
@@ -277,6 +278,12 @@ def trace_unrolled(
         n_raw = n_raw.detach()
 
     x_theta = o + t.unsqueeze(-1) * d
+    # "Detach nothing": re-evaluate the normal at the differentiable x_theta so the
+    # loss also carries the position→normal edge ∂n/∂x·∂x_theta/∂θ.
+    if diff_normal and attach_normal_point:
+        with torch.enable_grad():
+            n_raw = torch.autograd.grad(f(x_theta).sum(), x_theta,
+                                        create_graph=True)[0]
     eik_out = eik_buf[:eik_slot * B] if eik_buf is not None else torch.empty(0, 3, device=o.device)
     return x_theta, t, hit, eik_out, n_raw, sdf_min, hit_bg
 
@@ -286,6 +293,7 @@ def trace_idr(
     cfg: TraceConfig = _DEFAULT_TRACE,
     collect_eik: bool = True,
     diff_normal: bool = False,
+    attach_normal_point: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Differentiable sphere tracing via IDR implicit gradient (Yariv et al. 2020).
 
@@ -435,6 +443,15 @@ def trace_idr(
     # the sphere exit is far from any surface, so f*/n·d would be unreliable).
     correction = torch.where(hit, f_star / n_dot_d_safe.detach(), torch.zeros_like(f_star))
     x_theta = x_star + correction.unsqueeze(-1) * (-d)        # x* - (f*/n·d)*d
+
+    # "Detach nothing": re-evaluate the returned normal at the DIFFERENTIABLE
+    # x_theta so the loss also carries the position→normal edge
+    # ∂n/∂x·∂x_theta/∂θ (curvature × surface motion). The IDR correction above
+    # keeps using n_geo (detached x_star), so x_theta's own gradient is unchanged.
+    if diff_normal and attach_normal_point:
+        with torch.enable_grad():
+            n_raw = torch.autograd.grad(f(x_theta).sum(), x_theta,
+                                        create_graph=True)[0]
 
     eik_out = eik_buf[:eik_slot * B] if eik_buf is not None else torch.empty(0, 3, device=o.device)
     return x_theta, t, hit, eik_out, n_raw, sdf_min, hit_bg

@@ -3066,6 +3066,13 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
         train_cfg.w_ncc_normal > 0
         or (train_cfg.w_ncc > 0 and not train_cfg.ncc_detach_normals)
     )
+    if getattr(train_cfg, "ncc_attach_normal_point", False):
+        if _need_diff_normal_compile:
+            print("  [ncc] attach_normal_point ON — normal evaluated at differentiable "
+                  "x_theta (position→normal gradient flows; 'detach nothing')")
+        else:
+            print("  [warn] --ncc-attach-normal-point set but no differentiable normal "
+                  "path active (needs --no-ncc-detach-normals or w_ncc_normal>0) — ignored")
     if getattr(train_cfg, "compile", True):
         if _need_diff_normal_compile:
             import torch._functorch.config as _ffc
@@ -3409,9 +3416,11 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
             or (train_cfg.w_ncc > 0 and not train_cfg.ncc_detach_normals)
         )
         with prof.timed("trace"):
-            x_theta, t, hit, eik_pts, n_raw, sdf_min, hit_bg = _trace_fn(f_fwd, o, u, trace_cfg,
-                                                                          collect_eik=_need_eik,
-                                                                          diff_normal=_need_diff_normal)
+            x_theta, t, hit, eik_pts, n_raw, sdf_min, hit_bg = _trace_fn(
+                f_fwd, o, u, trace_cfg,
+                collect_eik=_need_eik,
+                diff_normal=_need_diff_normal,
+                attach_normal_point=train_cfg.ncc_attach_normal_point)
         neus_trace_stats = get_last_trace_stats() if f.architecture == "neus" else None
         neus_trace_str = ""
         # hit_real = real convergence; hit_bg = reached bounding sphere exit.
@@ -4413,6 +4422,12 @@ if __name__ == "__main__":
                     default=_tc.ncc_detach_normals,
                     help="detach normals in the position-branch NCC tangent patch "
                          "(use --no-ncc-detach-normals for the normal-gradient ablation)")
+    ap.add_argument("--ncc-attach-normal-point", action=argparse.BooleanOptionalAction,
+                    default=_tc.ncc_attach_normal_point,
+                    help="'detach nothing' ablation: evaluate the normal at the "
+                         "differentiable x_theta so the loss also carries the "
+                         "position→normal term ∂n/∂x·∂x_theta/∂θ. Needs "
+                         "--no-ncc-detach-normals; adds a curvature-weighted term.")
     ap.add_argument("--ncc-patch", type=int, default=_tc.ncc_patch,
                     help="PMVS patch side P (PxP sample grid)")
     ap.add_argument("--ncc-half-pix", type=float, default=_tc.ncc_half_pix,
@@ -4814,6 +4829,9 @@ if __name__ == "__main__":
         if args.ncc_detach_normals != _tc.ncc_detach_normals:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, ncc_detach_normals=args.ncc_detach_normals))
+        if args.ncc_attach_normal_point != _tc.ncc_attach_normal_point:
+            run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
+                run_cfg.train, ncc_attach_normal_point=args.ncc_attach_normal_point))
         if args.w_geo_sdf != _tc.w_geo_sdf:
             run_cfg = dataclasses.replace(run_cfg, train=dataclasses.replace(
                 run_cfg.train, w_geo_sdf=args.w_geo_sdf))
@@ -4896,6 +4914,7 @@ if __name__ == "__main__":
                 view_selection=args.view_selection, pairs_path=args.pairs_path,
                 w_ncc=args.w_ncc, w_ncc_normal=args.w_ncc_normal,
                 ncc_detach_normals=args.ncc_detach_normals,
+                ncc_attach_normal_point=args.ncc_attach_normal_point,
                 ncc_patch=args.ncc_patch,
                 ncc_half_pix=args.ncc_half_pix, ncc_min=args.ncc_min,
                 ncc_sat_tau=args.ncc_sat_tau,

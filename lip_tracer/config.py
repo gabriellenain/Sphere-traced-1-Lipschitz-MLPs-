@@ -295,6 +295,14 @@ class TrainConfig:
     # the legacy first-order geometry update. Disable for the controlled
     # ablation where NCC gradients also flow through n_theta in the same term.
     ncc_detach_normals: bool = True
+    # "Detach nothing" ablation. Even with ncc_detach_normals=False the normal is
+    # evaluated at a DETACHED surface point (x* = sg[x_theta]), so only the
+    # weights→normal edge ∂n/∂θ|_x flows. Set True to also evaluate the normal at
+    # the differentiable x_theta, restoring the position→normal edge
+    # ∂n/∂x·∂x_theta/∂θ (level-set curvature × surface motion) — the full gradient.
+    # Requires ncc_detach_normals=False (needs the double-backward graph); the
+    # extra term is curvature-weighted and can amplify high-frequency ripples.
+    ncc_attach_normal_point: bool = False
     ncc_patch:   int   = 5
     ncc_half_pix: float = 2.0   # PMVS patch half-width in reference-view pixels
     # Object-fixed patch footprint (WORLD units). >0 → size the position-branch

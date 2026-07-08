@@ -1565,13 +1565,14 @@ def _debug_views(f, views, view_ids: list[int], step: int, run_dir: Path,
                 uc1 = uc[:, 1].clamp(0, H_full - 1)
                 fg_alt = masks_t[ak, uc1, uc0]
                 # occlusion (same as photo_loss occ_mode)
+                _occ_slack = getattr(trace_cfg, "occ_depth_slack", 1e-2)
                 if occ_md == "from_hit":
                     _, tp, hp = trace_nograd(f, xs + 1e-2 * dp, dp, trace_cfg)
-                    not_occl = (~hp) | (tp > dist - 0.1)
+                    not_occl = (~hp) | (tp > dist - _occ_slack)
                 else:                                            # pinhole
                     _, tp, hp = trace_nograd(f, op.unsqueeze(0).expand_as(xs),
                                              -dp, trace_cfg)
-                    not_occl = hp & (dist <= tp + 0.1)
+                    not_occl = hp & (dist <= tp + _occ_slack)
                 gate = in_fr & cos_ok & fg_alt & not_occl & fss
                 if not gate.any():
                     continue
@@ -3056,7 +3057,20 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
     # checkpointing/introspection keep using the raw `f` — only forward calls in
     # the inner loop route through the fused graph. dynamic=True: the compacted
     # trace passes variable-size batches each iteration.
+    # Differentiable normals (∇f traced with create_graph=True, used when the NCC
+    # loss optimizes orientation — w_ncc_normal>0 or --no-ncc-detach-normals) are
+    # incompatible with torch.compile's donated-buffer optimization, whose compiled
+    # backward asserts create_graph=False. Without this the first such backward
+    # aborts: "non-empty donated buffers requires create_graph=False".
+    _need_diff_normal_compile = (
+        train_cfg.w_ncc_normal > 0
+        or (train_cfg.w_ncc > 0 and not train_cfg.ncc_detach_normals)
+    )
     if getattr(train_cfg, "compile", True):
+        if _need_diff_normal_compile:
+            import torch._functorch.config as _ffc
+            _ffc.donated_buffer = False
+            print("  torch.compile: donated_buffer disabled (differentiable normals need create_graph=True)")
         f_fwd, _ok, _msg = _try_compile_model(f)
         if _ok:
             print("  torch.compile(dynamic=True) enabled for hot-path f")
@@ -4290,6 +4304,12 @@ if __name__ == "__main__":
                          "Each Newton step is ~3x a regular iter (fwd+bwd) and is pointless for a boolean.")
     ap.add_argument("--occ-eps", type=float, default=_trc.occ_eps,
                     help="hit threshold for the occlusion trace (<0 = same as --eps)")
+    ap.add_argument("--occ-depth-slack", type=float, default=_trc.occ_depth_slack,
+                    help="depth tolerance for the occ visibility test, normalized units "
+                         "(default 1e-2 ~= 10x eps). Must exceed eps (self-occlusion "
+                         "residual); floored by grazing-angle error, capped by the "
+                         "thinnest occluder you need to catch. Lower it for thin/"
+                         "self-occluding scenes (e.g. DTU scan37).")
     ap.add_argument("--eps", type=float, default=_trc.eps,
                     help="sphere-trace hit threshold |f(x)|<eps, in normalized units. "
                          "DTU 1 unit~0.25m so 1e-3~0.25mm; MVMannequin 1 unit~1m so "
@@ -4674,6 +4694,7 @@ if __name__ == "__main__":
                 occ_iters=args.occ_iters,
                 occ_newton_steps=args.occ_newton_steps,
                 occ_eps=args.occ_eps,
+                occ_depth_slack=args.occ_depth_slack,
             ),
             eval=dataclasses.replace(
                 run_cfg.eval,
@@ -4834,6 +4855,7 @@ if __name__ == "__main__":
                               occ_iters=args.occ_iters,
                               occ_newton_steps=args.occ_newton_steps,
                               occ_eps=args.occ_eps,
+                              occ_depth_slack=args.occ_depth_slack,
                               bsphere_radius=args.bsphere_radius,
                               bsphere_start_radius=args.bsphere_start_radius,
                               t_far=args.t_far, sdf_min_beta=args.sdf_min_beta),

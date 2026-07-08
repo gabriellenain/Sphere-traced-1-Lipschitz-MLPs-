@@ -475,8 +475,10 @@ def photo_loss(
             eps=trace_cfg.occ_eps if trace_cfg.occ_eps > 0 else trace_cfg.eps,
         )
         _trace_kw = {"cfg": occ_cfg}
+        _occ_slack = trace_cfg.occ_depth_slack
     else:
         _trace_kw = {}
+        _occ_slack = 1e-2
     with _occ_cm:
         if occ_mode == "from_hit":
             # Trace from hit point toward the alt camera instead of from the pinhole.
@@ -516,9 +518,9 @@ def photo_loss(
 
         if occ_mode == "from_hit":
             # Trace started at hit-point toward alt cam: occluded iff it hits before reaching cam.
-            not_occl = ~hitp | (tp > dist - 0.1)
+            not_occl = ~hitp | (tp > dist - _occ_slack)
         else:
-            depth_ok = dist <= tp + 1e-1
+            depth_ok = dist <= tp + _occ_slack
             not_occl = hitp & depth_ok
 
         if step % 50 == 0 and k == 0:

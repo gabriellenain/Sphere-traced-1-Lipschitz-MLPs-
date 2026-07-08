@@ -42,6 +42,13 @@ class TraceConfig:
     occ_iters:        int   = -1   # max iters for the occ trace (-1 → use `iters`)
     occ_newton_steps: int   = -1   # Newton steps for the occ trace (-1 → use `newton_steps`; 0 = none)
     occ_eps:          float = -1.0 # hit threshold for the occ trace (<0 → use `eps`)
+    occ_depth_slack:  float = 1e-2 # depth tolerance for the occ visibility test, in
+                                   # normalized units. A point is "not occluded" if the
+                                   # occ trace reaches within this slack of its depth.
+                                   # Must exceed ~eps (self-occlusion residual) but stay
+                                   # well below the object radius; the floor is set by the
+                                   # grazing-angle term (depth err ≈ pos err / cos θ), the
+                                   # ceiling by how thin an occluder you need to detect.
     grad_mode:      str   = "idr"  # "backprop" | "idr"
     bsphere_radius: float = 0.0    # >0: use per-ray exit depth of this bounding sphere as t_far;
                                    # rays that reach the sphere exit are marked hit_bg=True so the

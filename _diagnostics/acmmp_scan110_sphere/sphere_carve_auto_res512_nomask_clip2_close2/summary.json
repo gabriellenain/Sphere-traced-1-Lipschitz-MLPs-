@@ -1,0 +1,400 @@
+{
+  "scene": "/scratch/_projets_/willow/1-lip-tracer-new/data/dtu_idr/scan110",
+  "depth_dir": "/scratch/_projets_/willow/1-lip-tracer-new/data/dtu_idr/scan110/acmmp_depth_1600x1200",
+  "method": "carve",
+  "tsdf_info": null,
+  "settings": {
+    "res": 512,
+    "bound": 1.5,
+    "sphere_center": [
+      0.19286800920963287,
+      0.09673042595386505,
+      -0.05275745689868927
+    ],
+    "sphere_radius": 0.85243152016152,
+    "sphere_radius_info": {
+      "mode": "sfm_distance_percentile",
+      "points": 11168,
+      "percentile": 99.9,
+      "core_radius": 0.83243152016152,
+      "pad": 0.02,
+      "radius": 0.85243152016152
+    },
+    "conf_thr": 0.5,
+    "use_depth_mask": false,
+    "margin_voxels": 3.0,
+    "margin": 0.01761252446183953,
+    "votes_req": 3,
+    "sfm_clip": true,
+    "clip_margin_voxels": 2.0,
+    "clip_margin": 0.011741682974559686,
+    "open_iters": 0,
+    "close_iters": 2,
+    "fill_holes": false,
+    "largest_component": true
+  },
+  "clip_info": {
+    "mode": "sfm_aabb",
+    "points": 11168,
+    "lo": [
+      -0.3697003229745597,
+      -0.5096286729745596,
+      -0.5731072229745597
+    ],
+    "hi": [
+      0.7554363429745596,
+      0.7030895229745597,
+      0.46759231297455967
+    ],
+    "margin": 0.011741682974559686
+  },
+  "cleanup_info": {
+    "open_iters": 0,
+    "close_iters": 2,
+    "fill_holes": false,
+    "before": 2779536,
+    "after": 2875397,
+    "delta": 95861
+  },
+  "per_view": [
+    {
+      "view": 0,
+      "valid_depth_px": 1715960,
+      "voxels_voted_empty": 3061702
+    },
+    {
+      "view": 1,
+      "valid_depth_px": 1836505,
+      "voxels_voted_empty": 3302651
+    },
+    {
+      "view": 2,
+      "valid_depth_px": 1842892,
+      "voxels_voted_empty": 3385699
+    },
+    {
+      "view": 3,
+      "valid_depth_px": 1834305,
+      "voxels_voted_empty": 3359542
+    },
+    {
+      "view": 4,
+      "valid_depth_px": 1726943,
+      "voxels_voted_empty": 3103828
+    },
+    {
+      "view": 5,
+      "valid_depth_px": 1765706,
+      "voxels_voted_empty": 3312404
+    },
+    {
+      "view": 6,
+      "valid_depth_px": 1817409,
+      "voxels_voted_empty": 3460546
+    },
+    {
+      "view": 7,
+      "valid_depth_px": 1845726,
+      "voxels_voted_empty": 3573960
+    },
+    {
+      "view": 8,
+      "valid_depth_px": 1867822,
+      "voxels_voted_empty": 3625555
+    },
+    {
+      "view": 9,
+      "valid_depth_px": 1870344,
+      "voxels_voted_empty": 3603743
+    },
+    {
+      "view": 10,
+      "valid_depth_px": 1874065,
+      "voxels_voted_empty": 3565843
+    },
+    {
+      "view": 11,
+      "valid_depth_px": 1722400,
+      "voxels_voted_empty": 3351980
+    },
+    {
+      "view": 12,
+      "valid_depth_px": 1775389,
+      "voxels_voted_empty": 3473486
+    },
+    {
+      "view": 13,
+      "valid_depth_px": 1831555,
+      "voxels_voted_empty": 3693635
+    },
+    {
+      "view": 14,
+      "valid_depth_px": 1811102,
+      "voxels_voted_empty": 3646491
+    },
+    {
+      "view": 15,
+      "valid_depth_px": 1789938,
+      "voxels_voted_empty": 3597019
+    },
+    {
+      "view": 16,
+      "valid_depth_px": 1744985,
+      "voxels_voted_empty": 3473643
+    },
+    {
+      "view": 17,
+      "valid_depth_px": 1726892,
+      "voxels_voted_empty": 3406095
+    },
+    {
+      "view": 18,
+      "valid_depth_px": 1714145,
+      "voxels_voted_empty": 3374095
+    },
+    {
+      "view": 19,
+      "valid_depth_px": 1397027,
+      "voxels_voted_empty": 2639523
+    },
+    {
+      "view": 20,
+      "valid_depth_px": 1461452,
+      "voxels_voted_empty": 2785844
+    },
+    {
+      "view": 21,
+      "valid_depth_px": 1456375,
+      "voxels_voted_empty": 2781424
+    },
+    {
+      "view": 22,
+      "valid_depth_px": 1492629,
+      "voxels_voted_empty": 2899269
+    },
+    {
+      "view": 23,
+      "valid_depth_px": 1562476,
+      "voxels_voted_empty": 3133398
+    },
+    {
+      "view": 24,
+      "valid_depth_px": 1595437,
+      "voxels_voted_empty": 3215302
+    },
+    {
+      "view": 25,
+      "valid_depth_px": 1650090,
+      "voxels_voted_empty": 3355678
+    },
+    {
+      "view": 26,
+      "valid_depth_px": 1664287,
+      "voxels_voted_empty": 3379790
+    },
+    {
+      "view": 27,
+      "valid_depth_px": 1663872,
+      "voxels_voted_empty": 3350581
+    },
+    {
+      "view": 28,
+      "valid_depth_px": 1295081,
+      "voxels_voted_empty": 2439701
+    },
+    {
+      "view": 29,
+      "valid_depth_px": 1328559,
+      "voxels_voted_empty": 2522788
+    },
+    {
+      "view": 30,
+      "valid_depth_px": 1301688,
+      "voxels_voted_empty": 2421760
+    },
+    {
+      "view": 31,
+      "valid_depth_px": 1317555,
+      "voxels_voted_empty": 2485964
+    },
+    {
+      "view": 32,
+      "valid_depth_px": 1293813,
+      "voxels_voted_empty": 2409791
+    },
+    {
+      "view": 33,
+      "valid_depth_px": 1257394,
+      "voxels_voted_empty": 2296174
+    },
+    {
+      "view": 34,
+      "valid_depth_px": 1223854,
+      "voxels_voted_empty": 2186376
+    },
+    {
+      "view": 35,
+      "valid_depth_px": 1205528,
+      "voxels_voted_empty": 2132350
+    },
+    {
+      "view": 36,
+      "valid_depth_px": 1211599,
+      "voxels_voted_empty": 2124135
+    },
+    {
+      "view": 37,
+      "valid_depth_px": 1226902,
+      "voxels_voted_empty": 2139195
+    },
+    {
+      "view": 38,
+      "valid_depth_px": 975226,
+      "voxels_voted_empty": 1428347
+    },
+    {
+      "view": 39,
+      "valid_depth_px": 1025048,
+      "voxels_voted_empty": 1570187
+    },
+    {
+      "view": 40,
+      "valid_depth_px": 973222,
+      "voxels_voted_empty": 1528205
+    },
+    {
+      "view": 41,
+      "valid_depth_px": 974226,
+      "voxels_voted_empty": 1529485
+    },
+    {
+      "view": 42,
+      "valid_depth_px": 986457,
+      "voxels_voted_empty": 1564126
+    },
+    {
+      "view": 43,
+      "valid_depth_px": 992229,
+      "voxels_voted_empty": 1566710
+    },
+    {
+      "view": 44,
+      "valid_depth_px": 998658,
+      "voxels_voted_empty": 1588657
+    },
+    {
+      "view": 45,
+      "valid_depth_px": 1003976,
+      "voxels_voted_empty": 1606194
+    },
+    {
+      "view": 46,
+      "valid_depth_px": 1007156,
+      "voxels_voted_empty": 1619233
+    },
+    {
+      "view": 47,
+      "valid_depth_px": 1005584,
+      "voxels_voted_empty": 1612853
+    },
+    {
+      "view": 48,
+      "valid_depth_px": 1036951,
+      "voxels_voted_empty": 1733168
+    },
+    {
+      "view": 49,
+      "valid_depth_px": 1501970,
+      "voxels_voted_empty": 5441159
+    },
+    {
+      "view": 50,
+      "valid_depth_px": 1482107,
+      "voxels_voted_empty": 5376494
+    },
+    {
+      "view": 51,
+      "valid_depth_px": 1436146,
+      "voxels_voted_empty": 5081837
+    },
+    {
+      "view": 52,
+      "valid_depth_px": 1392675,
+      "voxels_voted_empty": 4744896
+    },
+    {
+      "view": 53,
+      "valid_depth_px": 1360694,
+      "voxels_voted_empty": 4459543
+    },
+    {
+      "view": 54,
+      "valid_depth_px": 1120525,
+      "voxels_voted_empty": 3382062
+    },
+    {
+      "view": 55,
+      "valid_depth_px": 1095109,
+      "voxels_voted_empty": 3383964
+    },
+    {
+      "view": 56,
+      "valid_depth_px": 1101924,
+      "voxels_voted_empty": 3510649
+    },
+    {
+      "view": 57,
+      "valid_depth_px": 1138343,
+      "voxels_voted_empty": 3751262
+    },
+    {
+      "view": 58,
+      "valid_depth_px": 1180940,
+      "voxels_voted_empty": 3977871
+    },
+    {
+      "view": 59,
+      "valid_depth_px": 919858,
+      "voxels_voted_empty": 2624037
+    },
+    {
+      "view": 60,
+      "valid_depth_px": 971532,
+      "voxels_voted_empty": 2663816
+    },
+    {
+      "view": 61,
+      "valid_depth_px": 944553,
+      "voxels_voted_empty": 2496880
+    },
+    {
+      "view": 62,
+      "valid_depth_px": 942624,
+      "voxels_voted_empty": 2465982
+    },
+    {
+      "view": 63,
+      "valid_depth_px": 950323,
+      "voxels_voted_empty": 2515069
+    }
+  ],
+  "sphere_voxels": 12822447,
+  "voxels_removed_depth": 7130439,
+  "voxels_removed_sfm_clip": 2912472,
+  "voxels_removed_sfm_roi_dist": 0,
+  "sfm_roi_dist": null,
+  "voxels_rescued_sfm_protect": 0,
+  "protect_sfm_radius": null,
+  "drop_seethrough": false,
+  "voxels_removed_component": 1524,
+  "voxels_final": 2873873,
+  "pct_removed_total": 77.58717193371905,
+  "outputs": {
+    "sphere_mesh": "/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/acmmp_scan110_sphere/sphere_carve_auto_res512_nomask_clip2_close2/sphere_init.ply",
+    "sphere_sdf": "/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/acmmp_scan110_sphere/sphere_carve_auto_res512_nomask_clip2_close2/sdf_sphere_init.npy",
+    "carved_mesh": "/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/acmmp_scan110_sphere/sphere_carve_auto_res512_nomask_clip2_close2/sphere_mvsformer_carved.ply",
+    "carved_sdf": "/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/acmmp_scan110_sphere/sphere_carve_auto_res512_nomask_clip2_close2/sdf_sphere_mvsformer_carved.npy",
+    "compare_png": "/home/glenain/Sphere-traced-1-Lipschitz-MLPs-/_diagnostics/acmmp_scan110_sphere/sphere_carve_auto_res512_nomask_clip2_close2/sphere_mvsformer_carve_compare.png"
+  },
+  "runtime_sec": 306.3038378646597
+}

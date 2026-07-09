@@ -436,6 +436,88 @@ def append_results_row(csv_path: Path, row: dict) -> None:
     print(f"appended results row -> {csv_path}")
 
 
+def _pred_grad(f_train, x, output_div, create_graph):
+    """pred(x)=f(x)/output_div and its input-space gradient g=grad_x pred."""
+    x = x.detach().requires_grad_(True)
+    pred = f_train(x) / output_div
+    g, = torch.autograd.grad(pred.sum(), x, create_graph=create_graph)
+    return pred, g, x
+
+
+def mc_surface_points(f_train, output_div, bound, res, device):
+    """Marching-cubes vertices of the current zero set {pred=0}. This is the
+    'mesh M_k' DiffCD re-extracts every K_mesh iterations to draw surface samples
+    from. Returns None if the field has no zero crossing yet."""
+    from skimage.measure import marching_cubes
+    xs = torch.linspace(-bound, bound, res, device=device)
+    grid = torch.stack(torch.meshgrid(xs, xs, xs, indexing="ij"), -1).reshape(-1, 3)
+    vals = []
+    with torch.no_grad():
+        for i in range(0, len(grid), 65536):
+            vals.append((f_train(grid[i:i + 65536]) / output_div).float().cpu())
+    vol = torch.cat(vals).reshape(res, res, res).numpy()
+    if vol.min() > 0 or vol.max() < 0:
+        return None
+    verts, _, _, _ = marching_cubes(vol, level=0.0,
+                                    spacing=(2 * bound / (res - 1),) * 3)
+    return (verts.astype(np.float32) - bound)
+
+
+def diffcd_loss(f_train, output_div, cloud_pts, cloud_tree, cloud_idx_batch,
+                surf_bank, eik_pts, proj_iters, grad_eps, tau, conv_eps,
+                eik_weight):
+    """DiffCD (Härenstam-Nielsen et al., ECCV 2024), faithful form:
+
+        L = 1/2 ( mean_i |pred(x~_i)|                      # points -> surface
+                + mean_i min_j ||x_i(θ) - x~_j|| )          # surface -> points
+          + eik_weight * mean_s (||grad pred(x_s)|| - 1)^2  # eikonal
+
+    pred = f(x)/output_div. Points->surface is the plain |pred| (0th-order distance,
+    valid because the eikonal term drives ||grad pred||->1). Surface points x_i(θ)
+    come from marching-cubes vertices `surf_bank`, filtered by |pred|<tau and then
+    SDF-descent-projected M=proj_iters times; non-converged (|pred|>conv_eps) are
+    dropped. NN distance to the cloud is NOT squared (paper uses ||.||).
+    """
+    # --- Term A: points -> surface = mean |pred| over a cloud minibatch ---
+    pred_p = f_train(cloud_pts[cloud_idx_batch]) / output_div
+    loss_a = pred_p.abs().mean()
+
+    # --- Term B: surface -> points ---
+    loss_b = torch.zeros((), device=cloud_pts.device)
+    n_used = 0
+    if surf_bank is not None and len(surf_bank) > 0:
+        with torch.no_grad():
+            cand = surf_bank
+            pv = (f_train(cand) / output_div).abs()
+            cand = cand[pv < tau]
+        if len(cand) > 0:
+            # SDF-descent projection: x <- x - pred * grad/||grad||  (M iters).
+            x = cand
+            for _ in range(proj_iters):
+                x = x.detach().requires_grad_(True)
+                pred = f_train(x) / output_div
+                g, = torch.autograd.grad(pred.sum(), x, create_graph=True)
+                gn = g.norm(dim=-1, keepdim=True).clamp_min(grad_eps)
+                x = x - pred.unsqueeze(-1) * g / gn
+            s = x  # differentiable through the final descent step
+            with torch.no_grad():
+                converged = (f_train(s) / output_div).abs() < conv_eps
+            s = s[converged]
+            n_used = len(s)
+            if n_used > 0:
+                with torch.no_grad():
+                    _, idx = cloud_tree.query(s.detach().cpu().numpy(), k=1)
+                nn_pts = cloud_pts[torch.as_tensor(idx, device=s.device)]
+                loss_b = (s - nn_pts).norm(dim=-1).mean()
+
+    # --- Eikonal: ||grad pred|| -> 1 on sampled points ---
+    _, g_e, _ = _pred_grad(f_train, eik_pts, output_div, create_graph=True)
+    loss_eik = ((g_e.norm(dim=-1) - 1.0) ** 2).mean()
+
+    loss = 0.5 * (loss_a + loss_b) + eik_weight * loss_eik
+    return loss, loss_a.detach(), loss_b.detach(), loss_eik.detach(), n_used
+
+
 def main() -> None:
     mc = ModelConfig()
     ap = argparse.ArgumentParser(description="Regress FTheta to GT mesh SDF.")
@@ -482,6 +564,36 @@ def main() -> None:
                     help="bfloat16 autocast for forward+loss (no GradScaler needed)")
     ap.add_argument("--compile", action="store_true", dest="compile_model",
                     help="torch.compile the model (large speedup for small MLPs)")
+    ap.add_argument("--loss", choices=["l1", "diffcd"], default="l1",
+                    help="l1 = regress pred to GT SDF everywhere (default). "
+                         "diffcd = symmetric differentiable Chamfer to an unoriented "
+                         "point cloud (Härenstam-Nielsen et al., ECCV 2024).")
+    # DiffCD hyperparameters (paper defaults).
+    ap.add_argument("--diffcd-eik-weight", type=float, default=0.1,
+                    help="eikonal weight lambda (paper: 0.1 clean / 0.5 / 1.0 noisy)")
+    ap.add_argument("--diffcd-proj-iters", type=int, default=4,
+                    help="SDF-descent projection steps M (paper: 4)")
+    ap.add_argument("--diffcd-tau", type=float, default=0.01,
+                    help="reject MC candidates with |pred|>tau before projecting")
+    ap.add_argument("--diffcd-conv-eps", type=float, default=0.001,
+                    help="drop projected points with |pred|>conv_eps (paper: 0.001)")
+    ap.add_argument("--diffcd-grad-eps", type=float, default=1e-6,
+                    help="numerical floor for ||grad|| in the projection step")
+    ap.add_argument("--diffcd-mesh-every", type=int, default=1000,
+                    help="re-extract the surface mesh every K iters (paper: 1000)")
+    ap.add_argument("--diffcd-mesh-res", type=int, default=256,
+                    help="marching-cubes res for surface sampling (paper: 512)")
+    ap.add_argument("--diffcd-n-cloud", type=int, default=200000,
+                    help="size of the unoriented point cloud P")
+    ap.add_argument("--diffcd-n-surf", type=int, default=8192,
+                    help="surface-sample candidates drawn from the mesh per step")
+    ap.add_argument("--diffcd-n-eik", type=int, default=8192,
+                    help="points for the eikonal term (half uniform, half near-cloud)")
+    ap.add_argument("--geometric-init", action="store_true",
+                    help="NeuS MLP: init f as a sphere SDF (IGR/SAL/IDR) to break the "
+                         "unoriented sign ambiguity. Required for DiffCD to converge.")
+    ap.add_argument("--geometric-init-radius", type=float, default=0.5,
+                    help="radius of the sphere used for geometric init")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -571,10 +683,32 @@ def main() -> None:
               f"(demanded |grad f| = {args.target_scale:g}; net is 1-Lipschitz)")
     print(f"near={len(near):,} vol={len(vol):,} device={device}")
 
+    cloud_pts = cloud_tree = cloud_np = None
+    if args.loss == "diffcd":
+        from scipy.spatial import cKDTree
+        # Unoriented point cloud P (positions only — no normals, no signs).
+        cloud_np = mesh.sample(args.diffcd_n_cloud).astype(np.float32)
+        cloud_pts = torch.from_numpy(cloud_np).to(device)
+        cloud_tree = cKDTree(cloud_np)
+        print(f"diffcd: unoriented cloud P = {len(cloud_np):,} pts, "
+              f"eik_weight={args.diffcd_eik_weight} proj_iters={args.diffcd_proj_iters} "
+              f"mesh_every={args.diffcd_mesh_every} mesh_res={args.diffcd_mesh_res}")
+
     f = make_model(hidden=args.hidden, depth=args.depth, group_size=args.group_size,
                    activation=args.activation, input_encoding=args.input_encoding,
                    multires=args.multires, architecture=args.architecture,
                    lipschitz_mode=args.lipschitz_mode).to(device)
+
+    if args.geometric_init:
+        if not hasattr(f, "geometric_init"):
+            raise SystemExit(f"--geometric-init not supported for architecture {args.architecture!r}")
+        f.geometric_init(radius=args.geometric_init_radius)
+        with torch.no_grad():
+            r = args.geometric_init_radius
+            probe = torch.tensor([[0., 0., 0.], [r, 0., 0.], [2 * r, 0., 0.]], device=device)
+            fp = (f(probe) / args.output_div).tolist()
+            print(f"geometric init (r={r}): f(0)={fp[0]:.3f} f(r)={fp[1]:.3f} "
+                  f"f(2r)={fp[2]:.3f}  (expect ~ -r, ~0, ~+r)")
 
     if f.encoder is not None:
         with torch.no_grad():
@@ -630,19 +764,50 @@ def main() -> None:
     else:
         amp_ctx = contextlib.nullcontext
 
+    surf_bank = None  # marching-cubes vertices of {pred=0}, refreshed periodically
+    loss_a = loss_b = loss_eik = torch.zeros((), device=device)
+    n_used = 0
     for step in range(start_step, args.steps + 1):
         ni = torch.randint(0, len(near), (n_near_b,), device=device)
         vi = torch.randint(0, len(vol), (n_vol_b,), device=device)
         x = torch.cat([near[ni], vol[vi]], dim=0)
         y = torch.cat([near_sdf[ni], vol_sdf[vi]], dim=0)
 
-        with amp_ctx():
-            # --output-div L: pred = model(gamma(x)) / L. With raw PE, model(gamma(x))
-            # is L-Lipschitz in world space, so pred is 1-Lipschitz and is fit to the
-            # plain SDF d. Tests whether a PE-normalized (output-divided) 1-Lipschitz
-            # field can represent d. Zero set {pred=0} = {model=0}, unchanged by /L.
-            pred = f_train(x) / args.output_div
-            loss = F.l1_loss(pred, y)
+        if args.loss == "diffcd":
+            # DiffCD (paper-faithful): symmetric Chamfer between the unoriented
+            # cloud P and {pred=0}, plus eikonal. No amp (needs double-backward).
+            if step % args.diffcd_mesh_every == 0:
+                verts = mc_surface_points(f_train, args.output_div, args.bound,
+                                          args.diffcd_mesh_res, device)
+                surf_bank = (torch.from_numpy(verts).to(device)
+                             if verts is not None else None)
+            # cloud minibatch for term A
+            ci = torch.randint(0, len(cloud_pts), (args.batch,), device=device)
+            # surface candidates: random subset of the current MC mesh bank
+            bank = None
+            if surf_bank is not None and len(surf_bank) > 0:
+                bi = torch.randint(0, len(surf_bank),
+                                   (min(args.diffcd_n_surf, len(surf_bank)),), device=device)
+                bank = surf_bank[bi]
+            # eikonal points: half uniform in the domain, half near the cloud
+            ne = args.diffcd_n_eik
+            unif = (torch.rand(ne // 2, 3, device=device) * 2 - 1) * args.bound
+            cj = torch.randint(0, len(cloud_pts), (ne - ne // 2,), device=device)
+            near_c = cloud_pts[cj] + torch.randn(ne - ne // 2, 3, device=device) * args.near_std
+            eik_pts = torch.cat([unif, near_c], dim=0)
+            loss, loss_a, loss_b, loss_eik, n_used = diffcd_loss(
+                f_train, args.output_div, cloud_pts, cloud_tree, ci,
+                bank, eik_pts, args.diffcd_proj_iters, args.diffcd_grad_eps,
+                args.diffcd_tau, args.diffcd_conv_eps, args.diffcd_eik_weight)
+        else:
+            with amp_ctx():
+                # --output-div L: pred = model(gamma(x)) / L. With raw PE,
+                # model(gamma(x)) is L-Lipschitz in world space, so pred is
+                # 1-Lipschitz and is fit to the plain SDF d. Tests whether a
+                # PE-normalized (output-divided) 1-Lipschitz field can represent d.
+                # Zero set {pred=0} = {model=0}, unchanged by /L.
+                pred = f_train(x) / args.output_div
+                loss = F.l1_loss(pred, y)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -660,7 +825,11 @@ def main() -> None:
                 near_l1 = (pred_near - gt_near).abs().mean().item()
                 vol_l1 = (pred_vol - gt_vol).abs().mean().item()
             history.append((step, loss.item(), near_l1, vol_l1))
-            print(f"step {step:6d} loss={loss.item():.6f} near_l1={near_l1:.6f} vol_l1={vol_l1:.6f}", flush=True)
+            extra = (f" A(p->s)={loss_a.item():.5f} B(s->p)={loss_b.item():.5f} "
+                     f"eik={loss_eik.item():.5f} nsurf={n_used}"
+                     if args.loss == "diffcd" else "")
+            print(f"step {step:6d} loss={loss.item():.6f} near_l1={near_l1:.6f} "
+                  f"vol_l1={vol_l1:.6f}{extra}", flush=True)
             if step > 0 and step % 2000 == 0:
                 save_loss_plot(history, args.out_dir / "loss.png")
 

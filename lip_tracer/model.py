@@ -190,6 +190,58 @@ class FTheta(nn.Module):
     def sdf(self, x: Tensor) -> Tensor:
         return self.forward(x)
 
+    @torch.no_grad()
+    def geometric_init(self, radius: float = 0.5, n_samples: int = 16384,
+                       seed: int = 1234) -> None:
+        """Closed-form SAL/IGR-style sphere init: set f ≈ ‖x‖ − radius with no SGD.
+
+        SAL's original trick (a wide ReLU layer whose units are *averaged* by an
+        output weight √(π/n), using E_w[relu(w·x)] ∝ ‖x‖) needs an expansive,
+        √n-Lipschitz intermediate map — structurally impossible here, since every
+        CPL block and MaxMin layer is 1-Lipschitz. The 1-Lipschitz-compatible route
+        to ‖x‖ is the *max* identity ‖x‖ = maxᵤ ⟨u,x⟩ (a max of 1-Lipschitz maps is
+        1-Lipschitz), which the random CPL stack + GroupSort already realises: with
+        random 1-Lipschitz weights the frozen features h(x) = net(pad(x)) move at
+        ~unit speed and span many directions, so a *single* unit-norm head can be
+        aligned with the radial direction. We leave the CPL blocks at their standard
+        random 1-Lipschitz init (the "random directions") and solve only the head
+        weight + bias in closed form (one least-squares over points in a ball) so
+        that ⟨h(x), w⟩ + b ≈ ‖x‖ − radius.
+
+        The head weight the network applies is unit-normalised, so the raw solution
+        norm ‖w‖ is a diagnostic: ‖w‖ ≈ 1 ⇔ the field is eikonal (|∇f| ≈ 1) and the
+        sphere is faithful. It only holds for the genuinely 1-Lipschitz,
+        identity-encoding model (activation ∈ {groupsort, nact}); the intentionally
+        non-1-Lipschitz softplus/softmax CPL variants and PE encoding dilute the
+        radial direction and this closed form degrades (‖w‖ strays from 1) — use the
+        SGD fit_sphere_init for those instead.
+        """
+        device = self.head_weight.device
+        bound  = radius * 1.5   # match fit_sphere_init's sampling box
+        g      = torch.Generator(device="cpu").manual_seed(seed)
+        x      = ((2 * torch.rand(n_samples, 3, generator=g) - 1) * bound).to(device)
+        if self.encoder is None:
+            h = F.pad(x, (0, self.hidden - 3))
+        else:
+            h = F.pad(self.encoder(x), (0, self.hidden - self.encoder.out_dim))
+        h      = self.net(h)                             # frozen 1-Lipschitz features
+        target = x.norm(dim=-1) - radius
+        A      = torch.cat([h, torch.ones(n_samples, 1, device=device)], dim=-1)
+        sol    = torch.linalg.lstsq(A, target).solution
+        w, b   = sol[:-1], sol[-1]
+        wn     = w.norm().clamp(min=1e-6)
+        self.head_weight.copy_(w)
+        self._head_w_buf.copy_(w / wn)
+        self.head_bias.copy_(b.reshape(1))
+        f0     = self.forward(torch.zeros(1, 3, device=device)).item()
+        note   = ""
+        if not (0.7 < wn.item() < 1.4):
+            note = ("  [WARN] ‖w‖ far from 1: this activation/encoding is not cleanly "
+                    "1-Lipschitz-radial; the closed-form sphere is unreliable — prefer "
+                    "SGD fit_sphere_init")
+        print(f"  cpl geometric_init  r={radius:.3f}  ‖w‖={wn.item():.3f} (~1=eikonal)  "
+              f"f(0)={f0:.4f} (target={-radius:.4f}){note}")
+
 
 class NeuSMLP(nn.Module):
     """NeuS-style MLP: 8-layer Softplus network with skip connection at layer 4.
@@ -246,6 +298,35 @@ class NeuSMLP(nn.Module):
 
     def sdf(self, x: Tensor) -> Tensor:
         return self.forward(x)
+
+    def geometric_init(self, radius: float = 0.5) -> None:
+        """IGR/SAL/IDR geometric initialization: start f as the signed distance to
+        a sphere of the given radius (negative inside, positive outside). Breaks the
+        inside/outside sign ambiguity of an unoriented point cloud so DiffCD/eikonal
+        fitting converges to a signed field instead of the unsigned distance.
+
+        The first (and skip) layer zero out the positional-encoding channels so the
+        field starts as a pure function of raw xyz; PE detail grows during training.
+        """
+        import numpy as np
+        d_in = 3  # raw xyz channels sit first in the PE (identity block)
+        for i, lin in enumerate(self.layers):
+            out_dim = lin.weight.shape[0]
+            if self.encoder is not None and i == 0:
+                nn.init.constant_(lin.bias, 0.0)
+                nn.init.constant_(lin.weight[:, d_in:], 0.0)              # zero PE
+                nn.init.normal_(lin.weight[:, :d_in], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+            elif self.encoder is not None and i == self.skip_layer:
+                nn.init.constant_(lin.bias, 0.0)
+                nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                nn.init.constant_(lin.weight[:, -(self.in_dim - d_in):], 0.0)  # zero skip-PE
+            else:
+                nn.init.constant_(lin.bias, 0.0)
+                nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+        # output layer: f(x) ~= ||x|| - radius
+        nn.init.normal_(self.out.weight, mean=np.sqrt(np.pi) / np.sqrt(self.hidden),
+                        std=1e-4)
+        nn.init.constant_(self.out.bias, -radius)
 
 
 class RadianceNet(nn.Module):

@@ -3075,14 +3075,19 @@ def train(cfg: Config = None, use_wandb: bool = False, resume: Path | None = Non
                   "path active (needs --no-ncc-detach-normals or w_ncc_normal>0) — ignored")
     if getattr(train_cfg, "compile", True):
         if _need_diff_normal_compile:
-            import torch._functorch.config as _ffc
-            _ffc.donated_buffer = False
-            print("  torch.compile: donated_buffer disabled (differentiable normals need create_graph=True)")
-        f_fwd, _ok, _msg = _try_compile_model(f)
-        if _ok:
-            print("  torch.compile(dynamic=True) enabled for hot-path f")
+            # Differentiable normals compute ∇(NCC) through x_theta with
+            # torch.autograd.grad(create_graph=True), i.e. a double backward
+            # through f. torch.compile's aot_autograd raises "does not currently
+            # support double backward", so force eager for these configs.
+            f_fwd = f
+            print("  torch.compile: disabled (differentiable normals need double "
+                  "backward, unsupported by aot_autograd) — running eager")
         else:
-            print(f"  [warn] torch.compile unavailable ({_msg}) — running eager")
+            f_fwd, _ok, _msg = _try_compile_model(f)
+            if _ok:
+                print("  torch.compile(dynamic=True) enabled for hot-path f")
+            else:
+                print(f"  [warn] torch.compile unavailable ({_msg}) — running eager")
     else:
         f_fwd = f
     if train_cfg.profile:
